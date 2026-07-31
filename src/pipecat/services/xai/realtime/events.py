@@ -121,9 +121,12 @@ class AudioOutput(BaseModel):
 
     Parameters:
         format: The format configuration for output audio.
+        speed: Playback speed multiplier. Values below 1.0 slow speech down;
+            values above 1.0 speed it up. Defaults to the provider's 1.0.
     """
 
     format: PCMAudioFormat | PCMUAudioFormat | PCMAAudioFormat | None = None
+    speed: float | None = Field(default=None, ge=0.7, le=1.5)
 
 
 class AudioConfiguration(BaseModel):
