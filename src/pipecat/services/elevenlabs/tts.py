@@ -977,6 +977,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
         """Send text to the WebSocket for synthesis."""
         if self._websocket and context_id:
             msg = {"text": text, "context_id": context_id}
+            msg = self.merge_provider_options(msg)
             await self._websocket.send(json.dumps(msg))
 
     @traced_tts
@@ -1019,6 +1020,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
                             locator.model_dump()
                             for locator in self._pronunciation_dictionary_locators
                         ]
+                    msg = self.merge_provider_options(msg)
                     # Mark the context-init as sent so the keepalive may now
                     # target this context_id.
                     self._context_init_sent.add(context_id)
@@ -1397,6 +1399,8 @@ class ElevenLabsHttpTTSService(TTSService):
             logger.warning(
                 f"Language code [{language}] not applied. Language codes can only be used with multilingual models: {', '.join(sorted(ELEVENLABS_MULTILINGUAL_MODELS))}"
             )
+
+        payload = self.merge_provider_options(payload)
 
         headers = {
             "xi-api-key": self._api_key,

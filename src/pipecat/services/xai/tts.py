@@ -203,6 +203,7 @@ class XAIHttpTTSService(TTSService):
         }
         if self._settings.language:
             payload["language"] = str(self._settings.language)
+        payload = self.merge_provider_options(payload)
 
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -372,6 +373,7 @@ class XAITTSService(InterruptibleTTSService):
             "codec": self._codec,
             "sample_rate": self.sample_rate,
         }
+        params = self.merge_provider_options(params)
         return f"{self._base_url}?{urlencode(params)}"
 
     async def _connect_websocket(self):

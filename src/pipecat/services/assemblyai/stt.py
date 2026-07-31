@@ -653,6 +653,8 @@ class AssemblyAISTTService(WebsocketSTTService):
         if s.keyterms_prompt is not None:
             params["keyterms_prompt"] = json.dumps(s.keyterms_prompt)
 
+        params = self.merge_provider_options(params)
+
         if params:
             query_string = urlencode(params)
             return f"{self._api_endpoint_base_url}?{query_string}"

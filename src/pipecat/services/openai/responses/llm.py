@@ -265,7 +265,7 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
             params["tools"] = tools
 
         # Extra settings
-        params.update(self._settings.extra)
+        params = self.merge_provider_options(params)
 
         return params
 

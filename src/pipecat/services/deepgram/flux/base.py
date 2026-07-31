@@ -278,6 +278,15 @@ class DeepgramFluxSTTBase(STTService):
                     f"ignoring hints for model {self._settings.model!r}"
                 )
 
+        for key, value in self._settings.extra.items():
+            if value is None:
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    params.append(urlencode({key: item}))
+            else:
+                params.append(urlencode({key: value}))
+
         return "&".join(params)
 
     async def _send_silence(self, duration_secs: float = 0.5):

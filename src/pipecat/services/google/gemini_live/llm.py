@@ -1289,6 +1289,10 @@ class GeminiLiveLLMService(LLMService[GeminiLLMAdapter]):
                 logger.debug(f"Setting tools: {tools}")
                 config.tools = tools
 
+            config = LiveConnectConfig(
+                **self.merge_provider_options(config.model_dump(mode="python", exclude_none=True))
+            )
+
             # Start the connection
             self._connection_task = self.create_task(self._connection_task_handler(config=config))
 

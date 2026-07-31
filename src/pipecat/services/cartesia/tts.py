@@ -522,7 +522,7 @@ class CartesiaTTSService(WebsocketTTSService):
         if self._settings.pronunciation_dict_id:
             msg["pronunciation_dict_id"] = self._settings.pronunciation_dict_id
 
-        return json.dumps(msg)
+        return json.dumps(self.merge_provider_options(msg))
 
     async def start(self, frame: StartFrame):
         """Start the Cartesia TTS service.

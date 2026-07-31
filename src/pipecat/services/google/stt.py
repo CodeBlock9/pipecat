@@ -856,6 +856,11 @@ class GoogleSTTService(STTService):
                 interim_results=self._settings.enable_interim_results,
             ),
         )
+        if self._settings.extra:
+            config_payload = cloud_speech.StreamingRecognitionConfig.to_dict(self._config)
+            self._config = cloud_speech.StreamingRecognitionConfig(
+                self.merge_provider_options(config_payload)
+            )
 
         self._request_queue = asyncio.Queue()
         self._streaming_task = self.create_task(self._stream_audio())

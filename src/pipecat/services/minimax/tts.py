@@ -396,6 +396,7 @@ class MiniMaxHttpTTSService(TTSService):
         }
         if self._settings.language_boost is not None:
             payload["language_boost"] = self._settings.language_boost
+        payload = self.merge_provider_options(payload)
 
         try:
             async with self._session.post(

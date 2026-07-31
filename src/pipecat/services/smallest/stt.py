@@ -316,6 +316,7 @@ class SmallestSTTService(WebsocketSTTService):
                 "numerals": self._settings.numerals,
                 "diarize": str(self._settings.diarize).lower(),
             }
+            query_params = self.merge_provider_options(query_params)
 
             ws_url = f"{self._base_url}/waves/v1/pulse/get_text?{urlencode(query_params)}"
 

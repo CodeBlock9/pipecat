@@ -650,6 +650,10 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         if settings.tools and isinstance(settings.tools, ToolsSchema):
             settings.tools = adapter.from_standard_tools(settings.tools)
 
+        settings = events.SessionProperties.model_validate(
+            self.merge_provider_options(settings.model_dump(mode="python"))
+        )
+
         await self.send_client_event(events.SessionUpdateEvent(session=settings))
 
     #

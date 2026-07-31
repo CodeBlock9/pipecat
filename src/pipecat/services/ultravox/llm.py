@@ -325,6 +325,7 @@ class UltravoxRealtimeLLMService(LLMService):
         if params.max_duration:
             request_body["maxDuration"] = f"{params.max_duration.total_seconds():3f}s"
         request_body = request_body | params.extra
+        request_body = self.merge_provider_options(request_body, include_declared=True)
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"https://api.ultravox.ai/api/agents/{params.agent_id}/calls",
@@ -357,6 +358,7 @@ class UltravoxRealtimeLLMService(LLMService):
         if initial_output_medium:
             request_body["initialOutputMedium"] = initial_output_medium
         request_body = request_body | params.extra
+        request_body = self.merge_provider_options(request_body, include_declared=True)
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 "https://api.ultravox.ai/api/calls",

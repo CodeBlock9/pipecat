@@ -73,6 +73,8 @@ class SpeachesTTSService(OpenAITTSService):
             if self._settings.speed:
                 create_params["speed"] = self._settings.speed
 
+            create_params = self.merge_provider_options(create_params)
+
             async with self._client.audio.speech.with_streaming_response.create(
                 **create_params
             ) as response:

@@ -320,6 +320,8 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
         if system:
             request_params["system"] = system
 
+        request_params = self.merge_provider_options(request_params)
+
         async with self._aws_session.create_client(
             service_name="bedrock-runtime", **self._aws_params
         ) as client:
@@ -467,6 +469,8 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
             # Add performance config if latency is specified
             if self._settings.latency in ["standard", "optimized"]:
                 request_params["performanceConfig"] = {"latency": self._settings.latency}
+
+            request_params = self.merge_provider_options(request_params)
 
             # Add cache checkpoints to system prompts and tool definitions.
             # This enables prompt caching for providers that support it (e.g.

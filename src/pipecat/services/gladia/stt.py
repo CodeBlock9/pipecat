@@ -407,7 +407,7 @@ class GladiaSTTService(WebsocketSTTService):
         if messages_config:
             settings["messages_config"] = messages_config.model_dump(exclude_none=True)
 
-        return settings
+        return self.merge_provider_options(settings)
 
     async def start(self, frame: StartFrame):
         """Start the Gladia STT websocket connection.

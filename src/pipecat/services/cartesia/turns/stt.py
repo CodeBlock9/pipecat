@@ -245,6 +245,7 @@ class CartesiaTurnsSTTService(WebsocketSTTService):
             "encoding": "pcm_s16le",
             "sample_rate": str(self.sample_rate),
         }
+        params = self.merge_provider_options(params)
         return f"{self._url}?{urllib.parse.urlencode(params)}"
 
     async def _connect_websocket(self):

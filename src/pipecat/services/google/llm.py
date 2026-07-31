@@ -380,8 +380,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         if thinking:
             generation_params["thinking_config"] = thinking.model_dump(exclude_unset=True)
 
-        if self._settings.extra:
-            generation_params.update(self._settings.extra)
+        generation_params = self.merge_provider_options(generation_params)
 
         return generation_params
 

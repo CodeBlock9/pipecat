@@ -60,6 +60,25 @@ class TestAzureSTTProfanitySetting(unittest.TestCase):
             AzureSTTService(api_key="fake", region="eastus")
             mock_set.assert_not_called()
 
+    def test_provider_options_update_sdk_config_after_construction(self):
+        with (
+            patch("pipecat.services.azure.stt.SpeechConfig.set_profanity") as mock_set,
+            patch("pipecat.services.azure.stt.SpeechConfig.set_property_by_name") as mock_property,
+        ):
+            service = AzureSTTService(api_key="fake", region="eastus")
+            service.apply_provider_options(
+                {
+                    "profanity": "raw",
+                    "advanced.setting": {"enabled": True},
+                }
+            )
+
+            mock_set.assert_called_once()
+            mock_property.assert_called_once_with(
+                "advanced.setting",
+                '{"enabled": true}',
+            )
+
 
 class TestAzureSTTFinalizedFlag(unittest.IsolatedAsyncioTestCase):
     """Azure's ``RecognizedSpeech`` event is the final recognition for an

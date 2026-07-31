@@ -376,6 +376,8 @@ class InworldHttpTTSService(TTSService):
         if self._timestamp_transport_strategy is not None:
             payload["timestampTransportStrategy"] = self._timestamp_transport_strategy
 
+        payload = self.merge_provider_options(payload)
+
         request_id = str(uuid.uuid4())
         headers = {
             "Authorization": f"Basic {self._api_key}",

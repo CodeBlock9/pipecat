@@ -177,7 +177,7 @@ class HuggingFaceSTTService(SegmentedSTTService):
         if parameters:
             payload["parameters"] = parameters
 
-        return payload
+        return self.merge_provider_options(payload)
 
     async def _transcribe_audio(self, audio_data: bytes) -> dict[str, Any]:
         """Upload audio data to Hugging Face and get transcription result.

@@ -349,6 +349,7 @@ class CartesiaSTTService(WebsocketSTTService):
                 "encoding": self._encoding,
                 "sample_rate": str(self.sample_rate),
             }
+            params = self.merge_provider_options(params)
             ws_url = f"wss://{self._base_url}/stt/websocket?{urllib.parse.urlencode(params)}"
             headers = {"Cartesia-Version": "2025-04-16", "X-API-Key": self._api_key}
 

@@ -147,7 +147,9 @@ class SarvamLLMService(OpenAILLMService):
         ):
             params["reasoning_effort"] = self._settings.reasoning_effort
 
-        return params
+        # Compatibility cleanup removes base defaults, while explicitly supplied
+        # advanced options remain authoritative for newer Sarvam API versions.
+        return self.merge_provider_options(params)
 
     def _validate_model(self, model: str):
         if model not in self._SUPPORTED_MODELS:

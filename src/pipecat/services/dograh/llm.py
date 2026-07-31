@@ -106,8 +106,9 @@ class DograhLLMService(OpenAILLMService):
 
         correlation_id = self._get_correlation_id()
         if correlation_id:
-            # Initialize metadata dict if not present
-            if "metadata" not in params:
+            # Server-managed billing metadata must remain an object and win over
+            # arbitrary provider options.
+            if not isinstance(params.get("metadata"), dict):
                 params["metadata"] = {}
 
             params["metadata"]["correlation_id"] = correlation_id

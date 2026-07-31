@@ -681,6 +681,8 @@ class SarvamSTTService(STTService):
             if self._settings.prompt is not None and self._config.supports_prompt:
                 connect_kwargs["prompt"] = self._settings.prompt
 
+            connect_kwargs = self.merge_provider_options(connect_kwargs)
+
             def _connect_with_sdk_headers(connect_fn, **kwargs):
                 # If prompt is unsupported at connect-time, retry without it.
                 # Headers are supplied through request_options because this is a

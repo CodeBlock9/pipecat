@@ -247,7 +247,7 @@ class SmallestTTSService(InterruptibleTTSService):
 
         msg["output_format"] = self._output_format
 
-        return msg
+        return self.merge_provider_options(msg)
 
     def _build_websocket_url(self) -> str:
         """Build the WebSocket URL."""

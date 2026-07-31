@@ -14,6 +14,7 @@ import json
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlencode
 
 import aiohttp
 from loguru import logger
@@ -215,11 +216,13 @@ class DeepgramTTSService(WebsocketTTSService):
 
             # Build WebSocket URL with query parameters
             params = []
-            params.append(f"model={self._settings.voice}")
+            params.append(f"model={self._settings.model or self._settings.voice}")
             params.append(f"encoding={self._encoding}")
             params.append(f"sample_rate={self.sample_rate}")
             if self._mip_opt_out is not None:
                 params.append(f"mip_opt_out={str(self._mip_opt_out).lower()}")
+            for key, value in self._settings.extra.items():
+                params.append(urlencode({key: value}))
 
             url = f"{self._base_url}/v1/speak?{'&'.join(params)}"
 
@@ -473,6 +476,7 @@ class DeepgramHttpTTSService(TTSService):
 
         if self._mip_opt_out is not None:
             params["mip_opt_out"] = str(self._mip_opt_out).lower()
+        params = self.merge_provider_options(params)
 
         payload = {
             "text": text,
