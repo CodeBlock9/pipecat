@@ -368,7 +368,7 @@ class RimeTTSService(WebsocketTTSService):
             if self._settings.saveOovs is not None:
                 params["saveOovs"] = json.dumps(self._settings.saveOovs)
 
-        return params
+        return self.merge_provider_options(params)
 
     # A set of Rime-specific helpers for text transformations
     @staticmethod

@@ -229,7 +229,7 @@ class SessionProperties(BaseModel):
     """
 
     # Needed to support ToolSchema in tools field.
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
     instructions: str | None = None
     voice: GrokVoice | str | None = "ara"

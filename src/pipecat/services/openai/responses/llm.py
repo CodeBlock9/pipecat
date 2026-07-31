@@ -369,7 +369,7 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
             self._maybe_disable_reasoning(params)
 
         # Extra settings
-        params.update(self._settings.extra)
+        params = self.merge_provider_options(params)
 
         return params
 

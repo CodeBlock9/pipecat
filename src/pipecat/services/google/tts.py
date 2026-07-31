@@ -860,6 +860,12 @@ class GoogleHttpTTSService(TTSService):
             request = texttospeech_v1.SynthesizeSpeechRequest(
                 input=synthesis_input, voice=voice, audio_config=audio_config
             )
+            if self._settings.extra:
+                request = texttospeech_v1.SynthesizeSpeechRequest(
+                    self.merge_provider_options(
+                        texttospeech_v1.SynthesizeSpeechRequest.to_dict(request)
+                    )
+                )
 
             response = await self._client.synthesize_speech(request=request)
 
@@ -975,6 +981,12 @@ class GoogleBaseTTSService(TTSService):
         config_request = texttospeech_v1.StreamingSynthesizeRequest(
             streaming_config=streaming_config
         )
+        if self._settings.extra:
+            config_request = texttospeech_v1.StreamingSynthesizeRequest(
+                self.merge_provider_options(
+                    texttospeech_v1.StreamingSynthesizeRequest.to_dict(config_request)
+                )
+            )
 
         async def request_generator():
             yield config_request

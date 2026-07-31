@@ -10,11 +10,14 @@ Provides the foundation for all AI services in the Pipecat framework, including
 model management, settings handling, and frame processing lifecycle methods.
 """
 
+import copy
 import warnings
-from collections.abc import AsyncGenerator
-from typing import Any
+from collections.abc import AsyncGenerator, Mapping
+from dataclasses import fields as dataclass_fields
+from typing import Any, get_args
 
 from loguru import logger
+from pydantic import BaseModel
 
 from pipecat.frames.frames import (
     CancelFrame,
@@ -27,7 +30,26 @@ from pipecat.frames.frames import (
 )
 from pipecat.metrics.metrics import MetricsData
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.settings import ServiceSettings
+from pipecat.services.settings import ServiceSettings, is_given
+
+
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        existing = result.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            result[key] = _deep_merge_dicts(existing, value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _pydantic_model_type(annotation: Any) -> type[BaseModel] | None:
+    candidates = get_args(annotation) or (annotation,)
+    for candidate in candidates:
+        if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+            return candidate
+    return None
 
 
 class AIService(FrameProcessor):
@@ -53,10 +75,93 @@ class AIService(FrameProcessor):
             # (which hopefully should be rare)
             or ServiceSettings()
         )
+        self._provider_options: dict[str, Any] = {}
         self._sync_model_name_to_metrics()
         self._session_properties: dict[str, Any] = {}
         self._tracing_enabled: bool = False
         self._tracing_context = None
+
+    @property
+    def provider_options(self) -> dict[str, Any]:
+        """Return a defensive copy of advanced provider protocol options."""
+        return copy.deepcopy(self._provider_options)
+
+    def apply_provider_options(self, options: dict[str, Any] | None) -> None:
+        """Apply advanced provider options before the service starts.
+
+        Keys matching declared service settings update those settings so values
+        used in URLs and connection setup are effective immediately. Unknown
+        keys remain in ``settings.extra`` and the full mapping is retained for
+        provider integrations to merge into their wire payloads.
+
+        Args:
+            options: Provider-specific request/session options.
+        """
+        self._provider_options = copy.deepcopy(options or {})
+        if not self._provider_options:
+            return
+
+        delta = type(self._settings).from_mapping(self._provider_options)
+        for settings_field in dataclass_fields(delta):
+            if settings_field.name == "extra":
+                continue
+            incoming_value = getattr(delta, settings_field.name)
+            current_value = getattr(self._settings, settings_field.name, None)
+            if not is_given(incoming_value) or not is_given(current_value):
+                continue
+            if isinstance(current_value, BaseModel) and isinstance(
+                incoming_value, (BaseModel, Mapping)
+            ):
+                incoming_mapping = (
+                    incoming_value.model_dump(mode="python", exclude_unset=True)
+                    if isinstance(incoming_value, BaseModel)
+                    else dict(incoming_value)
+                )
+                merged = _deep_merge_dicts(
+                    current_value.model_dump(mode="python"),
+                    incoming_mapping,
+                )
+                setattr(delta, settings_field.name, type(current_value).model_validate(merged))
+            elif isinstance(current_value, dict) and isinstance(
+                incoming_value, (BaseModel, Mapping)
+            ):
+                incoming_mapping = (
+                    incoming_value.model_dump(mode="python", exclude_unset=True)
+                    if isinstance(incoming_value, BaseModel)
+                    else dict(incoming_value)
+                )
+                setattr(
+                    delta,
+                    settings_field.name,
+                    _deep_merge_dicts(current_value, incoming_mapping),
+                )
+            elif current_value is None and isinstance(incoming_value, Mapping):
+                model_type = _pydantic_model_type(settings_field.type)
+                if model_type is not None:
+                    setattr(
+                        delta,
+                        settings_field.name,
+                        model_type.model_validate(dict(incoming_value)),
+                    )
+        changed = self._settings.apply_update(delta)
+        if "model" in changed:
+            self._sync_model_name_to_metrics()
+
+    def merge_provider_options(
+        self,
+        payload: dict[str, Any],
+        *,
+        include_declared: bool = True,
+    ) -> dict[str, Any]:
+        """Merge provider options over a wire payload.
+
+        Raw values remain authoritative even when a key also maps to a declared
+        setting. This preserves future nested fields that a local settings model
+        does not yet understand and supports providers whose wire name differs
+        from the generic setting used during connection setup.
+        """
+        options = self._provider_options if include_declared else self._settings.extra
+        return _deep_merge_dicts(payload, options)
 
     def _sync_model_name_to_metrics(self):
         """Sync the current AI model name (in `self._settings.model`) for usage in metrics.

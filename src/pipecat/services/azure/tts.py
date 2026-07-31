@@ -7,6 +7,7 @@
 """Azure Cognitive Services Text-to-Speech service implementations."""
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
@@ -440,6 +441,13 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             "websocket",
             ServicePropertyChannel.UriQueryParameter,
         )
+        for key, value in self._settings.extra.items():
+            serialized = json.dumps(value) if isinstance(value, (dict, list)) else str(value)
+            self._speech_config.set_service_property(
+                key,
+                serialized,
+                ServicePropertyChannel.UriQueryParameter,
+            )
 
         self._speech_synthesizer = SpeechSynthesizer(
             speech_config=self._speech_config, audio_config=None

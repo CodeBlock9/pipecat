@@ -11,6 +11,7 @@ Speech SDK for real-time audio transcription.
 """
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
@@ -188,9 +189,24 @@ class AzureSTTService(STTService):
             self._speech_config.endpoint_id = endpoint_id
 
         self._apply_profanity()
+        self._apply_extra_properties()
 
         self._audio_stream = None
         self._speech_recognizer = None
+
+    def apply_provider_options(self, options: dict[str, Any] | None) -> None:
+        """Apply advanced settings to the already-created Azure SDK config."""
+        super().apply_provider_options(options)
+        self._speech_config.speech_recognition_language = assert_given(
+            self._settings.language
+        ) or language_to_azure_language(Language.EN_US)
+        self._apply_profanity()
+        self._apply_extra_properties()
+
+    def _apply_extra_properties(self) -> None:
+        for key, value in self._settings.extra.items():
+            serialized = json.dumps(value) if isinstance(value, (dict, list)) else str(value)
+            self._speech_config.set_property_by_name(key, serialized)
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate performance metrics.

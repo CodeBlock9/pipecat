@@ -331,6 +331,7 @@ class SmallestSTTService(WebsocketSTTService):
                 "endpointing": str(self._settings.endpointing).lower(),
                 "format": str(self._settings.format).lower(),
             }
+            query_params = self.merge_provider_options(query_params)
 
             # An empty `keywords` value would register a single empty keyword,
             # so omit the parameter entirely when no keywords are configured.

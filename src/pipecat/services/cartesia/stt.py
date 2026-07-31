@@ -394,12 +394,19 @@ class CartesiaSTTService(WebsocketSTTService):
                 return
             logger.debug("Connecting to Cartesia STT")
 
-            params = [
-                ("model", self._settings.model),
-                ("language", self._settings.language),
-                ("encoding", self._encoding),
-                ("sample_rate", str(self.sample_rate)),
-            ]
+            # keyterm repeats, so the query is built as a list of pairs. Advanced
+            # provider options only ever override single-valued params, so they
+            # are merged over those before the repeated ones are appended.
+            params = list(
+                self.merge_provider_options(
+                    {
+                        "model": self._settings.model,
+                        "language": self._settings.language,
+                        "encoding": self._encoding,
+                        "sample_rate": str(self.sample_rate),
+                    }
+                ).items()
+            )
             keyterms = _prepare_keyterms(self._settings.keyterm)
             if keyterms:
                 if str(self._settings.model).startswith(_KEYTERM_MODEL_PREFIX):

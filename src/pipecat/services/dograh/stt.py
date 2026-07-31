@@ -191,6 +191,8 @@ class DograhSTTService(STTService, WebsocketService):
             if self._keyterms:
                 config_msg["keyterms"] = self._keyterms
 
+            config_msg = self.merge_provider_options(config_msg)
+
             correlation_id = self._get_correlation_id()
             if correlation_id:
                 config_msg["correlation_id"] = correlation_id

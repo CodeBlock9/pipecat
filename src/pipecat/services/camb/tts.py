@@ -366,6 +366,8 @@ class CambTTSService(TTSService):
             if self._settings.model == "mars-instruct" and self._settings.user_instructions:
                 tts_kwargs["user_instructions"] = self._settings.user_instructions
 
+            tts_kwargs = self.merge_provider_options(tts_kwargs)
+
             await self.start_tts_usage_metrics(text)
 
             assert self._client is not None, "Camb.ai TTS service not initialized"

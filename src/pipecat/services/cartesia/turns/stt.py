@@ -268,11 +268,18 @@ class CartesiaTurnsSTTService(WebsocketSTTService):
     def _websocket_url(self) -> str:
         # Pipecat pipes 16-bit signed little-endian PCM through the pipeline,
         # so the wire encoding is fixed.
-        params = [
-            ("model", self._settings.model),
-            ("encoding", "pcm_s16le"),
-            ("sample_rate", str(self.sample_rate)),
-        ]
+        # keyterm repeats, so the query is built as a list of pairs. Advanced
+        # provider options only ever override single-valued params, so they are
+        # merged over those before the repeated ones are appended.
+        params = list(
+            self.merge_provider_options(
+                {
+                    "model": self._settings.model,
+                    "encoding": "pcm_s16le",
+                    "sample_rate": str(self.sample_rate),
+                }
+            ).items()
+        )
         params.extend(("keyterm", term) for term in _prepare_keyterms(self._settings.keyterm))
         # Cartesia expects spaces inside a keyterm as %20, which urlencode only
         # emits with quote_via=quote.

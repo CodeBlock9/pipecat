@@ -553,6 +553,16 @@ class SpeechmaticsSTTService(STTService):
             frame.user_turn_strategies = ExternalUserTurnStrategies()
         return frame
 
+    def apply_provider_options(self, options: dict[str, Any] | None) -> None:
+        """Rebuild the SDK config after applying advanced provider settings."""
+        super().apply_provider_options(options)
+        self._config = self._build_config(self._settings)
+        self._settings.model = self._config.operating_point.value
+        self._enable_vad = self._config.end_of_utterance_mode not in [
+            EndOfUtteranceMode.FIXED,
+            EndOfUtteranceMode.EXTERNAL,
+        ]
+
     # ============================================================================
     # LIFE-CYCLE / SESSION MANAGEMENT
     # ============================================================================
@@ -797,6 +807,11 @@ class SpeechmaticsSTTService(STTService):
             for key, value in s.extra_params.items():
                 if hasattr(config, key):
                     setattr(config, key, value)
+
+        if s.extra:
+            advanced_engine_control = dict(config.advanced_engine_control or {})
+            advanced_engine_control.update(s.extra)
+            config.advanced_engine_control = advanced_engine_control
 
         # Enable sentences
         split_sentences = assert_given(s.split_sentences)

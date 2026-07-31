@@ -271,6 +271,8 @@ class XAIHttpTTSService(TTSService):
         if assert_given(self._settings.text_normalization) is not None:
             payload["text_normalization"] = self._settings.text_normalization
 
+        payload = self.merge_provider_options(payload)
+
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
@@ -471,6 +473,8 @@ class XAITTSService(WebsocketTTSService):
             params["text_normalization"] = str(self._settings.text_normalization).lower()
         if assert_given(self._settings.with_timestamps) is not None:
             params["with_timestamps"] = str(self._settings.with_timestamps).lower()
+
+        params = self.merge_provider_options(params)
         return f"{self._base_url}?{urlencode(params)}"
 
     async def _connect_websocket(self):

@@ -868,6 +868,8 @@ class AssemblyAISTTService(WebsocketSTTService):
         if is_u3_pro_model(s.model) and isinstance(s.language_codes, list):
             params["language_codes"] = json.dumps(_prepare_language_codes(s.language_codes))
 
+        params = self.merge_provider_options(params)
+
         if params:
             query_string = urlencode(params)
             return f"{self._api_endpoint_base_url}?{query_string}"

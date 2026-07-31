@@ -207,7 +207,7 @@ class SessionProperties(BaseModel):
     """
 
     # Needed to support ToolSchema in tools field.
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
     type: Literal["realtime"] | None = "realtime"
     object: Literal["realtime.session"] | None = None

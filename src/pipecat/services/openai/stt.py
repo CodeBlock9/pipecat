@@ -175,6 +175,8 @@ class OpenAISTTService(BaseWhisperSTTService):
         if self._settings.temperature is not None:
             kwargs["temperature"] = self._settings.temperature
 
+        kwargs = self.merge_provider_options(kwargs)
+
         return await self._client.audio.transcriptions.create(**kwargs)
 
 
@@ -591,15 +593,17 @@ class OpenAIRealtimeSTTService(WebsocketSTTService):
             }
 
         await self._ws_send(
-            {
-                "type": "session.update",
-                "session": {
-                    "type": "transcription",
-                    "audio": {
-                        "input": input_audio,
+            self.merge_provider_options(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "type": "transcription",
+                        "audio": {
+                            "input": input_audio,
+                        },
                     },
-                },
-            }
+                }
+            )
         )
 
     async def _send_audio(self, audio: bytes):

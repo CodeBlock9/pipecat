@@ -641,6 +641,8 @@ class SarvamHttpTTSService(TTSService):
                     self._settings.temperature if self._settings.temperature is not None else 0.6
                 )
 
+            payload = self.merge_provider_options(payload)
+
             headers = {
                 "api-subscription-key": self._api_key,
                 "Content-Type": "application/json",

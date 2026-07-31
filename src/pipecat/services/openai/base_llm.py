@@ -363,7 +363,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # Messages, tools, tool_choice
         params.update(params_from_context)
 
-        params.update(self._settings.extra)
+        params = self.merge_provider_options(params)
 
         return params
 
