@@ -810,6 +810,7 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
         # _service_tools) and must stay intact.
         settings = assert_given(self._settings.session_properties).model_copy()
         adapter = self.get_llm_adapter()
+        context_tools: list[dict[str, Any]] | None = None
 
         if self._context:
             llm_invocation_params = adapter.get_llm_invocation_params(
@@ -818,8 +819,9 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
             )
 
             # tools given in the context override the tools in the session properties
-            if llm_invocation_params["tools"]:
-                settings.tools = llm_invocation_params["tools"]
+            if is_given(self._context.tools) or settings.tools is None:
+                context_tools = llm_invocation_params["tools"]
+                settings.tools = context_tools
 
             # The adapter resolves conflicts between init-provided and
             # context-provided system instructions (preferring init-provided).
@@ -835,6 +837,8 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
         settings = events.SessionProperties.model_validate(
             self.merge_provider_options(settings.model_dump(mode="python"))
         )
+        if context_tools == []:
+            settings.tools = []
 
         outgoing = self._strip_unsupported_reasoning(settings)
 
@@ -862,6 +866,8 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
                 await self._handle_evt_input_audio_transcription_delta(evt)
             elif evt.type == "conversation.item.input_audio_transcription.completed":
                 await self.handle_evt_input_audio_transcription_completed(evt)
+            elif evt.type == "conversation.item.input_audio_transcription.failed":
+                await self.handle_evt_input_audio_transcription_failed(evt)
             elif evt.type == "conversation.item.retrieved":
                 await self._handle_conversation_item_retrieved(evt)
             elif evt.type == "response.done":
@@ -1006,6 +1012,16 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
             FrameDirection.UPSTREAM,
         )
         await self._handle_user_transcription(evt.transcript, True, Language.EN)
+
+    async def handle_evt_input_audio_transcription_failed(self, evt):
+        """Handle failure of input audio transcription.
+
+        Args:
+            evt: The transcription failed event.
+        """
+        logger.warning(
+            f"{self}: input audio transcription failed for item {evt.item_id}: {evt.error.message}"
+        )
 
     async def _handle_conversation_item_retrieved(self, evt: events.ConversationItemRetrieved):
         futures = self._retrieve_conversation_item_futures.pop(evt.item.id, None)

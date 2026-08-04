@@ -16,6 +16,7 @@ orderings of ``response.output_audio.done`` events.
 import base64
 import json
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -147,6 +148,31 @@ async def _drive(service: OpenAIRealtimeLLMService, scripted: list[dict[str, Any
     """Feed scripted server-event dicts through the receive handler."""
     service._websocket = _FakeWebSocket([json.dumps(e) for e in scripted])
     await service._receive_task_handler()
+
+
+@pytest.mark.asyncio
+async def test_input_audio_transcription_failure_dispatches_to_service_hook():
+    service = _make_service()
+    service.handle_evt_input_audio_transcription_failed = AsyncMock()
+    scripted = [
+        {
+            "type": "conversation.item.input_audio_transcription.failed",
+            "event_id": "evt_transcription_failed",
+            "item_id": "item_failed",
+            "content_index": 0,
+            "error": {
+                "type": "transcription_error",
+                "code": "audio_unintelligible",
+                "message": "Could not transcribe audio",
+            },
+        }
+    ]
+
+    await _drive(service, scripted)
+
+    service.handle_evt_input_audio_transcription_failed.assert_awaited_once()
+    event = service.handle_evt_input_audio_transcription_failed.await_args.args[0]
+    assert event.item_id == "item_failed"
 
 
 # ---------------------------------------------------------------------------
