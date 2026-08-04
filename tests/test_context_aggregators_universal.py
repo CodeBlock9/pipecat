@@ -6,6 +6,7 @@
 
 import json
 import unittest
+from unittest.mock import AsyncMock, Mock
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
@@ -2171,6 +2172,21 @@ class TestRealtimeServiceModeAggregator(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(RuntimeError):
             assistant._validate_realtime_pairing()
+
+    async def test_cleanup_cancels_pending_realtime_handoff_flush(self):
+        context = LLMContext()
+        user = LLMUserAggregator(context, _realtime_service_mode=True)
+        flush_task = Mock()
+        flush_task.done.return_value = False
+        user._realtime_handoff_flush_task = flush_task
+        user.cancel_task = AsyncMock()
+        user._user_turn_controller.cleanup = AsyncMock()
+        user._user_idle_controller.cleanup = AsyncMock()
+
+        await user._cleanup()
+
+        user.cancel_task.assert_awaited_once_with(flush_task)
+        self.assertIsNone(user._realtime_handoff_flush_task)
 
 
 if __name__ == "__main__":

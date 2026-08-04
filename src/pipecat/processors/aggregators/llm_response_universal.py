@@ -1041,6 +1041,7 @@ class LLMUserAggregator(LLMContextAggregator):
         self._realtime_handoff_flush_task = None
 
     async def _cleanup(self):
+        await self._cancel_realtime_handoff_flush_task()
         if self._vad_controller:
             await self._vad_controller.cleanup()
         await self._user_turn_controller.cleanup()
