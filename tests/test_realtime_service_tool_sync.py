@@ -29,7 +29,7 @@ import pytest
 from pipecat.adapters.schemas.direct_function import tool_options
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.processors.aggregators.llm_context import NOT_GIVEN
+from pipecat.processors.aggregators.llm_context import NOT_GIVEN, LLMContext
 from pipecat.services.llm_service import FunctionCallParams
 
 
@@ -124,6 +124,25 @@ class _SessionUpdateToolPreservationTests:
         self.assertIsInstance(service._settings.session_properties.tools, ToolsSchema)
 
 
+class _ContextToolClearingTests:
+    """Regression cases for clearing tools advertised by a prior context."""
+
+    async def test_empty_context_tools_are_sent_as_an_explicit_empty_list(self):
+        service = self._service(None)
+        service.send_client_event = AsyncMock()
+        context = LLMContext()
+        context.set_tools(_tools(sample_handler))
+        service._context = context
+
+        await service._send_session_update()
+        self.assertTrue(service.send_client_event.await_args.args[0].session.tools)
+
+        context.set_tools(ToolsSchema(standard_tools=[]))
+        await service._send_session_update()
+
+        self.assertEqual(service.send_client_event.await_args.args[0].session.tools, [])
+
+
 class TestGeminiLiveServiceToolSync(_ServiceToolSyncTests, unittest.IsolatedAsyncioTestCase):
     def _service(self, tools):
         mod = pytest.importorskip("pipecat.services.google.gemini_live.llm")
@@ -169,7 +188,10 @@ class TestUltravoxServiceToolSync(_ServiceToolSyncTests, unittest.IsolatedAsynci
 
 
 class TestOpenAIRealtimeServiceToolSync(
-    _ServiceToolSyncTests, _SessionUpdateToolPreservationTests, unittest.IsolatedAsyncioTestCase
+    _ServiceToolSyncTests,
+    _SessionUpdateToolPreservationTests,
+    _ContextToolClearingTests,
+    unittest.IsolatedAsyncioTestCase,
 ):
     def _service(self, tools):
         mod = pytest.importorskip("pipecat.services.openai.realtime.llm")
@@ -182,7 +204,10 @@ class TestOpenAIRealtimeServiceToolSync(
 
 
 class TestGrokRealtimeServiceToolSync(
-    _ServiceToolSyncTests, _SessionUpdateToolPreservationTests, unittest.IsolatedAsyncioTestCase
+    _ServiceToolSyncTests,
+    _SessionUpdateToolPreservationTests,
+    _ContextToolClearingTests,
+    unittest.IsolatedAsyncioTestCase,
 ):
     def _service(self, tools):
         mod = pytest.importorskip("pipecat.services.xai.realtime.llm")

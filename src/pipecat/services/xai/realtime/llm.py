@@ -632,6 +632,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         # _service_tools) and must stay intact.
         settings = assert_given(self._settings.session_properties).model_copy()
         adapter = self.get_llm_adapter()
+        context_tools: list[dict[str, Any]] | None = None
 
         if self._context:
             llm_invocation_params = adapter.get_llm_invocation_params(
@@ -640,8 +641,9 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             )
 
             # tools given in the context override the tools in the session properties
-            if llm_invocation_params["tools"]:
-                settings.tools = llm_invocation_params["tools"]
+            if is_given(self._context.tools) or settings.tools is None:
+                context_tools = llm_invocation_params["tools"]
+                settings.tools = context_tools
 
             # The adapter resolves conflicts between init-provided and
             # context-provided system instructions (preferring init-provided).
@@ -655,6 +657,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         settings = events.SessionProperties.model_validate(
             self.merge_provider_options(settings.model_dump(mode="python"))
         )
+        if context_tools == []:
+            settings.tools = []
 
         await self.send_client_event(events.SessionUpdateEvent(session=settings))
 
