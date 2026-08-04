@@ -480,6 +480,12 @@ class SessionUpdatedEvent(ServerEvent):
     session: SessionProperties
 
 
+class SessionCreatedEvent(ServerEvent):
+    """Event indicating the realtime session was created."""
+
+    type: Literal["session.created"]
+
+
 class ConversationCreated(ServerEvent):
     """Event indicating a conversation has been created.
 
@@ -846,6 +852,7 @@ class ErrorEvent(ServerEvent):
 #
 
 _server_event_types = {
+    "session.created": SessionCreatedEvent,
     "error": ErrorEvent,
     "ping": PingEvent,
     "session.updated": SessionUpdatedEvent,

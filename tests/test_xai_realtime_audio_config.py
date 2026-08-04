@@ -6,6 +6,8 @@
 
 """Tests for xAI realtime audio session configuration."""
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -43,3 +45,17 @@ def test_audio_output_speed_preserves_transport_sample_rates():
 def test_audio_output_speed_rejects_values_outside_xai_range(speed: float):
     with pytest.raises(ValidationError):
         events.SessionProperties.model_validate({"audio": {"output": {"speed": speed}}})
+
+
+def test_session_created_event_is_parsed_as_known_lifecycle_event():
+    event = events.parse_server_event(
+        json.dumps(
+            {
+                "event_id": "event-1",
+                "type": "session.created",
+                "session": {"id": "session-1"},
+            }
+        )
+    )
+
+    assert isinstance(event, events.SessionCreatedEvent)

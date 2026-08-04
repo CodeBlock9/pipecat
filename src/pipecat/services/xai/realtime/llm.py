@@ -674,6 +674,9 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             if evt.type == "ping":
                 # Ignore ping events (keep-alive)
                 pass
+            elif evt.type == "session.created":
+                # Informational lifecycle event; conversation.created drives setup.
+                pass
             elif evt.type == "conversation.created":
                 await self._handle_evt_conversation_created(evt)
             elif evt.type == "session.updated":
