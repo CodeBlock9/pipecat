@@ -148,8 +148,10 @@ async def test_deepgram_declared_model_option_reaches_websocket_url(monkeypatch)
 
     websocket = SimpleNamespace(response=SimpleNamespace(headers={}))
     connect = AsyncMock(return_value=websocket)
-    monkeypatch.setattr("pipecat.services.deepgram.tts.websocket_connect", connect)
     service = DeepgramTTSService(api_key="test-key")
+    # 1.7.0 moved the module-level `websocket_connect` import behind
+    # WebsocketService._websocket_connect, so patch the bound method.
+    monkeypatch.setattr(service, "_websocket_connect", connect)
     service.apply_provider_options({"model": "future-deepgram-model"})
 
     await service._connect_websocket()
