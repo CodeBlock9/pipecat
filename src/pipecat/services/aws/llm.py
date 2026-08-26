@@ -333,6 +333,24 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
             # Call Bedrock without streaming
             response = await client.converse(**request_params)
 
+            usage = (response.get("usage") or {}) if isinstance(response, dict) else {}
+            if usage:
+                input_tokens = usage.get("inputTokens", 0) or 0
+                output_tokens = usage.get("outputTokens", 0) or 0
+                cache_read = usage.get("cacheReadInputTokens", 0) or 0
+                cache_write = usage.get("cacheWriteInputTokens", 0) or 0
+                self.record_inference_usage(
+                    LLMTokenUsage(
+                        prompt_tokens=input_tokens,
+                        completion_tokens=output_tokens,
+                        # Bedrock reports inputTokens net of the cache, so the
+                        # cached halves are added back for the gross total.
+                        total_tokens=input_tokens + cache_read + cache_write + output_tokens,
+                        cache_read_input_tokens=cache_read,
+                        cache_creation_input_tokens=cache_write,
+                    )
+                )
+
             # Extract the response text
             if (
                 "output" in response

@@ -353,6 +353,18 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             config=generation_config,
         )
 
+        usage_metadata = getattr(response, "usage_metadata", None)
+        if usage_metadata:
+            self.record_inference_usage(
+                LLMTokenUsage(
+                    prompt_tokens=usage_metadata.prompt_token_count or 0,
+                    completion_tokens=usage_metadata.candidates_token_count or 0,
+                    total_tokens=usage_metadata.total_token_count or 0,
+                    cache_read_input_tokens=usage_metadata.cached_content_token_count or 0,
+                    reasoning_tokens=usage_metadata.thoughts_token_count or 0,
+                )
+            )
+
         # Extract text from response
         if response.candidates and response.candidates[0].content:
             for part in response.candidates[0].content.parts:

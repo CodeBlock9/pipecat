@@ -387,6 +387,12 @@ class DograhSTTService(STTService, WebsocketService):
                 if from_finalize:
                     self.confirm_finalize()
                 logger.debug(f"Final transcription: {transcript}")
+                # Report usage before the transcription frame so tracing can
+                # attach it to the STT span the frame closes, and so a run that
+                # is cancelled mid-call still carries the seconds it consumed.
+                # Without this the base class only flushes on stop/cancel, and
+                # a rater that charges STT "only when it ran" would read zero.
+                await self.emit_stt_usage_metrics()
                 await self.push_frame(
                     TranscriptionFrame(
                         text=transcript,

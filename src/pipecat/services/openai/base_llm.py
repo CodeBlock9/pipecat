@@ -411,7 +411,35 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # LLM completion
         response = await self._client.chat.completions.create(**params)
 
+        self.record_inference_usage(self._inference_token_usage(response))
+
         return response.choices[0].message.content
+
+    def _inference_token_usage(self, response) -> LLMTokenUsage | None:
+        """Build token usage from a non-streaming chat completion.
+
+        Mirrors the accounting `_stream_chat_completions` reports for streamed
+        turns, so an out-of-band inference is metered on the same basis as one
+        that ran in the pipeline.
+        """
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return None
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        completion_details = getattr(usage, "completion_tokens_details", None)
+        return LLMTokenUsage(
+            prompt_tokens=usage.prompt_tokens or 0,
+            completion_tokens=usage.completion_tokens or 0,
+            total_tokens=usage.total_tokens or 0,
+            cache_read_input_tokens=(
+                getattr(prompt_details, "cached_tokens", None) if prompt_details else None
+            ),
+            reasoning_tokens=(
+                getattr(completion_details, "reasoning_tokens", None)
+                if completion_details
+                else None
+            ),
+        )
 
     @traced_llm
     async def _process_context(self, context: LLMContext):

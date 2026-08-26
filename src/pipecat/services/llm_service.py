@@ -55,6 +55,7 @@ from pipecat.frames.frames import (
     NodeTransitionStartedFrame,
     StartFrame,
 )
+from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import (
     NOT_GIVEN,
     LLMContext,
@@ -351,6 +352,9 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         # Whether the one-time realtime-service "no turn frames" warning has
         # fired (see _warn_if_realtime_service_emits_no_turn_frames).
         self._warned_realtime_service_no_turn_frames: bool = False
+        # Token usage from out-of-band `run_inference()` calls, accumulated
+        # until a caller collects it (see `collect_inference_usage`).
+        self._inference_usage: LLMTokenUsage | None = None
 
         self._register_event_handler("on_function_calls_started")
         self._register_event_handler("on_function_calls_cancelled")
@@ -396,6 +400,62 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
             The LLM's response as a string, or None if no response is generated.
         """
         raise NotImplementedError(f"run_inference() not supported by {self.__class__.__name__}")
+
+    def record_inference_usage(self, tokens: LLMTokenUsage | None) -> None:
+        """Accumulate token usage reported by an out-of-band inference.
+
+        `run_inference()` runs outside the pipeline, so its usage cannot travel
+        the frame route that `_process_context()` uses: `start_llm_usage_metrics`
+        is gated on `usage_metrics_enabled`, which is set from a `StartFrame`,
+        and a service used only for one-shot inference never receives one.
+        Recording the usage on the service instead makes it reachable by the
+        caller that asked for the inference.
+        """
+        if tokens is None:
+            return
+        current = self._inference_usage
+        if current is None:
+            self._inference_usage = tokens
+            return
+
+        def _add(a: int | None, b: int | None) -> int | None:
+            if a is None and b is None:
+                return None
+            return (a or 0) + (b or 0)
+
+        self._inference_usage = LLMTokenUsage(
+            prompt_tokens=current.prompt_tokens + tokens.prompt_tokens,
+            completion_tokens=current.completion_tokens + tokens.completion_tokens,
+            total_tokens=current.total_tokens + tokens.total_tokens,
+            cache_read_input_tokens=_add(
+                current.cache_read_input_tokens, tokens.cache_read_input_tokens
+            ),
+            cache_creation_input_tokens=_add(
+                current.cache_creation_input_tokens, tokens.cache_creation_input_tokens
+            ),
+            reasoning_tokens=_add(current.reasoning_tokens, tokens.reasoning_tokens),
+            input_audio_tokens=_add(
+                current.input_audio_tokens, tokens.input_audio_tokens
+            ),
+            output_audio_tokens=_add(
+                current.output_audio_tokens, tokens.output_audio_tokens
+            ),
+            cache_read_input_audio_tokens=_add(
+                current.cache_read_input_audio_tokens,
+                tokens.cache_read_input_audio_tokens,
+            ),
+        )
+
+    def collect_inference_usage(self) -> LLMTokenUsage | None:
+        """Take the token usage accumulated by `run_inference()` calls so far.
+
+        Returns the accumulated usage and resets the accumulator, so a caller
+        that collects after each inference is charged for that inference only,
+        and one that collects once at the end gets the whole session.
+        """
+        usage = self._inference_usage
+        self._inference_usage = None
+        return usage
 
     def service_metadata_frame(self) -> LLMServiceMetadataFrame:
         """The metadata frame this LLM service broadcasts at start.

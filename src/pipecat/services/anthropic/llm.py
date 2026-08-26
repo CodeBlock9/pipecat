@@ -334,6 +334,25 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
         # LLM completion
         response = await self._client.beta.messages.create(**params)
 
+        usage = getattr(response, "usage", None)
+        if usage:
+            input_tokens = getattr(usage, "input_tokens", 0) or 0
+            output_tokens = getattr(usage, "output_tokens", 0) or 0
+            cache_creation = getattr(usage, "cache_creation_input_tokens", None) or 0
+            cache_read = getattr(usage, "cache_read_input_tokens", None) or 0
+            self.record_inference_usage(
+                LLMTokenUsage(
+                    prompt_tokens=input_tokens,
+                    completion_tokens=output_tokens,
+                    # `input_tokens` is net of the cache here, so the gross
+                    # total adds the cached halves back rather than reading a
+                    # total the API does not report.
+                    total_tokens=input_tokens + cache_creation + cache_read + output_tokens,
+                    cache_creation_input_tokens=cache_creation,
+                    cache_read_input_tokens=cache_read,
+                )
+            )
+
         return next((block.text for block in response.content if hasattr(block, "text")), None)
 
     # Models known to support assistant message prefilling (a request whose
