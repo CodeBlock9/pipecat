@@ -1225,6 +1225,117 @@ class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
         assert context.messages[0]["content"] == "Hello Pipecat."
         assert context.messages[1]["content"] == "How are you?"
 
+    async def test_live_interruption_engages_interrupted_callback_after_correction(self):
+        context = LLMContext()
+        calls = []
+
+        def correct(text: str) -> str:
+            calls.append(("correct", text))
+            return text + "!"
+
+        def complete(text: str) -> str:
+            calls.append(("interrupted", text))
+            return text + " world"
+
+        aggregator = LLMAssistantAggregator(
+            context,
+            params=LLMAssistantAggregatorParams(
+                correct_aggregation_callback=correct,
+                interrupted_aggregation_callback=complete,
+            ),
+        )
+
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Hello "),
+            SleepFrame(),
+            InterruptionFrame(),
+        ]
+        expected_down_frames = [
+            LLMContextFrame,
+            LLMContextAssistantTimestampFrame,
+            LLMContextAssistantTurnFrame,
+            InterruptionFrame,
+        ]
+        await run_test(
+            aggregator,
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+        )
+        # Correction first, then the interrupted callback on its output.
+        self.assertEqual(calls, [("correct", "Hello"), ("interrupted", "Hello!")])
+        self.assertEqual(context.messages[-1]["content"], "Hello! world")
+
+    async def test_end_teardown_does_not_engage_interrupted_callback(self):
+        context = LLMContext()
+        calls = []
+
+        def correct(text: str) -> str:
+            calls.append(("correct", text))
+            return text
+
+        def complete(text: str) -> str:
+            calls.append(("interrupted", text))
+            return text + " world"
+
+        aggregator = LLMAssistantAggregator(
+            context,
+            params=LLMAssistantAggregatorParams(
+                correct_aggregation_callback=correct,
+                interrupted_aggregation_callback=complete,
+            ),
+        )
+
+        # run_test closes the pipeline with an EndFrame: the open turn is
+        # committed by teardown, which is not a live interruption.
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Hello "),
+            SleepFrame(),
+        ]
+        expected_down_frames = [
+            LLMContextFrame,
+            LLMContextAssistantTimestampFrame,
+            LLMContextAssistantTurnFrame,
+        ]
+        await run_test(
+            aggregator,
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+        )
+        self.assertEqual(calls, [("correct", "Hello")])
+        self.assertEqual(context.messages[-1]["content"], "Hello")
+
+    async def test_completed_turn_does_not_engage_interrupted_callback(self):
+        context = LLMContext()
+        calls = []
+
+        def complete(text: str) -> str:
+            calls.append(text)
+            return text + " world"
+
+        aggregator = LLMAssistantAggregator(
+            context,
+            params=LLMAssistantAggregatorParams(interrupted_aggregation_callback=complete),
+        )
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Hello"),
+            LLMFullResponseEndFrame(),
+        ]
+        expected_down_frames = [
+            LLMContextFrame,
+            LLMContextAssistantTimestampFrame,
+            LLMContextAssistantTurnFrame,
+        ]
+        await run_test(
+            aggregator,
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(context.messages[-1]["content"], "Hello")
+
     async def test_interruption(self):
         context = LLMContext()
 

@@ -225,6 +225,12 @@ class LLMAssistantAggregatorParams:
             ``add_tool_change_messages`` argument instead. Defaults to False.
         correct_aggregation_callback: Optional callback to correct corrupted
             TTS text before it's added to the conversation context.
+        interrupted_aggregation_callback: Optional callback applied to the
+            aggregation of an assistant turn that a live ``InterruptionFrame``
+            cut short, after ``correct_aggregation_callback``. Lets the
+            application decide what the context should record for a truncated
+            utterance (e.g. the full intended text). Not applied to turns
+            closed by ``EndFrame``/``CancelFrame`` teardown.
         enable_context_summarization: Legacy field name.
 
             .. deprecated:: 1.2.0
@@ -247,6 +253,7 @@ class LLMAssistantAggregatorParams:
     enable_context_summarization: bool | None = None
     context_summarization_config: LLMContextSummarizationConfig | None = None
     correct_aggregation_callback: Callable[[str], str] | None = None
+    interrupted_aggregation_callback: Callable[[str], str] | None = None
 
     def __post_init__(self):
         if self.enable_context_summarization is not None:
@@ -1623,8 +1630,15 @@ class LLMAssistantAggregator(LLMContextAggregator):
                 "across both halves."
             )
 
-    async def push_aggregation(self) -> str:
-        """Push the current assistant aggregation with timestamp."""
+    async def push_aggregation(self, *, live_interruption: bool = False) -> str:
+        """Push the current assistant aggregation with timestamp.
+
+        Args:
+            live_interruption: True when the turn is being committed because a
+                live ``InterruptionFrame`` cut it short; engages
+                ``interrupted_aggregation_callback`` after the correction
+                callback.
+        """
         if not self._aggregation:
             return ""
 
@@ -1637,6 +1651,11 @@ class LLMAssistantAggregator(LLMContextAggregator):
                     aggregation = self._params.correct_aggregation_callback(aggregation)
                 except Exception as e:
                     logger.error(f"Error in aggregation correction callback: {e}")
+            if live_interruption and self._params.interrupted_aggregation_callback:
+                try:
+                    aggregation = self._params.interrupted_aggregation_callback(aggregation)
+                except Exception as e:
+                    logger.error(f"Error in interrupted aggregation callback: {e}")
 
             logger.debug(f"{self} push_aggregation called - self._aggregation = {aggregation}")
             self._context.add_message({"role": "assistant", "content": aggregation})
@@ -1678,7 +1697,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
             await self.push_context_frame(FrameDirection.UPSTREAM)
 
     async def _handle_interruptions(self, frame: InterruptionFrame):
-        await self._trigger_assistant_turn_stopped(interrupted=True)
+        await self._trigger_assistant_turn_stopped(interrupted=True, live_interruption=True)
         await self.reset()
 
     async def _handle_end_or_cancel(self, frame: Frame):
@@ -2091,11 +2110,16 @@ class LLMAssistantAggregator(LLMContextAggregator):
 
         await self._call_event_handler("on_assistant_turn_started")
 
-    async def _trigger_assistant_turn_stopped(self, *, interrupted: bool = False):
+    async def _trigger_assistant_turn_stopped(
+        self, *, interrupted: bool = False, live_interruption: bool = False
+    ):
+        # ``live_interruption`` is narrower than ``interrupted``: EndFrame/
+        # CancelFrame teardown also reports interrupted=True but is not a
+        # live interruption, and must not engage the interrupted callback.
         if not self._assistant_turn_start_timestamp:
             return
 
-        aggregation = await self.push_aggregation()
+        aggregation = await self.push_aggregation(live_interruption=live_interruption)
         if aggregation:
             # Strip turn completion markers from the transcript
             aggregation = self._maybe_strip_turn_completion_markers(aggregation)
