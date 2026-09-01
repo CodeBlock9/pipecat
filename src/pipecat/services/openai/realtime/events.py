@@ -93,12 +93,18 @@ class TurnDetection(BaseModel):
         threshold: Voice activity detection threshold (0.0-1.0). Defaults to 0.5.
         prefix_padding_ms: Padding before speech starts in milliseconds. Defaults to 300.
         silence_duration_ms: Silence duration to detect speech end in milliseconds. Defaults to 500.
+        create_response: Whether the server automatically creates a response when VAD
+            detects the end of speech. None leaves the server default (true).
+        interrupt_response: Whether the server automatically cancels an in-progress
+            response when VAD detects speech start. None leaves the server default (true).
     """
 
     type: Literal["server_vad"] | None = "server_vad"
     threshold: float | None = 0.5
     prefix_padding_ms: int | None = 300
     silence_duration_ms: int | None = 500
+    create_response: bool | None = None
+    interrupt_response: bool | None = None
 
 
 class SemanticTurnDetection(BaseModel):
