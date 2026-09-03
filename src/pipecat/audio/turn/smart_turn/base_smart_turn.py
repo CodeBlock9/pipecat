@@ -166,6 +166,20 @@ class BaseSmartTurn(BaseTurnAnalyzer):
         logger.debug(f"End of Turn result: {state}")
         return state, result
 
+    async def cleanup(self):
+        """Release the per-analyzer inference thread at teardown.
+
+        ``ThreadPoolExecutor`` has no finaliser: without this the thread stays
+        parked on its work queue for the life of the process, and the module
+        level ``concurrent.futures.thread._threads_queues`` entry keeps it
+        alive. One analyzer per call therefore meant one leaked thread per
+        call. The shutdown does not wait, because this runs on the event loop
+        and the queue is empty by the time a turn analyzer is being cleaned up.
+        """
+        await super().cleanup()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._audio_buffer = []
+
     def update_vad_start_secs(self, vad_start_secs: float):
         """Store the new vad_start_secs value."""
         self._vad_start_secs = vad_start_secs

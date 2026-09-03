@@ -10,7 +10,8 @@ This module provides a smart turn analyzer that uses an ONNX model for
 local end-of-turn detection without requiring network connectivity.
 """
 
-from typing import Any, cast
+import threading
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import onnxruntime as ort
@@ -65,17 +66,43 @@ class LocalSmartTurnAnalyzerV3(BaseSmartTurn):
                         impresources.files(package_path).joinpath(model_name)
                     )
 
-        logger.debug(f"Loading Local Smart Turn v3.x model from {smart_turn_model_path}...")
+        self._session = self._shared_session(smart_turn_model_path, cpu_count)
 
-        so = ort.SessionOptions()
-        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        so.inter_op_num_threads = 1
-        so.intra_op_num_threads = cpu_count
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    #: One ONNX session per (model, thread count) for the whole process. The
+    #: session is ~28 MiB of ORT arena warm and holds no per-stream state --
+    #: everything that varies per audio stream is in ``_audio_buffer`` on the
+    #: analyzer -- so instances share it and ``run()`` is thread-safe. A server
+    #: that builds one analyzer per call was paying that 28 MiB per call, and
+    #: ORT does not return an arena to the OS when the session is destroyed, so
+    #: the process kept its worst-ever concurrency resident for good.
+    _session_cache: ClassVar[dict[tuple[str, int], "ort.InferenceSession"]] = {}
+    _session_cache_lock: ClassVar[threading.Lock] = threading.Lock()
 
-        self._session = ort.InferenceSession(smart_turn_model_path, sess_options=so)
+    @classmethod
+    def _shared_session(cls, model_path: str, cpu_count: int) -> "ort.InferenceSession":
+        """Return the process-wide session for ``model_path``, building it once."""
+        key = (str(model_path), int(cpu_count))
+        session = cls._session_cache.get(key)
+        if session is not None:
+            return session
+        with cls._session_cache_lock:
+            session = cls._session_cache.get(key)
+            if session is not None:
+                return session
 
-        logger.debug("Loaded Local Smart Turn v3.x")
+            logger.debug(f"Loading Local Smart Turn v3.x model from {model_path}...")
+
+            so = ort.SessionOptions()
+            so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            so.inter_op_num_threads = 1
+            so.intra_op_num_threads = cpu_count
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+            session = ort.InferenceSession(model_path, sess_options=so)
+            cls._session_cache[key] = session
+
+            logger.debug("Loaded Local Smart Turn v3.x")
+            return session
 
     def _write_audio_to_wav(
         self, audio_array: np.ndarray, sample_rate: int = _MODEL_SAMPLE_RATE, suffix: str = ""

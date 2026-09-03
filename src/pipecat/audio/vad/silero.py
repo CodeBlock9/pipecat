@@ -11,8 +11,9 @@ which can detect voice activity in audio streams with high accuracy.
 Supports 8kHz and 16kHz sample rates.
 """
 
+import threading
 import time
-from typing import cast
+from typing import ClassVar, cast
 
 import numpy as np
 from loguru import logger
@@ -39,6 +40,44 @@ class SileroOnnxModel:
     and input validation for audio processing.
     """
 
+    #: One ONNX session per (model, provider choice), shared by every instance
+    #: in the process. A session is ~9 MiB of ORT arena and is built from a
+    #: read-only graph: ``run()`` is thread-safe and carries no state between
+    #: calls, because everything that varies per audio stream lives in this
+    #: object's ``_state``/``_context`` arrays. Building one per instance is
+    #: what a server doing one analyzer per call was paying, and ORT's arena
+    #: allocator does not return that memory to the OS when the session dies,
+    #: so the cost was a permanent ratchet rather than a transient.
+    _session_cache: ClassVar[dict[tuple[str, bool], onnxruntime.InferenceSession]] = {}
+    _session_cache_lock: ClassVar[threading.Lock] = threading.Lock()
+
+    @classmethod
+    def _shared_session(cls, path: str, force_onnx_cpu: bool) -> onnxruntime.InferenceSession:
+        """Return the process-wide session for ``path``, building it once."""
+        key = (str(path), bool(force_onnx_cpu))
+        session = cls._session_cache.get(key)
+        if session is not None:
+            return session
+        with cls._session_cache_lock:
+            # Re-check: another thread may have built it while we waited.
+            session = cls._session_cache.get(key)
+            if session is not None:
+                return session
+
+            opts = onnxruntime.SessionOptions()
+            opts.inter_op_num_threads = 1
+            opts.intra_op_num_threads = 1
+
+            if force_onnx_cpu and "CPUExecutionProvider" in onnxruntime.get_available_providers():
+                session = onnxruntime.InferenceSession(
+                    path, providers=["CPUExecutionProvider"], sess_options=opts
+                )
+            else:
+                session = onnxruntime.InferenceSession(path, sess_options=opts)
+
+            cls._session_cache[key] = session
+            return session
+
     def __init__(self, path, force_onnx_cpu=True):
         """Initialize the Silero ONNX model.
 
@@ -46,16 +85,7 @@ class SileroOnnxModel:
             path: Path to the ONNX model file.
             force_onnx_cpu: Whether to force CPU execution provider.
         """
-        opts = onnxruntime.SessionOptions()
-        opts.inter_op_num_threads = 1
-        opts.intra_op_num_threads = 1
-
-        if force_onnx_cpu and "CPUExecutionProvider" in onnxruntime.get_available_providers():
-            self.session = onnxruntime.InferenceSession(
-                path, providers=["CPUExecutionProvider"], sess_options=opts
-            )
-        else:
-            self.session = onnxruntime.InferenceSession(path, sess_options=opts)
+        self.session = self._shared_session(path, force_onnx_cpu)
 
         self.reset_states()
         self.sample_rates = [8000, 16000]
