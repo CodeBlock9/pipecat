@@ -93,8 +93,33 @@ IDLE_TIMEOUT_SECS = 300
 
 CANCEL_TIMEOUT_SECS = 20.0
 
+# How many processors the cancel-timeout warning names before it summarizes the
+# rest. They are named in pipeline order, so the first ones are the useful ones.
+MAX_REPORTED_CANCEL_LAGGARDS = 5
+
 
 T = TypeVar("T")
+
+
+def _leaf_processors(processor: FrameProcessor) -> list[FrameProcessor]:
+    """Flatten a processor tree to the processors that actually handle frames.
+
+    Compound processors — pipelines within pipelines — are walked through
+    rather than reported, so the result reads as the chain a frame travels.
+
+    Args:
+        processor: The root to walk.
+
+    Returns:
+        The leaf processors, in pipeline order.
+    """
+    children = processor.processors
+    if not children:
+        return [processor]
+    leaves = []
+    for child in children:
+        leaves.extend(_leaf_processors(child))
+    return leaves
 
 
 class IdleFrameObserver(BaseObserver):
@@ -1003,7 +1028,8 @@ class PipelineWorker(BaseWorker):
                 logger.debug(f"{self}: {frame} reached the end of the pipeline.")
             except TimeoutError:
                 logger.warning(
-                    f"{self}: timeout waiting for {frame} to reach the end of the pipeline (being blocked somewhere?)."
+                    f"{self}: timeout waiting for {frame} to reach the end of the pipeline "
+                    f"(being blocked somewhere?). {self._cancel_progress_report()}"
                 )
             finally:
                 await self._call_event_handler("on_pipeline_finished", frame)
@@ -1021,6 +1047,26 @@ class PipelineWorker(BaseWorker):
         # We are really done. Setting ``_finished_event`` makes
         # ``BaseWorker.wait()`` resolve for callers awaiting this worker.
         self._finished_event.set()
+
+    def _cancel_progress_report(self) -> str:
+        """Where a `CancelFrame` got to in the pipeline, for the timeout warning.
+
+        A processor sets ``_cancelling`` the moment it starts handling the
+        frame, so the processors that have not set it are those the frame has
+        not reached — the first of them, in pipeline order, brackets whatever
+        is holding it up.
+
+        Returns:
+            A sentence naming the processors still waiting for the frame.
+        """
+        processors = _leaf_processors(self._pipeline)
+        pending = [p for p in processors if not p._cancelling]
+        if not pending:
+            return "Every processor has seen it."
+        names = ", ".join(p.name for p in pending[:MAX_REPORTED_CANCEL_LAGGARDS])
+        if len(pending) > MAX_REPORTED_CANCEL_LAGGARDS:
+            names += f", +{len(pending) - MAX_REPORTED_CANCEL_LAGGARDS} more"
+        return f"Not seen by {len(pending)} of {len(processors)} processors: {names}."
 
     async def _wait_for_pipeline_finished(self):
         await self._finished_event.wait()

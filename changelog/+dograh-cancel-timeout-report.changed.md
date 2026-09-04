@@ -1,0 +1,1 @@
+- The pipeline worker's cancel-timeout warning now names the processors the `CancelFrame` has not reached, in pipeline order, so a teardown that blocks says where it stopped.
