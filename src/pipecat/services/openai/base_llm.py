@@ -333,6 +333,15 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
             chunks = await self._client.chat.completions.create(**params)
             return chunks
 
+    async def cleanup(self):
+        """Clean up the service and close the provider client.
+
+        The client pools connections with no keepalive expiry, so its sockets
+        outlive the service unless it is closed.
+        """
+        await super().cleanup()
+        await self._close_provider_client(self._client)
+
     def build_chat_completion_params(self, params_from_context: OpenAILLMInvocationParams) -> dict:
         """Build parameters for chat completion request.
 

@@ -312,6 +312,15 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
         """Check if this service can generate processing metrics."""
         return True
 
+    async def cleanup(self):
+        """Clean up the service and close the provider client.
+
+        The client pools connections with no keepalive expiry, so its sockets
+        outlive the service unless it is closed.
+        """
+        await super().cleanup()
+        await self._close_provider_client(self._client)
+
     def _build_response_params(self, invocation_params: OpenAIResponsesLLMInvocationParams) -> dict:
         """Build parameters for a Responses API call.
 

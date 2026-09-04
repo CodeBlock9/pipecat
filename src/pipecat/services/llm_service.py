@@ -379,6 +379,27 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         """
         return self.get_llm_adapter().create_llm_specific_message(message)
 
+    async def _close_provider_client(self, client: Any) -> None:
+        """Close a provider SDK client at teardown.
+
+        The OpenAI and Anthropic clients pool connections with no keepalive
+        expiry, so a service that does not close its client leaves sockets open
+        for the life of the process. Closing is idempotent. A client that will
+        not close must not strand the rest of the pipeline's teardown, which
+        runs the remaining processors' `cleanup()` in sequence.
+
+        Args:
+            client: The SDK client to close. One without a ``close()`` — a test
+                double, say — is left alone.
+        """
+        close = getattr(client, "close", None)
+        if close is None:
+            return
+        try:
+            await close()
+        except Exception as e:
+            logger.debug(f"{self}: error closing the provider client: {e}")
+
     async def run_inference(
         self,
         context: LLMContext,

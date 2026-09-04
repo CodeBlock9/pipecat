@@ -1,0 +1,1 @@
+- `OpenAILLMService` and its OpenAI-compatible subclasses, the OpenAI Responses services and `AnthropicLLMService` now close their provider SDK client in `cleanup()`. Those clients pool connections with no keepalive expiry, so a service built per call held its sockets for the life of the process.

@@ -252,6 +252,11 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
         """
         return True
 
+    async def cleanup(self):
+        """Clean up the service and close the provider client."""
+        await super().cleanup()
+        await self._close_provider_client(self._client)
+
     async def _create_message_stream(self, api_call, params):
         """Create message stream with optional timeout and retry.
 
