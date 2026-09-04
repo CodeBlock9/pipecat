@@ -1,0 +1,1 @@
+- A realtime LLM session whose websocket fails on send now reports one fatal error and ends the call, instead of reporting the same failure on every audio frame while the caller talks to a session that can no longer answer. The socket is cleared on the first failure so later sends are no-ops, and closed at disconnect; a connect failure is fatal on the same reasoning.

@@ -346,6 +346,10 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
         self._video_frame_detail = video_frame_detail
         self._last_sent_time = 0
         self._websocket = None
+        # A websocket that failed and was retired without being closed. The
+        # send path cannot close it there (see `_park_websocket`), so
+        # `_disconnect` closes whatever is parked here.
+        self._dead_websocket = None
         self._receive_task = None
         self._context: LLMContext = None
 
@@ -740,8 +744,8 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
             )
             self._receive_task = self.create_task(self._receive_task_handler())
         except Exception as e:
-            await self.push_error(error_msg=f"Error connecting: {e}", exception=e)
-            self._websocket = None
+            self._park_websocket()
+            await self.push_error(error_msg=f"Error connecting: {e}", exception=e, fatal=True)
 
     async def _disconnect(self):
         try:
@@ -751,6 +755,7 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
             if self._websocket:
                 await self._websocket.close()
                 self._websocket = None
+            await self._close_dead_websocket()
             if self._receive_task:
                 await self.cancel_task(self._receive_task, timeout=1.0)
                 self._receive_task = None
@@ -774,7 +779,41 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
             # it is to recover from a send-side error with proper state management, and that exponential
             # backoff for retries can have cost/stability implications for a service cluster, let's just
             # treat a send-side error as fatal.
-            await self.push_error(error_msg=f"Error sending client event: {e}", exception=e)
+            #
+            # Retiring the socket first makes every later send a no-op, so a
+            # session whose socket has gone reports the failure once instead of
+            # once per frame the transport keeps feeding it.
+            self._park_websocket()
+            await self.push_error(
+                error_msg=f"Error sending client event: {e}", exception=e, fatal=True
+            )
+
+    def _park_websocket(self):
+        """Retire the current websocket without closing it.
+
+        Closing here is not an option: it would have to go through
+        `_disconnect`, which cancels the receive task — and the receive task is
+        often the caller. `_disconnect` closes the parked socket instead, so
+        nothing is leaked; the receive loop meanwhile exits on its own when the
+        peer closes.
+        """
+        if self._websocket:
+            self._dead_websocket = self._websocket
+            self._websocket = None
+
+    async def _close_dead_websocket(self):
+        """Close the parked websocket, if there is one.
+
+        A socket lands here because a send or a connect already failed on it,
+        so a close failure says nothing new and is swallowed.
+        """
+        if not self._dead_websocket:
+            return
+        websocket, self._dead_websocket = self._dead_websocket, None
+        try:
+            await websocket.close()
+        except Exception as e:
+            logger.debug(f"{self}: error closing a retired websocket: {e}")
 
     async def _update_settings(self, delta):
         """Apply a settings delta, sending a session update when needed."""
