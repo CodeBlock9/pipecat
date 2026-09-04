@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import uuid
 import warnings
@@ -352,6 +353,13 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         # Whether the one-time realtime-service "no turn frames" warning has
         # fired (see _warn_if_realtime_service_emits_no_turn_frames).
         self._warned_realtime_service_no_turn_frames: bool = False
+        # The parameter names `_wire_callable()` accepts, resolved on first use
+        # and kept for the life of the service; None once resolved means the
+        # service takes anything and nothing needs routing. See
+        # `_route_unsupported_options_to_extra_body`.
+        self._wire_parameter_names: frozenset[str] | None = None
+        self._wire_parameter_names_resolved: bool = False
+        self._unsupported_options_warned: bool = False
         # Token usage from out-of-band `run_inference()` calls, accumulated
         # until a caller collects it (see `collect_inference_usage`).
         self._inference_usage: LLMTokenUsage | None = None
@@ -399,6 +407,95 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
             await close()
         except Exception as e:
             logger.debug(f"{self}: error closing the provider client: {e}")
+
+    def _wire_callable(self) -> Callable[..., Any] | None:
+        """The provider SDK method that the built request parameters go to.
+
+        Used to tell a parameter of that method from a raw body field; see
+        `_route_unsupported_options_to_extra_body`. Return None — the default —
+        when the service has no single such method, which leaves every
+        parameter where it was built.
+        """
+        return None
+
+    def _route_unsupported_options_to_extra_body(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Move body fields the SDK method has no parameter for into ``extra_body``.
+
+        Provider options are forwarded verbatim, and that is what lets a key
+        the local settings model has never heard of reach an endpoint that
+        understands it — DeepSeek's ``thinking``, say. A key the SDK method
+        cannot take would instead raise ``TypeError`` before the request is
+        even sent, and on every turn of the call. Sending it through
+        ``extra_body`` — the SDK's own escape hatch for raw body fields — keeps
+        the option reaching providers that want it and turns the rest into a
+        provider response the caller can classify. The warning fires once per
+        service instance.
+
+        Args:
+            params: The request parameters, mutated in place.
+
+        Returns:
+            The same dictionary, for use as an expression.
+        """
+        supported = self._resolve_wire_parameter_names()
+        if supported is None:
+            return params
+
+        unsupported = [key for key in params if key not in supported]
+        if not unsupported:
+            return params
+
+        extra_body = dict(params.get("extra_body") or {})
+        for key in unsupported:
+            extra_body[key] = params.pop(key)
+        params["extra_body"] = extra_body
+
+        if not self._unsupported_options_warned:
+            wire_callable = self._wire_callable()
+            wire_name = getattr(wire_callable, "__qualname__", str(wire_callable))
+            logger.warning(
+                f"{self} sending {sorted(unsupported)} as raw body fields: not parameters of "
+                f"{wire_name}."
+            )
+            self._unsupported_options_warned = True
+
+        return params
+
+    def _resolve_wire_parameter_names(self) -> frozenset[str] | None:
+        """The parameter names `_wire_callable()` accepts, or None if it takes anything.
+
+        Resolved once per service instance: the SDK signature cannot change
+        under a live service, and reading it per request would put an
+        `inspect.signature` call on the completion path.
+        """
+        if self._wire_parameter_names_resolved:
+            return self._wire_parameter_names
+
+        self._wire_parameter_names_resolved = True
+        self._wire_parameter_names = self._read_wire_parameter_names()
+        return self._wire_parameter_names
+
+    def _read_wire_parameter_names(self) -> frozenset[str] | None:
+        """Read the accepted parameter names off `_wire_callable()`."""
+        wire_callable = self._wire_callable()
+        if wire_callable is None:
+            return None
+        try:
+            signature = inspect.signature(wire_callable)
+        except (TypeError, ValueError) as e:
+            # An SDK whose signature cannot be read forwards its parameters
+            # exactly as they were built.
+            logger.debug(f"{self}: cannot read the signature of {wire_callable}: {e}")
+            return None
+        parameters = signature.parameters.values()
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters):
+            # The method takes **kwargs, so nothing is unsupported.
+            return None
+        return frozenset(
+            p.name
+            for p in parameters
+            if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
 
     async def run_inference(
         self,

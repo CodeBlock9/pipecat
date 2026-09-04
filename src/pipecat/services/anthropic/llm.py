@@ -257,6 +257,10 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
         await super().cleanup()
         await self._close_provider_client(self._client)
 
+    def _wire_callable(self):
+        """The SDK method the built parameters are passed to."""
+        return self._client.beta.messages.create
+
     async def _create_message_stream(self, api_call, params):
         """Create message stream with optional timeout and retry.
 
@@ -335,6 +339,7 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
             params["thinking"] = thinking.model_dump(exclude_unset=True)
 
         params.update(self._settings.extra)
+        params = self._route_unsupported_options_to_extra_body(params)
 
         # LLM completion
         response = await self._client.beta.messages.create(**params)
@@ -440,6 +445,7 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
             params.update(params_from_context)
 
             params.update(self._settings.extra)
+            params = self._route_unsupported_options_to_extra_body(params)
 
             # "Interleaved thinking" needed to allow thinking between sequences
             # of function calls, when extended thinking is enabled.

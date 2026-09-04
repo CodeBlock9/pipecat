@@ -115,11 +115,9 @@ class InceptionLLMService(OpenAILLMService):
 
         # realtime is Inception-specific and unknown to the OpenAI SDK,
         # so it must be passed via extra_body to avoid validation errors.
-        extra_body = {}
         if is_given(self._settings.realtime) and self._settings.realtime is not None:
+            extra_body = dict(params.get("extra_body") or {})
             extra_body["realtime"] = self._settings.realtime
-
-        if extra_body:
             params["extra_body"] = extra_body
 
         return params

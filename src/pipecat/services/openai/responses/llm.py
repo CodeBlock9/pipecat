@@ -321,6 +321,10 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
         await super().cleanup()
         await self._close_provider_client(self._client)
 
+    def _wire_callable(self):
+        """The SDK method the built parameters are passed to."""
+        return self._client.responses.create
+
     def _build_response_params(self, invocation_params: OpenAIResponsesLLMInvocationParams) -> dict:
         """Build parameters for a Responses API call.
 
@@ -379,6 +383,7 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
 
         # Extra settings
         params = self.merge_provider_options(params)
+        params = self._route_unsupported_options_to_extra_body(params)
 
         return params
 

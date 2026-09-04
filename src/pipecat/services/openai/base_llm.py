@@ -342,6 +342,10 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         await super().cleanup()
         await self._close_provider_client(self._client)
 
+    def _wire_callable(self):
+        """The SDK method the built parameters are passed to."""
+        return self._client.chat.completions.create
+
     def build_chat_completion_params(self, params_from_context: OpenAILLMInvocationParams) -> dict:
         """Build parameters for chat completion request.
 
@@ -373,6 +377,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         params.update(params_from_context)
 
         params = self.merge_provider_options(params)
+        params = self._route_unsupported_options_to_extra_body(params)
 
         return params
 
