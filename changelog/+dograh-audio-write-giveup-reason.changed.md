@@ -1,0 +1,1 @@
+- The output transport's give-up after `audio_out_max_consecutive_failures` consecutive write failures pushes `CancelWorkerFrame(reason="audio_output_write_failed")` upstream instead of a bare `CancelTaskFrame`, so a consumer can tell a dead output socket apart from any other cancellation and dispose of the call on its own terms.

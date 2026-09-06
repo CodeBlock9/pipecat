@@ -19,7 +19,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     CancelFrame,
-    CancelTaskFrame,
+    CancelWorkerFrame,
     EndFrame,
     Frame,
     InterruptionFrame,
@@ -84,12 +84,16 @@ class TestBaseOutputTransportFailures(unittest.IsolatedAsyncioTestCase):
             )
 
             for _ in range(20):
-                if any(isinstance(frame, CancelTaskFrame) for frame, _ in transport.pushed_frames):
+                if any(
+                    isinstance(frame, CancelWorkerFrame) for frame, _ in transport.pushed_frames
+                ):
                     break
                 await asyncio.sleep(0.01)
 
             assert any(
-                isinstance(frame, CancelTaskFrame) and direction == FrameDirection.UPSTREAM
+                isinstance(frame, CancelWorkerFrame)
+                and frame.reason == "audio_output_write_failed"
+                and direction == FrameDirection.UPSTREAM
                 for frame, direction in transport.pushed_frames
             )
         finally:
