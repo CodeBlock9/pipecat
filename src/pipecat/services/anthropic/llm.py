@@ -168,6 +168,8 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
         client=None,
         retry_timeout_secs: float | None = 5.0,
         retry_on_timeout: bool | None = False,
+        request_timeout: float | None = None,
+        max_client_retries: int | None = None,
         **kwargs,
     ):
         """Initialize the Anthropic LLM service.
@@ -192,6 +194,13 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
             client: Optional custom Anthropic client instance.
             retry_timeout_secs: Request timeout in seconds for retry logic.
             retry_on_timeout: Whether to retry the request once if it times out.
+            request_timeout: Timeout applied to the Anthropic client, and so to
+                every request it makes. ``None`` keeps the SDK's own default,
+                which is ten minutes -- longer than any call this is used on.
+            max_client_retries: Retries the SDK performs inside one call.
+                ``None`` keeps the SDK's default. With a request timeout set,
+                the deadline a caller experiences is the timeout multiplied by
+                the attempts, which is why the two are configured together.
             **kwargs: Additional arguments passed to parent LLMService.
         """
         # 1. Initialize default_settings with hardcoded defaults
@@ -236,9 +245,14 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
             default_settings.apply_update(settings)
 
         super().__init__(settings=default_settings, **kwargs)
-        self._client = client or AsyncAnthropic(
-            api_key=api_key
-        )  # if the client is provided, use it and remove it, otherwise create a new one
+        anthropic_kwargs = {}
+        if request_timeout is not None:
+            anthropic_kwargs["timeout"] = request_timeout
+        if max_client_retries is not None:
+            anthropic_kwargs["max_retries"] = max_client_retries
+        # A provided client is used as given: its owner configured its own
+        # timeouts and retries.
+        self._client = client or AsyncAnthropic(api_key=api_key, **anthropic_kwargs)
         self._retry_timeout_secs = retry_timeout_secs
         self._retry_on_timeout = retry_on_timeout
         if self._settings.system_instruction:

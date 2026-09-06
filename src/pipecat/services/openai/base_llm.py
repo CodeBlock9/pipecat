@@ -147,6 +147,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         settings: Settings | None = None,
         retry_timeout_secs: float | None = 5.0,
         retry_on_timeout: bool | None = False,
+        request_timeout: float | httpx.Timeout | None = None,
+        turn_request_timeout: float | httpx.Timeout | None = None,
+        max_client_retries: int | None = None,
         **kwargs,
     ):
         """Initialize the BaseOpenAILLMService.
@@ -174,6 +177,24 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 parameters, ``settings`` values take precedence.
             retry_timeout_secs: Request timeout in seconds. Defaults to 5.0 seconds.
             retry_on_timeout: Whether to retry the request once if it times out.
+            request_timeout: Timeout applied to the HTTP client, and therefore to
+                every request this service makes that does not override it. A
+                float is httpx's whole-operation timeout; an ``httpx.Timeout``
+                lets connect and read be set separately, which is usually what
+                is wanted -- ``read`` bounds time-to-first-token and then each
+                inter-chunk gap, so a trickling stream is tolerated and a
+                stopped one is not. ``None`` keeps the SDK's own default, which
+                is ten minutes.
+            turn_request_timeout: Timeout passed per request on the *streaming*
+                completion only. A conversational turn and an out-of-band
+                inference have very different deadlines and often share one
+                client, so the client carries the looser one and the turn
+                overrides it. ``None`` means the client's timeout applies to
+                both.
+            max_client_retries: Retries the SDK performs inside one call.
+                ``None`` keeps the SDK's default of two. Set it to bound the
+                worst case: with a request timeout, the deadline a caller
+                experiences is the timeout multiplied by the attempts.
             **kwargs: Additional arguments passed to the parent LLMService.
         """
         # 1. Initialize default_settings with hardcoded defaults
@@ -220,6 +241,11 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         self._service_tier = service_tier
         self._retry_timeout_secs = retry_timeout_secs
         self._retry_on_timeout = retry_on_timeout
+        # Bound before create_client runs: subclasses override that method and
+        # read these there.
+        self._request_timeout = request_timeout
+        self._turn_request_timeout = turn_request_timeout
+        self._max_client_retries = max_client_retries
         self._full_model_name: str = ""
         self._client = self.create_client(
             api_key=api_key,
@@ -258,6 +284,12 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         Returns:
             Configured AsyncOpenAI client instance.
         """
+        client_kwargs = {}
+        if self._max_client_retries is not None:
+            client_kwargs["max_retries"] = self._max_client_retries
+        http_kwargs = {}
+        if self._request_timeout is not None:
+            http_kwargs["timeout"] = self._request_timeout
         return AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -266,9 +298,11 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
             http_client=DefaultAsyncHttpxClient(
                 limits=httpx.Limits(
                     max_keepalive_connections=100, max_connections=1000, keepalive_expiry=None
-                )
+                ),
+                **http_kwargs,
             ),
             default_headers=default_headers,
+            **client_kwargs,
         )
 
     def can_generate_metrics(self) -> bool:
@@ -318,6 +352,13 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
         params = self.build_chat_completion_params(params_from_context)
 
+        # A per-request override rather than a client setting: one service
+        # instance often serves both the conversational turn and out-of-band
+        # inference, and a non-streaming inference legitimately takes much
+        # longer than a turn is allowed to.
+        if self._turn_request_timeout is not None:
+            params["timeout"] = self._turn_request_timeout
+
         if self._retry_on_timeout:
             try:
                 chunks = await asyncio.wait_for(
@@ -325,7 +366,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 )
                 return chunks
             except (TimeoutError, APITimeoutError):
-                # Retry, this time without a timeout so we get a response
+                # Retry without the wait_for so we get a response. A configured
+                # `request_timeout` still applies at the client, so the retry
+                # carries the same deadline.
                 logger.debug(f"{self}: Retrying chat completion due to timeout")
                 chunks = await self._client.chat.completions.create(**params)
                 return chunks
@@ -666,7 +709,11 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 await self.push_frame(LLMFullResponseStartFrame())
                 await self.start_processing_metrics()
                 await self._process_context(frame.context)
-            except httpx.TimeoutException as e:
+            except (TimeoutError, httpx.TimeoutException, APITimeoutError) as e:
+                # All three shapes a request deadline can take: the SDK raises
+                # `APITimeoutError` for a client-level timeout on `create()`
+                # and lets httpx's own exception through while the stream is
+                # being iterated.
                 await self._call_event_handler("on_completion_timeout")
                 await self.push_error(error_msg="LLM completion timeout", exception=e)
             except Exception as e:

@@ -89,8 +89,16 @@ class AzureLLMService(OpenAILLMService):
             AsyncAzureOpenAI: Configured Azure OpenAI client instance.
         """
         logger.debug(f"Creating Azure OpenAI client with endpoint {self._endpoint}")
+        # The base class's request deadline and retry bound reach the Azure
+        # client too; without this they would apply only to `AsyncOpenAI`.
+        client_kwargs = {}
+        if self._max_client_retries is not None:
+            client_kwargs["max_retries"] = self._max_client_retries
+        if self._request_timeout is not None:
+            client_kwargs["timeout"] = self._request_timeout
         return AsyncAzureOpenAI(
             api_key=api_key,
             azure_endpoint=self._endpoint,
             api_version=self._api_version,
+            **client_kwargs,
         )
