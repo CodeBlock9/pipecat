@@ -198,6 +198,12 @@ class LLMUserAggregatorParams:
             )
 
 
+#: Logged once for a generation that produced neither text nor a function call.
+#: A model that answers with nothing raises no error and leaves a run that looks
+#: complete, so this line is the only signal such a turn has.
+EMPTY_COMPLETION_LOG = "LLM generation produced no text"
+
+
 @dataclass
 class LLMAssistantAggregatorParams:
     """Parameters for configuring LLM assistant aggregation behavior.
@@ -1453,6 +1459,11 @@ class LLMAssistantAggregator(LLMContextAggregator):
 
         self._assistant_turn_start_timestamp = ""
 
+        # Whether the generation now in flight has produced anything at all.
+        # A tool-only turn produces no text and is not empty, so a function
+        # call counts as output.
+        self._generation_produced_output = False
+
         self._thought_append_to_context = False
         self._thought_llm: str = ""
         self._thought_aggregation: list[TextPartForConcatenation] = []
@@ -1717,6 +1728,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
     async def _handle_function_calls_started(self, frame: FunctionCallsStartedFrame):
         function_names = [f"{f.function_name}:{f.tool_call_id}" for f in frame.function_calls]
         logger.debug(f"{self} FunctionCallsStartedFrame: {function_names}")
+        self._generation_produced_output = True
         for function_call in frame.function_calls:
             self._function_calls_in_progress[function_call.tool_call_id] = None
 
@@ -1949,6 +1961,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # Realtime mode treats LLMFullResponseStartFrame as the user
         # turn's end signal for context-writing purposes — see
         # _realtime_handle_llm_start.
+        self._generation_produced_output = False
         if self._realtime_service_mode:
             await self._realtime_handle_llm_start()
             return
@@ -1975,6 +1988,11 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # context.
         if self._realtime_service_mode and self._paired_user_aggregator is not None:
             await self._paired_user_aggregator._realtime_handoff_flush_immediate()
+        if not self._generation_produced_output:
+            logger.warning(
+                f"{EMPTY_COMPLETION_LOG}: {self} saw neither text nor a function "
+                f"call for this generation"
+            )
         await self._trigger_assistant_turn_stopped()
 
     async def _handle_tts_started(self, frame: TTSStartedFrame):
@@ -2001,6 +2019,8 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # Make sure we really have text (spaces count, too!)
         if len(frame.text) == 0:
             return
+
+        self._generation_produced_output = True
 
         text = (
             frame.raw_text
