@@ -7,9 +7,11 @@
 """Base classes for Text-to-speech services."""
 
 import asyncio
+import time
 import uuid
 import warnings
 from abc import abstractmethod
+from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -105,6 +107,11 @@ class _WordTimestampEntry:
     includes_inter_frame_spaces: bool = False
 
 
+#: Prefix on every line a synthesis deadline produces, so an operator can count
+#: them without matching a provider's own wording.
+TTS_SYNTHESIS_TIMEOUT = "TTS synthesis timeout"
+
+
 class TTSService(AIService):
     """Base class for text-to-speech services.
 
@@ -164,6 +171,14 @@ class TTSService(AIService):
         # if pause_frame_processing is True, force-resume if no BotStartedSpeakingFrame
         # arrives within this many seconds of pausing
         pause_watchdog_timeout_s: float = 3.0,
+        # Deadline for the first audio of one synthesis, and then for each gap
+        # between chunks. None leaves synthesis unbounded.
+        synthesis_first_chunk_timeout_s: float | None = None,
+        synthesis_chunk_gap_timeout_s: float | None = None,
+        # Synthesis timeouts inside synthesis_timeout_window_s that make the
+        # error fatal rather than droppable.
+        synthesis_timeout_burst: int = 3,
+        synthesis_timeout_window_s: float = 30.0,
         # if True, append a trailing space to text before sending to TTS
         # (helps prevent some TTS services from vocalizing trailing punctuation)
         append_trailing_space: bool = False,
@@ -218,6 +233,18 @@ class TTSService(AIService):
                 against a context completing with no audio (e.g. a quota-exhausted TTS provider
                 reporting success with zero bytes), or a BotStoppedSpeakingFrame race that leaves
                 the pause permanently latched.
+            synthesis_first_chunk_timeout_s: Deadline for the first audio of one
+                synthesis. ``None`` leaves synthesis unbounded, which is the
+                default. Applied around the ``run_tts`` iteration and, for
+                services that deliver audio on a separate receive loop, as a
+                per-context watchdog armed when the request is sent.
+            synthesis_chunk_gap_timeout_s: Deadline for each gap between audio
+                chunks once the first has arrived. ``None`` leaves the gaps
+                unbounded.
+            synthesis_timeout_burst: Synthesis deadlines inside
+                ``synthesis_timeout_window_s`` that make the error fatal. Below
+                it, one expiry costs a sentence and the error is droppable.
+            synthesis_timeout_window_s: Window the burst is counted over.
             append_trailing_space: Whether to append a trailing space to text before sending to TTS.
                 This helps prevent some TTS services from vocalizing trailing punctuation (e.g., "dot").
                 Only applied in sentence aggregation mode; when streaming tokens, the incoming
@@ -296,6 +323,12 @@ class TTSService(AIService):
         self._silence_time_s: float = silence_time_s
         self._pause_frame_processing: bool = pause_frame_processing
         self._pause_watchdog_timeout_s: float = pause_watchdog_timeout_s
+        self._synthesis_first_chunk_timeout_s = synthesis_first_chunk_timeout_s
+        self._synthesis_chunk_gap_timeout_s = synthesis_chunk_gap_timeout_s
+        self._synthesis_timeout_burst = synthesis_timeout_burst
+        self._synthesis_timeout_window_s = synthesis_timeout_window_s
+        self._synthesis_timeout_times: deque[float] = deque()
+        self._synthesis_watchdogs: dict[str, asyncio.Task] = {}
         self._pause_watchdog_task: asyncio.Task | None = None
         # Whether the bot is currently speaking. Set on BotStartedSpeakingFrame,
         # cleared on BotStoppedSpeakingFrame and InterruptionFrame. Lets
@@ -1237,6 +1270,7 @@ class TTSService(AIService):
 
         # Trigger event before starting TTS
         await self._call_event_handler("on_tts_request", context_id, prepared_text)
+        await self._arm_synthesis_watchdog(context_id)
 
         if self._push_start_frame and not self.audio_context_available(context_id):
             await self.create_audio_context(context_id)
@@ -1322,13 +1356,90 @@ class TTSService(AIService):
 
         """
         is_yielding_frames = False
-        async for frame in generator:
+        first = True
+        while True:
+            timeout = (
+                self._synthesis_first_chunk_timeout_s
+                if first
+                else self._synthesis_chunk_gap_timeout_s
+            )
+            try:
+                if timeout is None:
+                    frame = await generator.__anext__()
+                else:
+                    frame = await asyncio.wait_for(generator.__anext__(), timeout)
+            except StopAsyncIteration:
+                break
+            except TimeoutError:
+                # Closing the generator is what un-wedges an HTTP-shaped
+                # service: the request is still open inside it, and abandoning
+                # the coroutine without aclose() leaves it there.
+                await generator.aclose()
+                await self._report_synthesis_timeout(
+                    f"{TTS_SYNTHESIS_TIMEOUT}: no "
+                    f"{'audio' if first else 'further audio'} within {timeout:g}s"
+                )
+                break
+            first = False
             if frame:
                 await self.append_to_audio_context(context_id, frame)
                 if isinstance(frame, TTSAudioRawFrame):
                     is_yielding_frames = True
 
         self._is_yielding_frames_synchronously = is_yielding_frames
+
+    async def _report_synthesis_timeout(self, message: str):
+        """Report one synthesis deadline, escalating a burst of them to fatal.
+
+        One expiry costs the caller a sentence and the next one is usually
+        fine, so the error is droppable. A burst inside
+        ``synthesis_timeout_window_s`` is a synthesiser that is not coming
+        back, and a caller listening to silence is better served by a line that
+        drops than by another dropped sentence.
+        """
+        now = time.monotonic()
+        self._synthesis_timeout_times.append(now)
+        while (
+            self._synthesis_timeout_times
+            and now - self._synthesis_timeout_times[0] > self._synthesis_timeout_window_s
+        ):
+            self._synthesis_timeout_times.popleft()
+
+        fatal = len(self._synthesis_timeout_times) >= self._synthesis_timeout_burst
+        if fatal:
+            self._synthesis_timeout_times.clear()
+        logger.warning(f"{self}: {message}")
+        await self.push_error(error_msg=message, fatal=fatal)
+
+    async def _arm_synthesis_watchdog(self, context_id: str):
+        """Bound a synthesis whose audio arrives on a separate receive loop.
+
+        A websocket-shaped service yields ``None`` from ``run_tts`` and delivers
+        audio through its own receive loop, so the generator finishes at once
+        and the deadline around it bounds nothing. This watchdog is the same
+        deadline expressed on the context: armed when the request is sent,
+        cleared by the first audio frame appended to that context.
+        """
+        if self._synthesis_first_chunk_timeout_s is None:
+            return
+        await self._cancel_synthesis_watchdog(context_id)
+
+        async def _watch():
+            await asyncio.sleep(self._synthesis_first_chunk_timeout_s)
+            await self._report_synthesis_timeout(
+                f"{TTS_SYNTHESIS_TIMEOUT}: no audio for context {context_id} "
+                f"within {self._synthesis_first_chunk_timeout_s:g}s"
+            )
+
+        self._synthesis_watchdogs[context_id] = self.create_task(
+            _watch(), name=f"{self}::synthesis_watchdog::{context_id}"
+        )
+
+    async def _cancel_synthesis_watchdog(self, context_id: str):
+        """Disarm the watchdog for one context, if it is armed."""
+        task = self._synthesis_watchdogs.pop(context_id, None)
+        if task and not task.done():
+            await self.cancel_task(task)
 
     #
     # Word timestamp methods
@@ -1477,6 +1588,8 @@ class TTSService(AIService):
         if not context_id:
             logger.debug(f"{self} unable to append audio to context: no context ID provided")
             return
+        if isinstance(frame, TTSAudioRawFrame):
+            await self._cancel_synthesis_watchdog(context_id)
         if self.audio_context_available(context_id):
             logger.trace(f"{self} appending audio {frame} to audio context {context_id}")
             await self._audio_contexts[context_id].put(frame)
