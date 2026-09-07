@@ -420,6 +420,7 @@ class PipelineWorker(BaseWorker):
         # This is the heartbeat queue. When a heartbeat frame is received in the
         # down queue we add it to the heartbeat queue for processing.
         self._heartbeat_queue = asyncio.Queue()
+        self._heartbeats_received = 0
         self._heartbeat_push_task: asyncio.Task | None = None
         self._heartbeat_monitor_task: asyncio.Task | None = None
 
@@ -1302,12 +1303,25 @@ class PipelineWorker(BaseWorker):
                 frame = await asyncio.wait_for(self._heartbeat_queue.get(), timeout=wait_time)
                 process_time = (self._clock.get_time() - frame.timestamp) / 1_000_000_000
                 logger.trace(f"{self}: heartbeat frame processed in {process_time} seconds")
+                self._heartbeats_received += 1
                 self._heartbeat_queue.task_done()
             except TimeoutError:
                 logger.warning(
                     f"{self}: heartbeat frame not received for more than {wait_time} seconds"
                 )
                 await self._call_event_handler("on_heartbeat_timeout")
+
+    @property
+    def heartbeats_received(self) -> int:
+        """How many heartbeat frames have traversed the pipeline.
+
+        Monotonic for the life of the worker. An ``on_heartbeat_timeout``
+        handler reads it to tell a pipeline that is stalled from one that is
+        merely slow: between two timeouts the count either moved, in which case
+        frames are still getting through, or it did not, in which case nothing
+        is.
+        """
+        return self._heartbeats_received
 
     async def _idle_monitor_handler(self):
         """Monitor pipeline activity and detect idle conditions.

@@ -1,0 +1,1 @@
+- `PipelineWorker.heartbeats_received` reports how many heartbeat frames have traversed the pipeline, monotonic for the life of the worker. `on_heartbeat_timeout` fires on the same period whether the pipeline has stopped or is merely slow, so a handler that wants to tell those apart reads this between events: a count that moved means frames are still getting through.
