@@ -421,6 +421,9 @@ class PipelineWorker(BaseWorker):
         # down queue we add it to the heartbeat queue for processing.
         self._heartbeat_queue = asyncio.Queue()
         self._heartbeats_received = 0
+        # Set by `cancel()` for one cancellation; None means the worker's own
+        # `cancel_timeout_secs`.
+        self._pending_cancel_timeout_secs: float | None = None
         self._heartbeat_push_task: asyncio.Task | None = None
         self._heartbeat_monitor_task: asyncio.Task | None = None
 
@@ -716,13 +719,21 @@ class PipelineWorker(BaseWorker):
         logger.debug(f"Task {self} scheduled to stop when done")
         await self.queue_frame(EndFrame())
 
-    async def cancel(self, *, reason: str | None = None):
+    async def cancel(self, *, reason: str | None = None, cancel_timeout_secs: float | None = None):
         """Request the running pipeline to cancel.
 
         Args:
             reason: Optional reason to indicate why the pipeline is being cancelled.
+            cancel_timeout_secs: How long to wait for the ``CancelFrame`` to
+                reach the end of the pipeline, for this cancellation only.
+                ``None`` uses the worker's own ``cancel_timeout_secs``. A caller
+                that already knows the pipeline cannot forward frames -- an
+                output transport that has given up on its socket, say -- passes
+                a short value: the frame will not arrive, and waiting the full
+                timeout holds the worker open for no benefit.
         """
         if not self._finished:
+            self._pending_cancel_timeout_secs = cancel_timeout_secs
             await self._cancel(reason=reason)
 
     async def run(self, params: WorkerParams):
@@ -1022,15 +1033,19 @@ class PipelineWorker(BaseWorker):
         """Wait for the specified frame to reach the end of the pipeline."""
 
         async def wait_for_cancel():
+            timeout = (
+                self._cancel_timeout_secs
+                if self._pending_cancel_timeout_secs is None
+                else self._pending_cancel_timeout_secs
+            )
             try:
-                await asyncio.wait_for(
-                    self._pipeline_end_event.wait(), timeout=self._cancel_timeout_secs
-                )
+                await asyncio.wait_for(self._pipeline_end_event.wait(), timeout=timeout)
                 logger.debug(f"{self}: {frame} reached the end of the pipeline.")
             except TimeoutError:
                 logger.warning(
                     f"{self}: timeout waiting for {frame} to reach the end of the pipeline "
-                    f"(being blocked somewhere?). {self._cancel_progress_report()}"
+                    f"after {timeout}s (being blocked somewhere?). "
+                    f"{self._cancel_progress_report()}"
                 )
             finally:
                 await self._call_event_handler("on_pipeline_finished", frame)
