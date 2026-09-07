@@ -1041,6 +1041,9 @@ class TTSService(AIService):
         await self.reset_word_timestamps()
 
         await self._stop_audio_context_task()
+        # Every synthesis in flight is over, including one still waiting on its
+        # first audio chunk from a receive loop.
+        await self._end_all_synthesis_watchdogs()
         # Drops non-UninterruptibleFrame items while keeping uninterruptible ones
         # (e.g. FunctionCallResultFrame) that must not be lost mid-flight.
         self._serialization_queue.reset()
@@ -1356,6 +1359,7 @@ class TTSService(AIService):
         """
         is_yielding_frames = False
         yielded_audio = False
+        yielded_error = False
         timed_out = False
         first = True
         while True:
@@ -1390,6 +1394,13 @@ class TTSService(AIService):
                     # delivering the synthesis. See below.
                     yielded_audio = True
                     is_yielding_frames = True
+                elif isinstance(frame, ErrorFrame):
+                    # `yield ErrorFrame(...)` is how every HTTP service reports
+                    # a synthesis that failed. The failure is already on its
+                    # way downstream, so a watchdog here would report the same
+                    # one again seconds later -- and the second report counts
+                    # towards the fatal burst.
+                    yielded_error = True
 
         # Only now is the shape of this service known, and only one shape
         # needs the context watchdog.
@@ -1403,20 +1414,25 @@ class TTSService(AIService):
         # its receive loop. Counting that control frame as delivery left the
         # first sentence of every turn on those services with no bound at all.
         #
-        # A generator that yielded audio, or that hit its own deadline, has
-        # been bounded already -- arming a watchdog carrying the same deadline
-        # would report one stalled sentence twice and reach the fatal burst on
-        # the second stall rather than the third. A generator that returned
-        # having yielded no audio is websocket-shaped: nothing else is watching
-        # for that audio, and the deadline starts here, once the request is
-        # known to be away.
+        # A generator that yielded audio, that hit its own deadline, or that
+        # yielded an `ErrorFrame` has been accounted for already -- arming a
+        # watchdog carrying the same deadline would report one failure twice
+        # and reach the fatal burst a sentence early. A generator that returned
+        # having yielded no audio and no error is websocket-shaped: nothing
+        # else is watching for that audio, and the deadline starts here, once
+        # the request is known to be away.
+        #
+        # Everything that ends such a synthesis early has to disarm it: the
+        # first audio frame (`append_to_audio_context`), the context being
+        # removed or torn down, and an interruption -- see
+        # `_end_all_synthesis_watchdogs`.
         #
         # This is why the watchdog is armed after the generator and not before
         # it: armed before, its countdown starts marginally *earlier* than the
         # deadline around the iteration, so on an HTTP-shaped stall it fires
         # first and no amount of disarming afterwards can take that report
         # back.
-        if not yielded_audio and not timed_out:
+        if not yielded_audio and not timed_out and not yielded_error:
             await self._arm_synthesis_watchdog(context_id)
 
         self._is_yielding_frames_synchronously = is_yielding_frames
@@ -1487,6 +1503,24 @@ class TTSService(AIService):
         task = self._synthesis_watchdogs.pop(context_id, None)
         if task and not task.done():
             await self.cancel_task(task)
+
+    async def _end_all_synthesis_watchdogs(self):
+        """Disarm every armed synthesis, for an interruption.
+
+        A barge-in ends every synthesis in flight, and the window this matters
+        in is the one arming *after* ``run_tts`` opened: from the moment a
+        websocket service's request is away until its first audio chunk -- the
+        first sentence of a turn, before the bot has made a sound, which is
+        exactly when a caller talks over it. Left armed, the watchdog reports a
+        timeout for audio nobody is waiting for any more, and three of those
+        inside the window end the call.
+
+        By context id rather than through ``get_audio_contexts()``: an armed
+        context may already have been deleted by the time the interruption
+        lands, and the entry would then outlive every list that could name it.
+        """
+        for context_id in list(self._synthesis_watchdogs):
+            await self._cancel_synthesis_watchdog(context_id)
 
     async def _end_synthesis_watchdog(self, context_id: str):
         """Disarm on a context that has ended, whether or not audio arrived.
@@ -1775,7 +1809,12 @@ class TTSService(AIService):
                 # audio available (i.e. we find None).
                 await self._handle_audio_context(context_id)
 
-                # We just finished processing the context, so we can safely remove it.
+                # We just finished processing the context, so we can safely
+                # remove it. `del` and not `remove_audio_context`, so the
+                # watchdog has to be ended here explicitly: a context that
+                # completed without ever appending a `TTSAudioRawFrame` would
+                # otherwise leave one armed and firing after it was over.
+                await self._end_synthesis_watchdog(context_id)
                 del self._audio_contexts[context_id]
                 await self.on_audio_context_completed(context_id=context_id)
                 self.reset_active_audio_context()

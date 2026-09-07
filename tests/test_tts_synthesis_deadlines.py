@@ -344,3 +344,94 @@ async def test_audio_after_a_control_frame_still_disarms_it():
 
     assert service.errors == []
     assert service._synthesis_watchdogs == {}
+
+
+# ---------------------------------------------------------------------------
+# ... and disarmed by every way a synthesis can end
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_barge_in_during_the_arming_window_fires_no_timeout():
+    """The window the round-4 widening opened, and the frame that lands in it.
+
+    Arming after `run_tts` returns means a websocket-shaped service is watched
+    from the moment its request is away until its first audio chunk -- and that
+    is exactly the window a caller barges into on the first sentence of a turn,
+    before the bot has made a sound. `_handle_interruption` tears down the
+    aggregator, the sequencer, the serialization queue and the audio contexts
+    and never touched `_synthesis_watchdogs`, so the watchdog outlived the
+    synthesis it was watching and reported a timeout for audio nobody was
+    waiting for any more. Three of those inside the window is fatal.
+    """
+    from pipecat.frames.frames import InterruptionFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    service = _StubTTS(chunks=[], synthesis_first_chunk_timeout_s=0.05)
+
+    await service._push_tts_frames(
+        AggregatedTextFrame(text="hi", aggregated_by=AggregationType.SENTENCE)
+    )
+    assert service._synthesis_watchdogs, "nothing was armed, so this proves nothing"
+
+    await service._handle_interruption(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+    await asyncio.sleep(0.25)
+
+    assert service._synthesis_watchdogs == {}
+    assert service.errors == []
+
+
+@pytest.mark.asyncio
+async def test_a_generator_that_yielded_an_error_frame_arms_nothing():
+    """Every HTTP TTS yields one on its exception path.
+
+    `yield ErrorFrame(...)` is how a Google, OpenAI or Azure synthesis reports
+    that it failed. That is not audio, so the widened rule armed a watchdog for
+    it -- and then reported a synthesis timeout seconds later for a synthesis
+    whose failure had already been pushed. One fault, two reports, and the
+    second one counting towards the fatal burst.
+    """
+    from pipecat.frames.frames import ErrorFrame
+
+    service = _StubTTS(
+        chunks=[ErrorFrame("provider said no")],
+        synthesis_first_chunk_timeout_s=0.05,
+    )
+
+    await service._push_tts_frames(
+        AggregatedTextFrame(text="hi", aggregated_by=AggregationType.SENTENCE)
+    )
+    await asyncio.sleep(0.25)
+
+    assert service._synthesis_watchdogs == {}
+    assert service.errors == []
+
+
+@pytest.mark.asyncio
+async def test_a_context_torn_down_by_the_handler_takes_its_watchdog_with_it():
+    """`del self._audio_contexts[...]` is not `remove_audio_context`.
+
+    Only the latter calls `_end_synthesis_watchdog`, and the handler that
+    finishes a context deletes it directly -- so a context that completed
+    without ever appending a `TTSAudioRawFrame` left its watchdog armed and
+    firing.
+    """
+    service = _StubTTS(chunks=[], synthesis_first_chunk_timeout_s=0.05)
+
+    await service.create_audio_context("ctx")
+    await service._arm_synthesis_watchdog("ctx")
+    # Mark it for deletion, then let the handler drain and tear it down. The
+    # sentinel goes into the queue directly: this stub overrides
+    # append_to_audio_context and would swallow it.
+    await service._audio_contexts["ctx"].put(None)
+    await service._serialization_queue.put("ctx")
+    handler = asyncio.create_task(service._audio_context_task_handler())
+    await asyncio.sleep(0.1)
+
+    try:
+        assert "ctx" not in service._audio_contexts
+        assert service._synthesis_watchdogs == {}
+        await asyncio.sleep(0.2)
+        assert service.errors == []
+    finally:
+        handler.cancel()
