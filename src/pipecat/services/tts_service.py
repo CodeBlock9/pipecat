@@ -1270,7 +1270,6 @@ class TTSService(AIService):
 
         # Trigger event before starting TTS
         await self._call_event_handler("on_tts_request", context_id, prepared_text)
-        await self._arm_synthesis_watchdog(context_id)
 
         if self._push_start_frame and not self.audio_context_available(context_id):
             await self.create_audio_context(context_id)
@@ -1357,6 +1356,7 @@ class TTSService(AIService):
         """
         is_yielding_frames = False
         yielded_anything = False
+        timed_out = False
         first = True
         while True:
             timeout = (
@@ -1376,6 +1376,7 @@ class TTSService(AIService):
                 # service: the request is still open inside it, and abandoning
                 # the coroutine without aclose() leaves it there.
                 await generator.aclose()
+                timed_out = True
                 await self._report_synthesis_timeout(
                     f"{TTS_SYNTHESIS_TIMEOUT}: no "
                     f"{'audio' if first else 'further audio'} within {timeout:g}s"
@@ -1388,12 +1389,24 @@ class TTSService(AIService):
                 if isinstance(frame, TTSAudioRawFrame):
                     is_yielding_frames = True
 
-        # The generator is done, so its deadline has had its say. A service
-        # that yielded its own audio needs no second watchdog on this context;
-        # one that yielded nothing is websocket-shaped and its audio is still
-        # to arrive on the receive loop, so the watchdog stays armed for it.
-        if yielded_anything:
-            await self._cancel_synthesis_watchdog(context_id)
+        # Only now is the shape of this service known, and only one shape
+        # needs the context watchdog.
+        #
+        # A generator that yielded audio, or that hit its own deadline, has
+        # been bounded already -- arming a watchdog carrying the same deadline
+        # would report one stalled sentence twice and reach the fatal burst on
+        # the second stall rather than the third. A generator that returned
+        # having yielded nothing is websocket-shaped: its audio is still to
+        # arrive on the receive loop, nothing else is watching for it, and the
+        # deadline starts here, once the request is known to be away.
+        #
+        # This is why the watchdog is armed after the generator and not before
+        # it: armed before, its countdown starts marginally *earlier* than the
+        # deadline around the iteration, so on an HTTP-shaped stall it fires
+        # first and no amount of disarming afterwards can take that report
+        # back.
+        if not yielded_anything and not timed_out:
+            await self._arm_synthesis_watchdog(context_id)
 
         self._is_yielding_frames_synchronously = is_yielding_frames
 
@@ -1428,12 +1441,12 @@ class TTSService(AIService):
         and the deadline around it bounds nothing. This watchdog is the same
         deadline expressed on the context.
 
-        Armed for every synthesis and disarmed as soon as the shape is known:
-        by the first audio frame appended to the context, or by the generator
-        finishing having yielded anything at all -- at which point its own
-        deadline has already covered the synthesis, and leaving this armed
-        would count one stalled sentence twice against the burst and fire a
-        false timeout on a synthesis that legitimately produced no audio.
+        Armed by ``tts_process_generator`` for that shape alone, once the
+        generator has returned without yielding -- never for a service whose
+        audio comes through ``run_tts``, which its own deadline already bounds.
+        Disarmed by the first audio frame appended to the context, or by the
+        context ending with no audio at all (a filtered sentence, a provider
+        answering with an empty stream).
         """
         if self._synthesis_first_chunk_timeout_s is None:
             return

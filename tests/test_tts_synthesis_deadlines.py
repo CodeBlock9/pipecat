@@ -23,7 +23,9 @@ import asyncio
 
 import pytest
 
-from pipecat.frames.frames import TTSAudioRawFrame
+from pipecat.frames.frames import AggregatedTextFrame, TTSAudioRawFrame
+from pipecat.utils.text.base_text_aggregator import AggregationType
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.tts_service import TTS_SYNTHESIS_TIMEOUT, TTSService
 
 
@@ -34,6 +36,7 @@ class _StubTTS(TTSService):
         super().__init__(**kwargs)
         self._chunks = chunks or []
         self.errors = []
+        self.pushed = []
         self.closed = False
 
     async def run_tts(self, text: str, context_id: str):
@@ -61,6 +64,21 @@ class _StubTTS(TTSService):
 
     async def cancel_task(self, task, timeout=None):
         task.cancel()
+
+    async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
+        self.pushed.append(frame)
+
+    async def start_processing_metrics(self):
+        pass
+
+    async def stop_processing_metrics(self):
+        pass
+
+    async def start_ttfb_metrics(self):
+        pass
+
+    async def stop_ttfb_metrics(self):
+        pass
 
 
 def _audio() -> TTSAudioRawFrame:
@@ -148,9 +166,9 @@ async def test_timeouts_spread_beyond_the_window_never_escalate():
 @pytest.mark.asyncio
 async def test_the_context_watchdog_bounds_a_websocket_shaped_service():
     """It yields None and delivers audio elsewhere, so the generator is instant."""
-    service = _StubTTS(chunks=[], synthesis_first_chunk_timeout_s=0.05)
-    await service._arm_synthesis_watchdog("ctx")
+    service = _StubTTS(chunks=[None], synthesis_first_chunk_timeout_s=0.05)
 
+    await service.tts_process_generator("ctx", service.run_tts("hi", "ctx"))
     await asyncio.sleep(0.2)
 
     assert service.errors
@@ -182,11 +200,11 @@ async def test_no_watchdog_is_armed_when_no_deadline_is_configured():
 
 
 @pytest.mark.asyncio
-async def test_a_generator_that_yielded_audio_disarms_the_context_watchdog():
+async def test_a_generator_that_yielded_audio_arms_no_context_watchdog():
     """Otherwise an HTTP-shaped service is bounded twice.
 
     Its generator deadline has already had its say by the time the generator
-    ends, so a watchdog still armed on the context counts the same stalled
+    ends, so a watchdog also running on the context counts the same stalled
     sentence a second time against `synthesis_timeout_burst` -- and reaches the
     fatal threshold in two stalls rather than three.
     """
@@ -195,7 +213,6 @@ async def test_a_generator_that_yielded_audio_disarms_the_context_watchdog():
         synthesis_first_chunk_timeout_s=0.05,
         synthesis_chunk_gap_timeout_s=0.05,
     )
-    await service._arm_synthesis_watchdog("ctx")
 
     await service.tts_process_generator("ctx", service.run_tts("hi", "ctx"))
     await asyncio.sleep(0.2)
@@ -230,3 +247,48 @@ async def test_a_fired_watchdog_leaves_no_entry_behind():
 
     assert service.errors
     assert service._synthesis_watchdogs == {}
+
+
+# ---------------------------------------------------------------------------
+# ... including the synthesis that stalled
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_one_stalled_generator_shaped_synthesis_reports_once():
+    """The stall path was still bounded twice.
+
+    The watchdog was armed for *every* synthesis, before the request went out,
+    and disarmed only where the generator yielded something. A generator that
+    hits its own deadline yields nothing, so the watchdog -- carrying the same
+    deadline, started marginally earlier -- reported the same stalled sentence
+    a second time.
+    """
+    service = _StubTTS(
+        chunks=[30.0],
+        synthesis_first_chunk_timeout_s=0.05,
+        synthesis_chunk_gap_timeout_s=0.05,
+    )
+
+    await service._push_tts_frames(AggregatedTextFrame(text="hi", aggregated_by=AggregationType.SENTENCE))
+    await asyncio.sleep(0.3)
+
+    assert len(service.errors) == 1, service.errors
+    assert service._synthesis_watchdogs == {}
+
+
+@pytest.mark.asyncio
+async def test_three_stalled_sentences_reach_the_burst_and_not_two():
+    """The burst counts stalled sentences, not reports of them."""
+    service = _StubTTS(
+        chunks=[30.0],
+        synthesis_first_chunk_timeout_s=0.05,
+        synthesis_chunk_gap_timeout_s=0.05,
+        synthesis_timeout_burst=3,
+    )
+
+    for _ in range(3):
+        await service._push_tts_frames(AggregatedTextFrame(text="hi", aggregated_by=AggregationType.SENTENCE))
+    await asyncio.sleep(0.3)
+
+    assert [fatal for _msg, fatal in service.errors] == [False, False, True]
