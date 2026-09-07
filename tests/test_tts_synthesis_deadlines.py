@@ -23,7 +23,11 @@ import asyncio
 
 import pytest
 
-from pipecat.frames.frames import AggregatedTextFrame, TTSAudioRawFrame
+from pipecat.frames.frames import (
+    AggregatedTextFrame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+)
 from pipecat.utils.text.base_text_aggregator import AggregationType
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.tts_service import TTS_SYNTHESIS_TIMEOUT, TTSService
@@ -292,3 +296,51 @@ async def test_three_stalled_sentences_reach_the_burst_and_not_two():
     await asyncio.sleep(0.3)
 
     assert [fatal for _msg, fatal in service.errors] == [False, False, True]
+
+
+@pytest.mark.asyncio
+async def test_a_control_frame_is_not_audio_and_does_not_disarm_the_watchdog():
+    """The websocket services that lose the watchdog by yielding one frame.
+
+    Dograh, ElevenLabs, Rime and NVIDIA all yield a `TTSStartedFrame` from
+    `run_tts` when the context does not exist yet -- the first sentence of
+    every turn -- and then return, with the audio arriving on their receive
+    loop. "Yielded anything" reads that as an HTTP-shaped service that has
+    bounded itself, so no watchdog is armed and a websocket that never sends
+    the audio is not bounded at all. Which is the first sentence of the turn,
+    on four of the estate's services.
+    """
+    service = _StubTTS(
+        chunks=[TTSStartedFrame(context_id="ctx")],
+        synthesis_first_chunk_timeout_s=0.05,
+        synthesis_chunk_gap_timeout_s=0.05,
+    )
+
+    await service._push_tts_frames(
+        AggregatedTextFrame(text="hi", aggregated_by=AggregationType.SENTENCE)
+    )
+    await asyncio.sleep(0.3)
+
+    assert len(service.errors) == 1, service.errors
+    assert service.errors[0][0].startswith(TTS_SYNTHESIS_TIMEOUT)
+
+
+@pytest.mark.asyncio
+async def test_audio_after_a_control_frame_still_disarms_it():
+    """The same turn, when the receive loop does deliver."""
+    service = _StubTTS(
+        chunks=[TTSStartedFrame(context_id="ctx")],
+        synthesis_first_chunk_timeout_s=0.05,
+        synthesis_chunk_gap_timeout_s=0.05,
+    )
+
+    await service._push_tts_frames(
+        AggregatedTextFrame(text="hi", aggregated_by=AggregationType.SENTENCE)
+    )
+    # The receive loop appends the audio a moment later, as it would.
+    context_id = next(iter(service._synthesis_watchdogs))
+    await service.append_to_audio_context(context_id, _audio())
+    await asyncio.sleep(0.2)
+
+    assert service.errors == []
+    assert service._synthesis_watchdogs == {}

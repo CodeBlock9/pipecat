@@ -1355,7 +1355,7 @@ class TTSService(AIService):
 
         """
         is_yielding_frames = False
-        yielded_anything = False
+        yielded_audio = False
         timed_out = False
         first = True
         while True:
@@ -1384,28 +1384,39 @@ class TTSService(AIService):
                 break
             first = False
             if frame:
-                yielded_anything = True
                 await self.append_to_audio_context(context_id, frame)
                 if isinstance(frame, TTSAudioRawFrame):
+                    # Audio, and only audio, says this generator is the one
+                    # delivering the synthesis. See below.
+                    yielded_audio = True
                     is_yielding_frames = True
 
         # Only now is the shape of this service known, and only one shape
         # needs the context watchdog.
         #
+        # The question is whether this generator *delivered the audio*, and the
+        # only frame that answers it is a `TTSAudioRawFrame`. "Yielded
+        # anything" is not the same question: a websocket-shaped service yields
+        # a `TTSStartedFrame` from `run_tts` whenever the context does not
+        # exist yet -- the first sentence of every turn on Dograh, ElevenLabs,
+        # Rime and NVIDIA -- and then returns, with the audio still to come on
+        # its receive loop. Counting that control frame as delivery left the
+        # first sentence of every turn on those services with no bound at all.
+        #
         # A generator that yielded audio, or that hit its own deadline, has
         # been bounded already -- arming a watchdog carrying the same deadline
         # would report one stalled sentence twice and reach the fatal burst on
         # the second stall rather than the third. A generator that returned
-        # having yielded nothing is websocket-shaped: its audio is still to
-        # arrive on the receive loop, nothing else is watching for it, and the
-        # deadline starts here, once the request is known to be away.
+        # having yielded no audio is websocket-shaped: nothing else is watching
+        # for that audio, and the deadline starts here, once the request is
+        # known to be away.
         #
         # This is why the watchdog is armed after the generator and not before
         # it: armed before, its countdown starts marginally *earlier* than the
         # deadline around the iteration, so on an HTTP-shaped stall it fires
         # first and no amount of disarming afterwards can take that report
         # back.
-        if not yielded_anything and not timed_out:
+        if not yielded_audio and not timed_out:
             await self._arm_synthesis_watchdog(context_id)
 
         self._is_yielding_frames_synchronously = is_yielding_frames
@@ -1442,8 +1453,10 @@ class TTSService(AIService):
         deadline expressed on the context.
 
         Armed by ``tts_process_generator`` for that shape alone, once the
-        generator has returned without yielding -- never for a service whose
-        audio comes through ``run_tts``, which its own deadline already bounds.
+        generator has returned without yielding any *audio* -- a control frame
+        such as ``TTSStartedFrame`` is not delivery, and these services yield
+        one on the first sentence of a turn. Never for a service whose audio
+        comes through ``run_tts``, which its own deadline already bounds.
         Disarmed by the first audio frame appended to the context, or by the
         context ending with no audio at all (a filtered sentence, a provider
         answering with an empty stream).
