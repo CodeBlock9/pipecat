@@ -174,3 +174,59 @@ async def test_no_watchdog_is_armed_when_no_deadline_is_configured():
     await service._arm_synthesis_watchdog("ctx")
 
     assert service._synthesis_watchdogs == {}
+
+
+# ---------------------------------------------------------------------------
+# One synthesis is bounded once
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_generator_that_yielded_audio_disarms_the_context_watchdog():
+    """Otherwise an HTTP-shaped service is bounded twice.
+
+    Its generator deadline has already had its say by the time the generator
+    ends, so a watchdog still armed on the context counts the same stalled
+    sentence a second time against `synthesis_timeout_burst` -- and reaches the
+    fatal threshold in two stalls rather than three.
+    """
+    service = _StubTTS(
+        chunks=[_audio()],
+        synthesis_first_chunk_timeout_s=0.05,
+        synthesis_chunk_gap_timeout_s=0.05,
+    )
+    await service._arm_synthesis_watchdog("ctx")
+
+    await service.tts_process_generator("ctx", service.run_tts("hi", "ctx"))
+    await asyncio.sleep(0.2)
+
+    assert service.errors == []
+    assert service._synthesis_watchdogs == {}
+
+
+@pytest.mark.asyncio
+async def test_a_context_that_ends_with_no_audio_fires_no_timeout():
+    """A filtered sentence, or a provider answering with an empty stream.
+
+    The watchdog was cleared only by a `TTSAudioRawFrame`, so a synthesis that
+    legitimately produced none fired a timeout seconds after it was over.
+    """
+    service = _StubTTS(chunks=[], synthesis_first_chunk_timeout_s=0.05)
+    await service._arm_synthesis_watchdog("ctx")
+
+    await service._end_synthesis_watchdog("ctx")
+    await asyncio.sleep(0.2)
+
+    assert service.errors == []
+
+
+@pytest.mark.asyncio
+async def test_a_fired_watchdog_leaves_no_entry_behind():
+    """One entry per synthesis, kept for the life of the call, is a leak."""
+    service = _StubTTS(chunks=[], synthesis_first_chunk_timeout_s=0.02)
+    await service._arm_synthesis_watchdog("ctx")
+
+    await asyncio.sleep(0.2)
+
+    assert service.errors
+    assert service._synthesis_watchdogs == {}

@@ -1356,6 +1356,7 @@ class TTSService(AIService):
 
         """
         is_yielding_frames = False
+        yielded_anything = False
         first = True
         while True:
             timeout = (
@@ -1382,9 +1383,17 @@ class TTSService(AIService):
                 break
             first = False
             if frame:
+                yielded_anything = True
                 await self.append_to_audio_context(context_id, frame)
                 if isinstance(frame, TTSAudioRawFrame):
                     is_yielding_frames = True
+
+        # The generator is done, so its deadline has had its say. A service
+        # that yielded its own audio needs no second watchdog on this context;
+        # one that yielded nothing is websocket-shaped and its audio is still
+        # to arrive on the receive loop, so the watchdog stays armed for it.
+        if yielded_anything:
+            await self._cancel_synthesis_watchdog(context_id)
 
         self._is_yielding_frames_synchronously = is_yielding_frames
 
@@ -1417,19 +1426,31 @@ class TTSService(AIService):
         A websocket-shaped service yields ``None`` from ``run_tts`` and delivers
         audio through its own receive loop, so the generator finishes at once
         and the deadline around it bounds nothing. This watchdog is the same
-        deadline expressed on the context: armed when the request is sent,
-        cleared by the first audio frame appended to that context.
+        deadline expressed on the context.
+
+        Armed for every synthesis and disarmed as soon as the shape is known:
+        by the first audio frame appended to the context, or by the generator
+        finishing having yielded anything at all -- at which point its own
+        deadline has already covered the synthesis, and leaving this armed
+        would count one stalled sentence twice against the burst and fire a
+        false timeout on a synthesis that legitimately produced no audio.
         """
         if self._synthesis_first_chunk_timeout_s is None:
             return
         await self._cancel_synthesis_watchdog(context_id)
 
         async def _watch():
-            await asyncio.sleep(self._synthesis_first_chunk_timeout_s)
-            await self._report_synthesis_timeout(
-                f"{TTS_SYNTHESIS_TIMEOUT}: no audio for context {context_id} "
-                f"within {self._synthesis_first_chunk_timeout_s:g}s"
-            )
+            try:
+                await asyncio.sleep(self._synthesis_first_chunk_timeout_s)
+                await self._report_synthesis_timeout(
+                    f"{TTS_SYNTHESIS_TIMEOUT}: no audio for context {context_id} "
+                    f"within {self._synthesis_first_chunk_timeout_s:g}s"
+                )
+            finally:
+                # A fired watchdog leaves nothing behind: without this the map
+                # grows one entry per synthesis for the life of the call, and a
+                # later cancel would await a task that is already done.
+                self._synthesis_watchdogs.pop(context_id, None)
 
         self._synthesis_watchdogs[context_id] = self.create_task(
             _watch(), name=f"{self}::synthesis_watchdog::{context_id}"
@@ -1440,6 +1461,16 @@ class TTSService(AIService):
         task = self._synthesis_watchdogs.pop(context_id, None)
         if task and not task.done():
             await self.cancel_task(task)
+
+    async def _end_synthesis_watchdog(self, context_id: str):
+        """Disarm on a context that has ended, whether or not audio arrived.
+
+        A context that is removed or completed has nothing more to wait for.
+        Without this a synthesis that finished with zero audio -- a filtered
+        sentence, a provider answering with an empty stream -- would fire a
+        timeout seconds after it was already over.
+        """
+        await self._cancel_synthesis_watchdog(context_id)
 
     #
     # Word timestamp methods
@@ -1615,6 +1646,10 @@ class TTSService(AIService):
         if not context_id:
             logger.debug(f"{self} unable to remove audio context: no context ID provided")
             return
+        # The context is over, so its synthesis has nothing left to wait for --
+        # including a synthesis that ended with no audio at all, which would
+        # otherwise fire a timeout seconds after the fact.
+        await self._end_synthesis_watchdog(context_id)
         if self.audio_context_available(context_id):
             # We just mark the audio context for deletion by appending
             # None. Once we reach None while handling audio we know we can
