@@ -69,6 +69,43 @@ class TestSmartTurnSessionSharing(unittest.TestCase):
         self.assertTrue(analyzer._executor._shutdown)
         self.assertEqual(analyzer._audio_buffer, [])
 
+    def test_the_arena_is_shrunk_after_every_run(self):
+        """The pool is sized by peak overlap and never handed back on its own.
+
+        Smart turn runs about once every eight seconds per call and takes a
+        quarter of a second, so simultaneous inference is rare -- and whatever
+        a rare overlap grows the arena to is resident for the life of the
+        process unless each run gives its blocks back.
+        """
+        import time
+
+        import numpy as np
+
+        from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import (
+            LocalSmartTurnAnalyzerV3,
+        )
+
+        analyzer = LocalSmartTurnAnalyzerV3()
+        options = analyzer._shrinking_run_options()
+        # Shared, and built once: the entry is per run, but the object is not.
+        self.assertIs(options, LocalSmartTurnAnalyzerV3()._shrinking_run_options())
+
+        captured = {}
+        real_run = analyzer._session.run
+
+        def recording(output_names, input_feed, run_options=None):
+            captured["run_options"] = run_options
+            return real_run(output_names, input_feed, run_options)
+
+        analyzer._session.run = recording
+        try:
+            buffer = [(time.time(), np.zeros(1600, dtype=np.float32)) for _ in range(10)]
+            analyzer._process_speech_segment(buffer)
+        finally:
+            del analyzer._session.run
+
+        self.assertIs(captured["run_options"], options)
+
     def test_cleanup_leaves_the_shared_session_usable(self):
         from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import (
             LocalSmartTurnAnalyzerV3,

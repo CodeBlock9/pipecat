@@ -78,6 +78,31 @@ class LocalSmartTurnAnalyzerV3(BaseSmartTurn):
     _session_cache: ClassVar[dict[tuple[str, int], "ort.InferenceSession"]] = {}
     _session_cache_lock: ClassVar[threading.Lock] = threading.Lock()
 
+    #: Run options that ask ONNX Runtime to return the arena's unused blocks to
+    #: the allocator after the run that grew them.
+    #:
+    #: The arena is a high-water-mark pool: it is sized by peak simultaneous
+    #: inference and is never handed back on its own, so a moment of overlap
+    #: early in a process's life is resident for the rest of it. Smart turn
+    #: runs once per caller turn -- roughly once every eight seconds per call
+    #: -- and takes about a quarter of a second, so overlap is rare and the
+    #: pool it leaves behind serves nothing. Shrinkage is per run rather than
+    #: per session, which is why it is a RunOptions entry and not a
+    #: SessionOptions one.
+    _run_options: ClassVar["ort.RunOptions | None"] = None
+    _run_options_lock: ClassVar[threading.Lock] = threading.Lock()
+
+    @classmethod
+    def _shrinking_run_options(cls) -> "ort.RunOptions":
+        """Return the shared run options, building them once."""
+        if cls._run_options is None:
+            with cls._run_options_lock:
+                if cls._run_options is None:
+                    options = ort.RunOptions()
+                    options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
+                    cls._run_options = options
+        return cls._run_options
+
     @classmethod
     def _shared_session(cls, model_path: str, cpu_count: int) -> "ort.InferenceSession":
         """Return the process-wide session for ``model_path``, building it once."""
@@ -191,8 +216,10 @@ class LocalSmartTurnAnalyzerV3(BaseSmartTurn):
         log_mel = compute_whisper_log_mel_features(audio_array, do_normalize=True)
         input_features = np.expand_dims(log_mel, axis=0)  # Add batch dimension
 
-        # Run ONNX inference
-        outputs = self._session.run(None, {"input_features": input_features})
+        # Run ONNX inference, releasing the arena blocks this run grew.
+        outputs = self._session.run(
+            None, {"input_features": input_features}, self._shrinking_run_options()
+        )
 
         # Extract probability (ONNX model returns sigmoid probabilities)
         probability = cast(np.ndarray, outputs[0])[0].item()
