@@ -186,21 +186,15 @@ class AICQuailVADAnalyzer(VADAnalyzer):
         self._inference_error_logged = False
         self._buffer_size_warning_logged = False
 
-        # Eager model load shifts CDN download out of the hot path. If anything
-        # in this block raises (telemetry registration, network, license, etc.)
-        # we shut down the base-class executor so the half-constructed instance
-        # doesn't leak its worker thread, then propagate the original error.
-        try:
-            set_sdk_id(_AIC_SDK_PIPECAT_ID)
-            self._ensure_model_loaded()
-            if sample_rate is not None:
-                self._initialize_processor(sample_rate)
-        except Exception:
-            try:
-                self._executor.shutdown(wait=False)
-            except Exception as e:  # noqa: BLE001 - executor cleanup is best-effort
-                logger.debug(f"AICQuailVADAnalyzer executor shutdown failed: {e}")
-            raise
+        # Eager model load shifts CDN download out of the hot path. A failure
+        # here (telemetry registration, network, license) propagates and the
+        # half-constructed instance is dropped. It has no thread of its own to
+        # release: VADAnalyzer runs inference on the process-wide pool, and
+        # shutting that down would stop voice detection for every other call.
+        set_sdk_id(_AIC_SDK_PIPECAT_ID)
+        self._ensure_model_loaded()
+        if sample_rate is not None:
+            self._initialize_processor(sample_rate)
 
     def _ensure_model_loaded(self) -> None:
         if self._model is not None:

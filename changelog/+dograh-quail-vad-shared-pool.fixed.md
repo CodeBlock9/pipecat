@@ -1,0 +1,1 @@
+- `AICQuailVADAnalyzer` no longer shuts down its inference executor when eager model loading fails during construction. That executor used to be the analyzer's own; it is now the pool every VAD analyzer in the process shares, and shutting it down would have stopped voice detection for every other call on the first failed construction.

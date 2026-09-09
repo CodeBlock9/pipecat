@@ -104,97 +104,41 @@ class TestAICQuailVADAnalyzer(unittest.IsolatedAsyncioTestCase):
                 self.AICQuailVADAnalyzer(license_key="test-key", model_id=None, model_path=None)
         mock_sdk_id.assert_not_called()
 
-    def test_init_shuts_down_executor_on_eager_load_failure(self):
-        """If Model.download raises during __init__, the base executor's shutdown is called.
+    def test_init_leaves_the_shared_inference_pool_alone(self):
+        """A construction failure must not take VAD down for the whole process.
 
-        We patch ThreadPoolExecutor at the source so the base-class constructor
-        gets back a real mock instance whose ``shutdown`` is observable; the
-        previous version patched the in-class helper, which couldn't catch a
-        regression where the helper became a no-op.
+        This used to shut down ``self._executor`` so a half-constructed
+        analyzer did not leak its worker thread. That thread was its own; the
+        analyzer now runs inference on the pool every analyzer in the process
+        shares, and shutting that down would stop voice detection for every
+        other call.
         """
-        from concurrent.futures import ThreadPoolExecutor
+        from pipecat.audio.vad.vad_analyzer import _inference_pool
 
-        mock_executor_instance = MagicMock(spec=ThreadPoolExecutor)
-        with (
-            patch(f"{AIC_QUAIL_VAD_MODULE}.set_sdk_id"),
-            patch(f"{AIC_QUAIL_VAD_MODULE}.Model") as mock_model_cls,
-            patch(
-                "pipecat.audio.vad.vad_analyzer.ThreadPoolExecutor",
-                return_value=mock_executor_instance,
-            ),
-        ):
-            mock_model_cls.download.side_effect = RuntimeError("CDN unreachable")
-            with self.assertRaises(RuntimeError):
-                self.AICQuailVADAnalyzer(license_key="test-key")
-        mock_executor_instance.shutdown.assert_called_once_with(wait=False)
-
-    def test_init_tolerates_executor_shutdown_failure(self):
-        """If executor.shutdown itself raises during eager-load cleanup, the
-        original construction error still propagates."""
-        from concurrent.futures import ThreadPoolExecutor
-
-        mock_executor_instance = MagicMock(spec=ThreadPoolExecutor)
-        mock_executor_instance.shutdown.side_effect = RuntimeError("shutdown nope")
-        with (
-            patch(f"{AIC_QUAIL_VAD_MODULE}.set_sdk_id"),
-            patch(f"{AIC_QUAIL_VAD_MODULE}.Model") as mock_model_cls,
-            patch(
-                "pipecat.audio.vad.vad_analyzer.ThreadPoolExecutor",
-                return_value=mock_executor_instance,
-            ),
-        ):
-            mock_model_cls.download.side_effect = RuntimeError("CDN unreachable")
-            with self.assertRaises(RuntimeError) as ctx:
-                self.AICQuailVADAnalyzer(license_key="test-key")
-        # The original error (CDN unreachable) must propagate — not the shutdown error.
-        self.assertIn("CDN unreachable", str(ctx.exception))
-
-    def test_init_shuts_down_executor_on_set_sdk_id_failure(self):
-        """set_sdk_id is now inside the eager-load try/except so its failure
-        also triggers the executor shutdown."""
-        from concurrent.futures import ThreadPoolExecutor
-
-        mock_executor_instance = MagicMock(spec=ThreadPoolExecutor)
+        pool = _inference_pool()
         with (
             patch(
                 f"{AIC_QUAIL_VAD_MODULE}.set_sdk_id",
                 side_effect=RuntimeError("telemetry registration failed"),
             ),
             patch(f"{AIC_QUAIL_VAD_MODULE}.Model"),
-            patch(
-                "pipecat.audio.vad.vad_analyzer.ThreadPoolExecutor",
-                return_value=mock_executor_instance,
-            ),
         ):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(RuntimeError) as ctx:
                 self.AICQuailVADAnalyzer(license_key="test-key")
-        mock_executor_instance.shutdown.assert_called_once_with(wait=False)
 
-    def test_init_shuts_down_executor_on_processor_init_failure(self):
-        """Processor() failing during eager init (sample_rate passed to __init__)
-        triggers the same executor-shutdown cleanup as earlier failure modes."""
-        from concurrent.futures import ThreadPoolExecutor
+        self.assertIn("telemetry registration failed", str(ctx.exception))
+        self.assertFalse(pool._shutdown)
+        self.assertIs(_inference_pool(), pool)
 
-        mock_executor_instance = MagicMock(spec=ThreadPoolExecutor)
+    def test_init_propagates_an_eager_load_failure(self):
         with (
             patch(f"{AIC_QUAIL_VAD_MODULE}.set_sdk_id"),
             patch(f"{AIC_QUAIL_VAD_MODULE}.Model") as mock_model_cls,
-            patch(f"{AIC_QUAIL_VAD_MODULE}.ProcessorConfig") as mock_config_cls,
-            patch(
-                f"{AIC_QUAIL_VAD_MODULE}.Processor",
-                side_effect=RuntimeError("license expired"),
-            ),
-            patch(
-                "pipecat.audio.vad.vad_analyzer.ThreadPoolExecutor",
-                return_value=mock_executor_instance,
-            ),
         ):
-            mock_model_cls.from_file.return_value = self.mock_model
-            mock_model_cls.download.return_value = "/tmp/test.aicmodel"
-            mock_config_cls.return_value = MagicMock()
-            with self.assertRaises(RuntimeError):
-                self.AICQuailVADAnalyzer(license_key="test-key", sample_rate=16000)
-        mock_executor_instance.shutdown.assert_called_once_with(wait=False)
+            mock_model_cls.download.side_effect = RuntimeError("CDN unreachable")
+            with self.assertRaises(RuntimeError) as ctx:
+                self.AICQuailVADAnalyzer(license_key="test-key")
+        self.assertIn("CDN unreachable", str(ctx.exception))
 
     def test_default_model_id(self):
         """Default model_id is the published standalone Quail VAD."""
