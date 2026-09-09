@@ -243,10 +243,18 @@ class VADAnalyzer(ABC):
         return self._vad_state
 
     async def cleanup(self):
-        """Clean up resources.
+        """Release the per-analyzer inference thread at teardown.
 
-        This method should be called when the object is no longer needed.
-        It waits for all currently executing event handler tasks to finish
-        before returning.
+        ``ThreadPoolExecutor`` has no finaliser, and the module level
+        ``concurrent.futures.thread._threads_queues`` entry keeps its worker
+        alive, so without this the thread stays parked on its work queue for
+        the life of the process -- one leaked thread for every call, since a
+        call builds its own analyzer. This is the twin of the shutdown the
+        smart-turn analyzer already does (``base_smart_turn.py``); this half
+        was an empty body.
+
+        The shutdown does not wait: it runs on the event loop, and the queue is
+        empty by the time a VAD analyzer is being cleaned up.
         """
-        pass
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._vad_buffer = b""
