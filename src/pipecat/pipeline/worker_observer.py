@@ -18,6 +18,37 @@ from attr import dataclass
 
 from pipecat.observers.base_observer import BaseObserver, FrameProcessed, FramePushed
 
+#: The event methods a leaf observer may implement. An event is only queued
+#: for an observer that overrides the one it would be delivered to.
+_EVENT_HANDLERS = ("on_process_frame", "on_push_frame")
+
+
+def _implemented_handlers(observer: BaseObserver) -> frozenset[str]:
+    """Which of the frame event methods this observer actually overrides.
+
+    Every processor emits a ``FrameProcessed`` for every frame it handles and a
+    ``FramePushed`` for every frame it forwards, and both used to be queued for
+    every observer. An observer that has not overridden the method an event is
+    delivered to inherits ``BaseObserver``'s, whose body is ``pass`` -- so the
+    queue put, the task wake-up and the dispatch all bought a no-op. Recorded
+    once, when the proxy is created, rather than tested per frame.
+
+    Comparing against ``BaseObserver``'s own functions rather than asking the
+    observer anything keeps this right for observers defined outside this tree:
+    one that overrides neither method is simply sent neither event.
+
+    Args:
+        observer: The observer a proxy is being created for.
+
+    Returns:
+        The names of the event methods it overrides.
+    """
+    return frozenset(
+        name
+        for name in _EVENT_HANDLERS
+        if getattr(type(observer), name, None) is not getattr(BaseObserver, name)
+    )
+
 
 @dataclass
 class Proxy:
@@ -30,11 +61,14 @@ class Proxy:
         queue: Queue for frame data awaiting observer processing.
         task: Asyncio task running the observer's frame processing loop.
         observer: The actual observer instance being proxied.
+        handlers: The event methods this observer overrides. Events destined
+            for a method it did not override are never queued.
     """
 
     queue: asyncio.Queue
     task: asyncio.Task
     observer: BaseObserver
+    handlers: frozenset[str]
 
 
 class _PipelineStartedSignal:
@@ -141,27 +175,31 @@ class WorkerObserver(BaseObserver):
         await self._send_to_proxy(_PipelineStartedSignal())
 
     async def on_process_frame(self, data: FrameProcessed):
-        """Queue frame data for all managed observers.
+        """Queue frame data for the observers that handle it.
 
         Args:
             data: The frame push event data to distribute to observers.
         """
-        await self._send_to_proxy(data)
+        await self._send_to_proxy(data, "on_process_frame")
 
     async def on_push_frame(self, data: FramePushed):
-        """Queue frame data for all managed observers.
+        """Queue frame data for the observers that handle it.
 
         Args:
             data: The frame push event data to distribute to observers.
         """
-        await self._send_to_proxy(data)
+        await self._send_to_proxy(data, "on_push_frame")
 
     def _create_proxy(self, observer: BaseObserver) -> Proxy:
         """Create a proxy for a single observer."""
         queue = asyncio.Queue()
         task = self.create_task(self._proxy_task_handler(queue, observer))
-        proxy = Proxy(queue=queue, task=task, observer=observer)
-        return proxy
+        return Proxy(
+            queue=queue,
+            task=task,
+            observer=observer,
+            handlers=_implemented_handlers(observer),
+        )
 
     def _create_proxies(self, observers: list[BaseObserver]) -> dict[BaseObserver, Proxy]:
         """Create proxies for all observers."""
@@ -171,10 +209,20 @@ class WorkerObserver(BaseObserver):
             proxies[observer] = proxy
         return proxies
 
-    async def _send_to_proxy(self, data: Any):
+    async def _send_to_proxy(self, data: Any, handler: str | None = None):
+        """Queue an event for every observer that implements its handler.
+
+        Args:
+            data: The event to queue.
+            handler: Name of the observer method this event will be delivered
+                to, or None for an event -- the pipeline-started signal -- that
+                every observer receives whatever it implements.
+        """
         if not self._proxies:
             return
         for proxy in self._proxies.values():
+            if handler is not None and handler not in proxy.handlers:
+                continue
             await proxy.queue.put(data)
 
     async def _proxy_task_handler(self, queue: asyncio.Queue, observer: BaseObserver):
