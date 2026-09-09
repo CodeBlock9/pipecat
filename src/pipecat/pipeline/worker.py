@@ -122,6 +122,24 @@ def _leaf_processors(processor: FrameProcessor) -> list[FrameProcessor]:
     return leaves
 
 
+def _unique(types: Iterable[type[Frame]]) -> tuple[type[Frame], ...]:
+    """Frame types in the order given, with repeats dropped.
+
+    The reached-frame filters were sets so that adding a type twice did not
+    duplicate it. They are read once per frame in both directions, where a
+    tuple is what ``isinstance`` wants, so the deduplication happens on
+    assignment instead -- which is rare -- and the stored value is already the
+    tuple. ``dict.fromkeys`` keeps the caller's order, which a set did not.
+
+    Args:
+        types: The frame types to deduplicate.
+
+    Returns:
+        The same types, in order, without repeats.
+    """
+    return tuple(dict.fromkeys(types))
+
+
 class IdleFrameObserver(BaseObserver):
     """Idle timeout observer.
 
@@ -531,8 +549,13 @@ class PipelineWorker(BaseWorker):
         # in. This is mainly for efficiency reason because each event handler
         # creates a worker and most likely you only care about one or two frame
         # types.
-        self._reached_upstream_types: set[type[Frame]] = set()
-        self._reached_downstream_types: set[type[Frame]] = set()
+        # Kept as tuples, deduplicated on assignment, because the only two
+        # readers are `isinstance` calls on the source and sink push paths --
+        # once per frame, in both directions, for the whole of every call.
+        # Building a tuple from a set there meant allocating one per frame for
+        # sets that are almost always empty.
+        self._reached_upstream_types: tuple[type[Frame], ...] = ()
+        self._reached_downstream_types: tuple[type[Frame], ...] = ()
         self._register_event_handler("on_frame_reached_upstream")
         self._register_event_handler("on_frame_reached_downstream")
         self._register_event_handler("on_heartbeat_timeout")
@@ -636,7 +659,7 @@ class PipelineWorker(BaseWorker):
         Returns:
             Tuple of frame types that trigger the on_frame_reached_upstream event.
         """
-        return tuple(self._reached_upstream_types)
+        return self._reached_upstream_types
 
     @property
     def reached_downstream_types(self) -> tuple[type[Frame], ...]:
@@ -645,7 +668,7 @@ class PipelineWorker(BaseWorker):
         Returns:
             Tuple of frame types that trigger the on_frame_reached_downstream event.
         """
-        return tuple(self._reached_downstream_types)
+        return self._reached_downstream_types
 
     def add_observer(self, observer: BaseObserver):
         """Add an observer to monitor pipeline execution.
@@ -673,7 +696,7 @@ class PipelineWorker(BaseWorker):
         Args:
             types: Tuple of frame types to monitor for upstream events.
         """
-        self._reached_upstream_types = set(types)
+        self._reached_upstream_types = _unique(types)
 
     def set_reached_downstream_filter(self, types: tuple[type[Frame], ...]):
         """Set which frame types trigger the on_frame_reached_downstream event.
@@ -681,7 +704,7 @@ class PipelineWorker(BaseWorker):
         Args:
             types: Tuple of frame types to monitor for downstream events.
         """
-        self._reached_downstream_types = set(types)
+        self._reached_downstream_types = _unique(types)
 
     def add_reached_upstream_filter(self, types: tuple[type[Frame], ...]):
         """Add frame types to trigger the on_frame_reached_upstream event.
@@ -689,7 +712,7 @@ class PipelineWorker(BaseWorker):
         Args:
             types: Tuple of frame types to add to upstream monitoring.
         """
-        self._reached_upstream_types.update(types)
+        self._reached_upstream_types = _unique((*self._reached_upstream_types, *types))
 
     def add_reached_downstream_filter(self, types: tuple[type[Frame], ...]):
         """Add frame types to trigger the on_frame_reached_downstream event.
@@ -697,7 +720,7 @@ class PipelineWorker(BaseWorker):
         Args:
             types: Tuple of frame types to add to downstream monitoring.
         """
-        self._reached_downstream_types.update(types)
+        self._reached_downstream_types = _unique((*self._reached_downstream_types, *types))
 
     def has_finished(self) -> bool:
         """Check if the pipeline worker has finished execution.
@@ -1204,7 +1227,7 @@ class PipelineWorker(BaseWorker):
         pipeline to be stopped (e.g. EndWorkerFrame) in which case we would send
         an EndFrame down the pipeline.
         """
-        if isinstance(frame, tuple(self._reached_upstream_types)):
+        if self._reached_upstream_types and isinstance(frame, self._reached_upstream_types):
             await self._call_event_handler("on_frame_reached_upstream", frame)
 
         if isinstance(frame, PipelineFlushFrame):
@@ -1252,7 +1275,7 @@ class PipelineWorker(BaseWorker):
         processors have handled the EndFrame and therefore we can exit the worker
         cleanly.
         """
-        if isinstance(frame, tuple(self._reached_downstream_types)):
+        if self._reached_downstream_types and isinstance(frame, self._reached_downstream_types):
             await self._call_event_handler("on_frame_reached_downstream", frame)
 
         if isinstance(frame, PipelineFlushFrame):

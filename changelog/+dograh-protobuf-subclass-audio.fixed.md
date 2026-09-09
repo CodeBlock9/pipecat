@@ -1,0 +1,1 @@
+- `ProtobufFrameSerializer` resolves a frame's protobuf field through the type's ancestry rather than by exact class, so an `OutputAudioRawFrame` subclass such as `TTSAudioRawFrame` serializes as audio instead of being dropped with a "not serializable" warning.

@@ -546,11 +546,23 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
         if self._client.is_closing or not self._client.is_connected:
             return False
 
-        frame = OutputAudioRawFrame(
-            audio=frame.audio,
-            sample_rate=self.sample_rate,
-            num_channels=self._params.audio_out_channels,
-        )
+        # BaseOutputTransport already cut this chunk at this transport's own
+        # sample rate, so rebuilding it restated what was true and cost a fresh
+        # Frame for every 20 ms of outbound audio: two global locks for the id
+        # and the per-class count, and the subclass, pts, id, metadata and
+        # transport_destination of the frame it replaced. Rebuild only when the
+        # frame really does not match what this transport sends -- which is the
+        # case the old code silently relabelled rather than resampled, and it
+        # still does.
+        if (
+            frame.sample_rate != self.sample_rate
+            or frame.num_channels != self._params.audio_out_channels
+        ):
+            frame = OutputAudioRawFrame(
+                audio=frame.audio,
+                sample_rate=self.sample_rate,
+                num_channels=self._params.audio_out_channels,
+            )
 
         if self._params.add_wav_header:
             with io.BytesIO() as buffer:

@@ -14,9 +14,11 @@ from unittest.mock import AsyncMock, PropertyMock
 from loguru import logger
 from starlette.websockets import WebSocketState
 
+from pipecat.frames.frames import OutputAudioRawFrame, TTSAudioRawFrame
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketCallbacks,
     FastAPIWebsocketClient,
+    FastAPIWebsocketOutputTransport,
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
     _WebSocketMessageIterator,
@@ -354,6 +356,62 @@ class TestDisconnectAfterCloseFrameSent(unittest.IsolatedAsyncioTestCase):
         # The transport still owns this close: the receive loop must not report
         # a client disconnect and the output transport must stop writing.
         self.assertTrue(client.is_closing)
+
+
+class TestOutputAudioFramePassthrough(unittest.IsolatedAsyncioTestCase):
+    """The transport forwards the chunk it was handed, when it can.
+
+    `BaseOutputTransport` already cuts the chunk at the transport's own sample
+    rate and stamps its destination on it, so rebuilding it here allocated a
+    frame per 20 ms of audio and dropped the subclass, the timestamps and the
+    destination with it.
+    """
+
+    def _output(self, *, out_channels: int = 1):
+        client = AsyncMock()
+        type(client).is_closing = PropertyMock(return_value=False)
+        type(client).is_connected = PropertyMock(return_value=True)
+        params = FastAPIWebsocketParams(
+            audio_out_enabled=True,
+            audio_out_channels=out_channels,
+            serializer=None,
+        )
+        output = FastAPIWebsocketOutputTransport(AsyncMock(), client, params)
+        output._sample_rate = 8000
+        written = []
+        output._write_frame = AsyncMock(side_effect=lambda frame: written.append(frame))
+        output._write_audio_sleep = AsyncMock()
+        return output, written
+
+    async def test_a_matching_frame_is_written_unchanged(self):
+        output, written = self._output()
+        frame = TTSAudioRawFrame(audio=bytes(320), sample_rate=8000, num_channels=1)
+        frame.transport_destination = "caller"
+
+        self.assertTrue(await output.write_audio_frame(frame))
+
+        self.assertIs(written[0], frame)
+        self.assertEqual(written[0].transport_destination, "caller")
+
+    async def test_a_mismatched_frame_is_still_relabelled(self):
+        """Unchanged behaviour: the old code relabelled rather than resampled."""
+        output, written = self._output()
+        frame = TTSAudioRawFrame(audio=bytes(320), sample_rate=16000, num_channels=1)
+
+        self.assertTrue(await output.write_audio_frame(frame))
+
+        self.assertIsNot(written[0], frame)
+        self.assertEqual(type(written[0]), OutputAudioRawFrame)
+        self.assertEqual(written[0].sample_rate, 8000)
+
+    async def test_a_channel_mismatch_also_rebuilds(self):
+        output, written = self._output(out_channels=2)
+        frame = TTSAudioRawFrame(audio=bytes(320), sample_rate=8000, num_channels=1)
+
+        self.assertTrue(await output.write_audio_frame(frame))
+
+        self.assertIsNot(written[0], frame)
+        self.assertEqual(written[0].num_channels, 2)
 
 
 if __name__ == "__main__":

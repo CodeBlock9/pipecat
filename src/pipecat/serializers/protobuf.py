@@ -76,6 +76,29 @@ class ProtobufFrameSerializer(FrameSerializer):
         # these messages, so we disable the filter.
         self._params.ignore_rtvi_messages = False
 
+    def _serializable_as(self, frame_type: type) -> str | None:
+        """Find the protobuf field a frame type serializes into.
+
+        Resolved through the type's MRO rather than by exact identity, because
+        the frame hierarchy is meant to be used with ``isinstance`` everywhere
+        else: ``TTSAudioRawFrame`` is an ``OutputAudioRawFrame`` and carries no
+        field the audio message lacks. Exact-type matching worked only because
+        the WebSocket transports rebuilt every outbound chunk as a base
+        ``OutputAudioRawFrame`` on its way here, and they no longer do.
+
+        Args:
+            frame_type: The concrete class of the frame being serialized.
+
+        Returns:
+            The protobuf oneof field name, or None if nothing in the type's
+            ancestry is serializable.
+        """
+        for ancestor in frame_type.__mro__:
+            field_name = self.SERIALIZABLE_TYPES.get(ancestor)
+            if field_name is not None:
+                return field_name
+        return None
+
     async def serialize(self, frame: Frame) -> str | bytes | None:
         """Serialize a frame to Protocol Buffer binary format.
 
@@ -95,12 +118,11 @@ class ProtobufFrameSerializer(FrameSerializer):
             )
 
         proto_frame = frame_protos.Frame()  # type: ignore[attr-defined]
-        if type(serializable) not in self.SERIALIZABLE_TYPES:
+        proto_optional_name = self._serializable_as(type(serializable))
+        if proto_optional_name is None:
             logger.warning(f"Frame type {type(serializable)} is not serializable")
             return None
 
-        # ignoring linter errors; we check that type(frame) is in this dict above
-        proto_optional_name = self.SERIALIZABLE_TYPES[type(serializable)]  # type: ignore
         proto_attr = getattr(proto_frame, proto_optional_name)
         for field in dataclasses.fields(serializable):  # type: ignore
             value = getattr(serializable, field.name)

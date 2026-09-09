@@ -26,7 +26,7 @@ from pipecat.bus import (
     BusJobUpdateMessage,
     BusTTSSpeakMessage,
 )
-from pipecat.frames.frames import EndFrame, Frame, TextFrame, TTSSpeakFrame
+from pipecat.frames.frames import EndFrame, Frame, StartFrame, TextFrame, TTSSpeakFrame
 from pipecat.pipeline.job_context import JobStatus
 from pipecat.pipeline.job_decorator import job
 from pipecat.pipeline.pipeline import Pipeline
@@ -1481,6 +1481,36 @@ class TestJobDecorator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(max_running, 2)
         release.set()
         await self._wait_until(lambda: running == 0)
+
+
+class TestReachedFrameFilters(unittest.TestCase):
+    """The filters are stored as tuples because they are read once per frame.
+
+    Both source and sink test every frame against them, in both directions, for
+    the whole of a call. They used to be sets, which meant building a tuple per
+    frame for a filter that is empty unless something set one.
+    """
+
+    def test_an_unset_filter_is_empty_rather_than_matching_everything(self):
+        worker = make_stub_pipeline_task("filters")
+        self.assertEqual(worker.reached_downstream_types, ())
+        self.assertEqual(worker.reached_upstream_types, ())
+
+    def test_a_filter_deduplicates_and_keeps_the_order_it_was_given(self):
+        worker = make_stub_pipeline_task("filters")
+
+        worker.set_reached_downstream_filter((TextFrame, EndFrame))
+        worker.add_reached_downstream_filter((TextFrame, StartFrame))
+
+        self.assertEqual(worker.reached_downstream_types, (TextFrame, EndFrame, StartFrame))
+
+    def test_setting_a_filter_replaces_whatever_was_there(self):
+        worker = make_stub_pipeline_task("filters")
+
+        worker.set_reached_upstream_filter((TextFrame,))
+        worker.set_reached_upstream_filter((EndFrame,))
+
+        self.assertEqual(worker.reached_upstream_types, (EndFrame,))
 
 
 if __name__ == "__main__":

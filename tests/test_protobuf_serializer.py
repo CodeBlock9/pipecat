@@ -7,10 +7,12 @@
 import unittest
 
 from pipecat.frames.frames import (
+    InputAudioRawFrame,
     InterruptionFrame,
     OutputAudioRawFrame,
     TextFrame,
     TranscriptionFrame,
+    TTSAudioRawFrame,
 )
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
 
@@ -39,6 +41,24 @@ class TestProtobufFrameSerializer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(frame.audio, audio_frame.audio)
         self.assertEqual(frame.sample_rate, audio_frame.sample_rate)
         self.assertEqual(frame.num_channels, audio_frame.num_channels)
+
+    async def test_an_audio_subclass_serializes_as_audio(self):
+        """The WebSocket transports no longer flatten outbound audio to the base.
+
+        `TTSAudioRawFrame` is an `OutputAudioRawFrame` and carries no field the
+        audio message lacks, so it belongs in the audio slot. Matching the
+        exact type instead would silently drop every chunk of bot speech with
+        a warning.
+        """
+        tts_frame = TTSAudioRawFrame(audio=b"1234567890", sample_rate=16000, num_channels=1)
+        frame = await self.serializer.deserialize(await self.serializer.serialize(tts_frame))
+        self.assertEqual(frame.audio, tts_frame.audio)
+        self.assertEqual(frame.sample_rate, tts_frame.sample_rate)
+
+    async def test_an_input_audio_frame_is_still_not_serializable(self):
+        """Resolving through the MRO must not widen what may be sent."""
+        frame = InputAudioRawFrame(audio=b"1234567890", sample_rate=16000, num_channels=1)
+        self.assertIsNone(await self.serializer.serialize(frame))
 
     async def test_interruption_frame_roundtrip(self):
         interruption_frame = InterruptionFrame()
