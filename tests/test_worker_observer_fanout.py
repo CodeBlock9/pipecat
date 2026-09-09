@@ -68,6 +68,42 @@ class DeclaredObserver(PushOnlyObserver):
     observed_frame_types = (TextFrame,)
 
 
+class QuietMiddleObserver(BaseObserver):
+    """A class between the leaf and ``BaseObserver`` that overrides nothing.
+
+    The production shape: ``DeferredTunerObserver`` derives from the tuner
+    SDK's own ``_BaseObserver``, which derives from this one. The MRO resolves
+    an unoverridden handler to ``BaseObserver``'s own function, so the leaf
+    below must still be seen as implementing what it overrides.
+    """
+
+
+class LeafBelowAQuietMiddleObserver(QuietMiddleObserver):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.pushed: list[Frame] = []
+
+    async def on_push_frame(self, data: FramePushed):
+        self.pushed.append(data.frame)
+
+
+class BoundOnTheInstanceObserver(BaseObserver):
+    """Binds its handler in ``__init__`` rather than declaring a method.
+
+    A shape only an out-of-tree observer would take, and the reason the class
+    lookup is not the whole test: nothing about it is visible on the class.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.pushed: list[Frame] = []
+
+        async def on_push_frame(data: FramePushed):
+            self.pushed.append(data.frame)
+
+        self.on_push_frame = on_push_frame
+
+
 class SubclassAwareObserver(PushOnlyObserver):
     """Declares a base class, and must still be sent the subclasses."""
 
@@ -139,6 +175,30 @@ class TestHandlerFanOut(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([type(e) for e in queued[push_only]], [FramePushed])
             self.assertEqual([type(e) for e in queued[both]], [FrameProcessed, FramePushed])
             self.assertEqual(queued[silent], [])
+        finally:
+            await proxy.stop()
+
+    async def test_a_leaf_under_a_class_that_overrides_nothing_is_still_handled(self):
+        """The tuner SDK's observer arrives through exactly this shape."""
+        leaf = LeafBelowAQuietMiddleObserver()
+        proxy = await _started_proxy([leaf])
+        try:
+            await proxy.on_push_frame(_pushed(TextFrame("hello")))
+            await proxy.wait_until_idle()
+
+            self.assertEqual([type(f) for f in leaf.pushed], [TextFrame])
+        finally:
+            await proxy.stop()
+
+    async def test_a_handler_bound_on_the_instance_counts_as_implemented(self):
+        """Nothing about it is visible on the class, so the class test misses it."""
+        observer = BoundOnTheInstanceObserver()
+        proxy = await _started_proxy([observer])
+        try:
+            await proxy.on_push_frame(_pushed(TextFrame("hello")))
+            await proxy.wait_until_idle()
+
+            self.assertEqual([type(f) for f in observer.pushed], [TextFrame])
         finally:
             await proxy.stop()
 

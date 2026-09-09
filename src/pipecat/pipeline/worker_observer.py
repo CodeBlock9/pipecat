@@ -37,18 +37,22 @@ def _implemented_handlers(observer: BaseObserver) -> frozenset[str]:
 
     Comparing against ``BaseObserver``'s own functions rather than asking the
     observer anything keeps this right for observers defined outside this tree:
-    one that overrides neither method is simply sent neither event.
+    one that overrides neither method is simply sent neither event. A class in
+    between that overrides nothing is no obstacle -- the MRO resolves to the
+    base's own function -- and a handler bound on the instance rather than the
+    class counts too, which the class lookup alone cannot see.
 
     Args:
         observer: The observer a proxy is being created for.
 
     Returns:
-        The names of the event methods it overrides.
+        The names of the event methods it implements.
     """
     return frozenset(
         name
         for name in _EVENT_HANDLERS
-        if getattr(type(observer), name, None) is not getattr(BaseObserver, name)
+        if name in getattr(observer, "__dict__", ())
+        or getattr(type(observer), name, None) is not getattr(BaseObserver, name)
     )
 
 
