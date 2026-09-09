@@ -4,14 +4,15 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""How a VAD analyzer reaches its inference thread, and gives it back.
+"""How a VAD analyzer reaches the model, and how often.
 
-One analyzer is built per call. What it does with a thread therefore multiplies
-by concurrency, and what it fails to release multiplies by every call the
-process has ever taken.
+One analyzer is built per call, so whatever it holds multiplies by concurrency
+and whatever work it does per chunk multiplies by 50 a second per call. Two
+things follow: inference runs on a pool shared by the whole process, and audio
+is accumulated into whole windows on the event loop before any of it is sent
+there.
 """
 
-import asyncio
 import unittest
 
 from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADParams, VADState
@@ -45,15 +46,12 @@ def _analyzer(**kwargs) -> StubVADAnalyzer:
 
 
 class TestExecutorLifecycle(unittest.IsolatedAsyncioTestCase):
-    async def test_cleanup_releases_the_inference_thread(self):
-        analyzer = _analyzer()
-        self.assertFalse(analyzer._executor._shutdown)
+    async def test_analyzers_share_one_inference_pool(self):
+        """A pool each meant one operating-system thread per concurrent call."""
+        first = _analyzer()
+        second = _analyzer()
 
-        await analyzer.cleanup()
-
-        # Without this the thread stays parked on its work queue for the life
-        # of the process: one leaked thread per call.
-        self.assertTrue(analyzer._executor._shutdown)
+        self.assertIs(first._executor, second._executor)
 
     async def test_cleanup_drops_the_buffered_audio(self):
         analyzer = _analyzer()
@@ -63,15 +61,44 @@ class TestExecutorLifecycle(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(analyzer._vad_buffer, b"")
 
-    async def test_each_analyzer_owns_its_own_thread(self):
-        """One analyzer per call, one audio stream per analyzer."""
+    async def test_cleanup_leaves_the_pool_usable_for_other_calls(self):
+        """Shutting the shared pool down would stop VAD for every other call."""
         first = _analyzer()
         second = _analyzer()
-        try:
-            self.assertIsNot(first._executor, second._executor)
-        finally:
-            await first.cleanup()
-            await second.cleanup()
+        second.confidence = 1.0
+
+        await first.cleanup()
+
+        self.assertEqual(await second.analyze_audio(bytes(512)), VADState.STARTING)
+
+
+class TestWindowBuffering(unittest.IsolatedAsyncioTestCase):
+    async def test_a_short_chunk_does_not_reach_the_model(self):
+        """20 ms chunks against a 32 ms window: a third used to be round trips."""
+        analyzer = _analyzer()
+
+        state = await analyzer.analyze_audio(bytes(320))
+
+        self.assertEqual(analyzer.confidence_calls, 0)
+        self.assertEqual(state, VADState.QUIET)
+        self.assertEqual(len(analyzer._vad_buffer), 320)
+
+    async def test_a_whole_window_is_analyzed_and_the_remainder_kept(self):
+        analyzer = _analyzer()
+
+        await analyzer.analyze_audio(bytes(320))
+        await analyzer.analyze_audio(bytes(320))
+
+        self.assertEqual(analyzer.confidence_calls, 1)
+        self.assertEqual(len(analyzer._vad_buffer), 128)
+
+    async def test_several_windows_at_once_are_analyzed_in_order(self):
+        analyzer = _analyzer()
+
+        await analyzer.analyze_audio(bytes(512 * 3 + 64))
+
+        self.assertEqual(analyzer.confidence_calls, 3)
+        self.assertEqual(len(analyzer._vad_buffer), 64)
 
 
 class TestAnalysisStillWorks(unittest.IsolatedAsyncioTestCase):
