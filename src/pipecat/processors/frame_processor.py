@@ -898,6 +898,14 @@ class FrameProcessor(BaseObject):
     async def __internal_push_frame(self, frame: Frame, direction: FrameDirection):
         """Internal method to push frames to adjacent processors.
 
+        Deliberately unlogged. Every other ``logger.trace`` in this file
+        interpolates only ``self``, whose ``__str__`` is a cached name; a trace
+        line here would interpolate the frame, and ``Frame.__str__`` formats
+        its size, its sample rate, its channel count and its presentation
+        timestamp. The f-string is built whether or not TRACE is enabled, so
+        this ran for every push of every audio chunk of every call and the
+        result was discarded.
+
         Args:
             frame: The frame to push.
             direction: The direction to push the frame.
@@ -905,8 +913,6 @@ class FrameProcessor(BaseObject):
         try:
             timestamp = self._clock.get_time() if self._clock else 0
             if direction == FrameDirection.DOWNSTREAM and self._next:
-                logger.trace(f"Pushing {frame} downstream from {self} to {self._next}")
-
                 if self._observer:
                     data = FramePushed(
                         source=self,
@@ -918,7 +924,6 @@ class FrameProcessor(BaseObject):
                     await self._observer.on_push_frame(data)
                 await self._next.queue_frame(frame, direction)
             elif direction == FrameDirection.UPSTREAM and self._prev:
-                logger.trace(f"Pushing {frame} upstream from {self} to {self._prev}")
                 if self._observer:
                     data = FramePushed(
                         source=self,
