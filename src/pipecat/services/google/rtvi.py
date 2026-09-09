@@ -62,6 +62,12 @@ class GoogleRTVIObserver(RTVIObserver):
             rtvi: The RTVI processor to send messages through.
         """
         super().__init__(rtvi)
+        # ``on_push_frame`` delegates to the base observer first, so the
+        # declaration has to cover both handlers, not just this one's branch.
+        self.observed_frame_types = (
+            *self.observed_frame_types,
+            LLMSearchResponseFrame,
+        )
 
     async def on_push_frame(self, data: FramePushed):
         """Process frames being pushed through the pipeline.

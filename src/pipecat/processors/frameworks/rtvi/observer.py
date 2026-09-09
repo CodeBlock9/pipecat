@@ -192,6 +192,42 @@ class RTVIObserverParams:
     )
 
 
+#: Every frame type ``RTVIObserver.on_push_frame`` branches on.
+_RTVI_OBSERVED_FRAME_TYPES: tuple[type[Frame], ...] = (
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+    UserMuteStartedFrame,
+    UserMuteStoppedFrame,
+    InterruptionFrame,
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+    LLMFullResponseStartFrame,
+    LLMFullResponseEndFrame,
+    LLMTextFrame,
+    LLMContextFrame,
+    TranscriptionFrame,
+    InterimTranscriptionFrame,
+    AggregatedTextFrame,
+    AggregatedTextProgressFrame,
+    FunctionCallsStartedFrame,
+    FunctionCallInProgressFrame,
+    FunctionCallResultFrame,
+    FunctionCallCancelFrame,
+    MetricsFrame,
+    RTVIServerMessageFrame,
+    RTVIServerResponseFrame,
+    RTVIUICommandFrame,
+    RTVIUIJobGroupFrame,
+    RTVIConfigureObserverFrame,
+    InputAudioRawFrame,
+    TTSAudioRawFrame,
+)
+
+
 class RTVIObserver(BaseObserver):
     """Pipeline frame observer for RTVI server message handling.
 
@@ -221,6 +257,16 @@ class RTVIObserver(BaseObserver):
         super().__init__(**kwargs)
         self._rtvi = rtvi
         self._params = params or RTVIObserverParams()
+
+        # Declared as a class attribute would be fine today -- every branch in
+        # ``on_push_frame`` is on a fixed type -- but it is set here so a
+        # subclass can extend it, which ``GoogleRTVIObserver`` does. Both audio
+        # types are listed whatever ``user_audio_level_enabled`` and
+        # ``bot_audio_level_enabled`` say: they are construction-time settings
+        # and ``_apply_config`` does not touch them, but a declaration that
+        # tracked them would be a filter keyed on a flag rather than on what
+        # the handler can act on.
+        self.observed_frame_types = _RTVI_OBSERVED_FRAME_TYPES
 
         self._ignored_sources: set[FrameProcessor] = set(self._params.ignored_sources)
         self._frames_seen = set()

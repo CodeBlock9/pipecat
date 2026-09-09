@@ -35,6 +35,15 @@ class LLMLogObserver(BaseObserver):
     and when it finishes.
     """
 
+    observed_frame_types = (
+        LLMContextFrame,
+        LLMFullResponseStartFrame,
+        LLMFullResponseEndFrame,
+        LLMTextFrame,
+        FunctionCallInProgressFrame,
+        FunctionCallResultFrame,
+    )
+
     async def on_push_frame(self, data: FramePushed):
         """Handle frame push events and log LLM-related activities.
 

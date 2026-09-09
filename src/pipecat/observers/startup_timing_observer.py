@@ -162,6 +162,11 @@ class StartupTimingObserver(BaseObserver):
             all non-internal processors are measured.
     """
 
+    #: Every type either handler branches on. ``on_process_frame`` looks only
+    #: at ``StartFrame``; the declaration covers the push handler, which also
+    #: watches for the two connection frames that end the measurement.
+    observed_frame_types = (StartFrame, ClientConnectedFrame, BotConnectedFrame)
+
     def __init__(
         self,
         *,

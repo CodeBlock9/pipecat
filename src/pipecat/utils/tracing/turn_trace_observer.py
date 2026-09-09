@@ -46,6 +46,11 @@ class TurnTraceObserver(BaseObserver):
     conversation span that encapsulates the entire session.
     """
 
+    #: ``on_push_frame`` acts on ``StartFrame`` and nothing else -- it opens
+    #: the conversation span. Everything else it was handed, including all 50
+    #: audio frames a second, fell straight off the end of the method.
+    observed_frame_types = (StartFrame,)
+
     def __init__(
         self,
         turn_tracker: TurnTrackingObserver,

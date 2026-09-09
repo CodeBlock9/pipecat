@@ -108,6 +108,11 @@ class DebugLogObserver(BaseObserver):
                 # Dict of frame types with filters
                 self.frame_filters = frame_types
 
+        # Per instance, and None when there are no filters: an unfiltered
+        # DebugLogObserver logs every frame, so it must still be sent every
+        # frame.
+        self.observed_frame_types = tuple(self.frame_filters) or None
+
         # By default, exclude binary data fields that would clutter logs
         self.exclude_fields = (
             exclude_fields

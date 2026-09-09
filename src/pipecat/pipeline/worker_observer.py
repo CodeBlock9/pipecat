@@ -15,7 +15,9 @@ import asyncio
 from typing import Any
 
 from attr import dataclass
+from loguru import logger
 
+from pipecat.frames.frames import Frame
 from pipecat.observers.base_observer import BaseObserver, FrameProcessed, FramePushed
 
 #: The event methods a leaf observer may implement. An event is only queued
@@ -50,6 +52,40 @@ def _implemented_handlers(observer: BaseObserver) -> frozenset[str]:
     )
 
 
+def _declared_push_types(observer: BaseObserver) -> tuple[type[Frame], ...] | None:
+    """The frame types this observer says its push handler acts on.
+
+    Read with ``getattr`` and validated here rather than trusted, because
+    observers arrive from packages versioned separately from this one -- the
+    tuner SDK and ``NoveumTraceObserver`` both register through
+    ``PipelineWorker.add_observer``. An absent declaration, or one that is not
+    a sequence of classes, means "send everything", which is what those
+    observers received before the declaration existed.
+
+    Args:
+        observer: The observer a proxy is being created for.
+
+    Returns:
+        The declared types, or None to send this observer every frame.
+    """
+    declared = getattr(observer, "observed_frame_types", None)
+    if declared is None:
+        return None
+    if isinstance(declared, type):
+        declared = (declared,)
+    try:
+        types = tuple(declared)
+    except TypeError:
+        types = None
+    if types is None or not all(isinstance(entry, type) for entry in types):
+        logger.warning(
+            f"{observer} declares observed_frame_types={declared!r}, which is not a "
+            "tuple of frame classes; it will be sent every frame"
+        )
+        return None
+    return types
+
+
 @dataclass
 class Proxy:
     """Proxy data for managing observer tasks and queues.
@@ -63,12 +99,38 @@ class Proxy:
         observer: The actual observer instance being proxied.
         handlers: The event methods this observer overrides. Events destined
             for a method it did not override are never queued.
+        push_types: Frame types the observer's push handler acts on, or None
+            to send it every frame.
+        push_decisions: Memo of ``push_types`` against concrete frame types.
     """
 
     queue: asyncio.Queue
     task: asyncio.Task
     observer: BaseObserver
     handlers: frozenset[str]
+    push_types: tuple[type[Frame], ...] | None
+    push_decisions: dict[type[Frame], bool]
+
+    def observes(self, frame: Frame, frame_type: type[Frame]) -> bool:
+        """Whether this observer's push handler acts on this frame's type.
+
+        Args:
+            frame: The frame about to be queued.
+            frame_type: Its concrete class, already computed by the caller.
+
+        Returns:
+            True if the frame should be queued for this observer.
+        """
+        if self.push_types is None:
+            return True
+        # Memoised per concrete class: a call pushes tens of thousands of
+        # frames drawn from a handful of types, and the largest declaration in
+        # the tree has thirty entries for isinstance to walk.
+        decided = self.push_decisions.get(frame_type)
+        if decided is None:
+            decided = isinstance(frame, self.push_types)
+            self.push_decisions[frame_type] = decided
+        return decided
 
 
 class _PipelineStartedSignal:
@@ -119,8 +181,11 @@ class WorkerObserver(BaseObserver):
         self._observers.append(observer)
 
         # If we already started, create a new proxy for the observer.
-        # Otherwise, it will be created in start().
-        if self._proxies:
+        # Otherwise, it will be created in start(). The test is against None
+        # rather than truthiness: start() with no initial observers leaves an
+        # empty dict behind, and every observer added afterwards then went
+        # without a proxy and received nothing at all.
+        if self._proxies is not None:
             proxy = self._create_proxy(observer)
             self._proxies[observer] = proxy
 
@@ -199,6 +264,8 @@ class WorkerObserver(BaseObserver):
             task=task,
             observer=observer,
             handlers=_implemented_handlers(observer),
+            push_types=_declared_push_types(observer),
+            push_decisions={},
         )
 
     def _create_proxies(self, observers: list[BaseObserver]) -> dict[BaseObserver, Proxy]:
@@ -220,8 +287,15 @@ class WorkerObserver(BaseObserver):
         """
         if not self._proxies:
             return
+        # Only the push leg carries a declaration, and only it has a frame to
+        # dispatch on: the pipeline-started signal is a bare sentinel with no
+        # ``frame`` attribute at all.
+        frame = data.frame if handler == "on_push_frame" else None
+        frame_type = type(frame) if frame is not None else None
         for proxy in self._proxies.values():
             if handler is not None and handler not in proxy.handlers:
+                continue
+            if frame_type is not None and not proxy.observes(frame, frame_type):
                 continue
             await proxy.queue.put(data)
 

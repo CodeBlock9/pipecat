@@ -51,6 +51,20 @@ class TurnTrackingObserver(BaseObserver):
     report user speech timing.
     """
 
+    #: Every type ``on_push_frame`` branches on. Audio never appears here,
+    #: which is nearly everything the fan-out used to hand this observer.
+    observed_frame_types = (
+        StartFrame,
+        UserMuteStartedFrame,
+        UserMuteStoppedFrame,
+        UserStartedSpeakingFrame,
+        UserStoppedSpeakingFrame,
+        BotStartedSpeakingFrame,
+        BotStoppedSpeakingFrame,
+        EndFrame,
+        CancelFrame,
+    )
+
     def __init__(self, max_frames=100, turn_end_timeout_secs=2.5, **kwargs):
         """Initialize the turn tracking observer.
 

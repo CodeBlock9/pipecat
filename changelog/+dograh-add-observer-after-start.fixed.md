@@ -1,0 +1,1 @@
+- `WorkerObserver.add_observer` creates a proxy for an observer added after the pipeline started even when it started with no observers at all. The guard tested the proxy dict for truthiness and `start()` leaves an empty one behind, so such an observer silently received no frames.

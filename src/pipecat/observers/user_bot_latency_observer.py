@@ -168,6 +168,19 @@ class UserBotLatencyObserver(BaseObserver):
             to the first bot speech.
     """
 
+    #: Every type ``on_push_frame`` branches on.
+    observed_frame_types = (
+        ClientConnectedFrame,
+        UserStoppedSpeakingFrame,
+        VADUserStartedSpeakingFrame,
+        VADUserStoppedSpeakingFrame,
+        BotStartedSpeakingFrame,
+        FunctionCallInProgressFrame,
+        FunctionCallResultFrame,
+        InterruptionFrame,
+        MetricsFrame,
+    )
+
     def __init__(self, *, max_frames=100, **kwargs):
         """Initialize the user-bot latency observer.
 

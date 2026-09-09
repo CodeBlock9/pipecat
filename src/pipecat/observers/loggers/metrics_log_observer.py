@@ -87,6 +87,8 @@ class MetricsLogObserver(BaseObserver):
         self._include_metrics = include_metrics
         self._frames_seen = set()
 
+    observed_frame_types = (MetricsFrame,)
+
     async def on_push_frame(self, data: FramePushed):
         """Handle frame push events and log metrics frames.
 

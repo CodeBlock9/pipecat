@@ -76,6 +76,24 @@ class BaseObserver(BaseObject):
     performance analysis, and analytics collection.
     """
 
+    #: Frame types this observer's ``on_push_frame`` acts on, or ``None`` for
+    #: all of them. ``WorkerObserver`` reads it once per observer and skips the
+    #: queue put for a frame the handler would have dropped on its first
+    #: ``isinstance``. On a telephony call audio is about 98% of what an
+    #: observer is handed, and most observers act on none of it.
+    #:
+    #: Set it on the class where the handler branches on fixed types, or assign
+    #: it in ``__init__`` where the set depends on construction arguments. The
+    #: default of ``None`` filters nothing, which is what an observer written
+    #: against an older version of this class gets.
+    #:
+    #: It follows ``isinstance`` semantics, because every handler body does:
+    #: declaring ``OutputAudioRawFrame`` also admits ``TTSAudioRawFrame``. A
+    #: declaration that omits a type the handler branches on silently stops
+    #: that branch from ever running, so ``tests/test_observer_declarations.py``
+    #: walks each in-tree handler and holds the declaration against it.
+    observed_frame_types: tuple[type[Frame], ...] | None = None
+
     async def on_process_frame(self, data: FrameProcessed):
         """Handle the event when a frame is being processed by a processor.
 

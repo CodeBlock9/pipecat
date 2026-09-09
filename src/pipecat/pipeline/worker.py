@@ -160,6 +160,8 @@ class IdleFrameObserver(BaseObserver):
         self._idle_event = idle_event
         self._idle_timeout_frames = idle_timeout_frames
         self._processed_frames = set()
+        # Per instance: the caller chooses which frames count as activity.
+        self.observed_frame_types = (StartFrame, *idle_timeout_frames)
 
     async def on_push_frame(self, data: FramePushed):
         """Callback executed when a frame is pushed in the pipeline.

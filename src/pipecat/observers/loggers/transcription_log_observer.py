@@ -31,6 +31,8 @@ class TranscriptionLogObserver(BaseObserver):
     unrelated transcription frames from other sources.
     """
 
+    observed_frame_types = (TranscriptionFrame, InterimTranscriptionFrame)
+
     async def on_push_frame(self, data: FramePushed):
         """Handle frame push events and log transcription frames.
 
