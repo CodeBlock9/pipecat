@@ -1,0 +1,1 @@
+- OpenAI-compatible provider clients verify against one process-wide `ssl.SSLContext` instead of letting httpx build one per client. httpx loads the system trust store into every context it creates, and a call builds one to three of these clients and holds them for its whole length, so the store was parsed and retained once per client per call.

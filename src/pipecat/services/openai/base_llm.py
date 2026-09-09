@@ -8,6 +8,8 @@
 
 import asyncio
 import json
+import ssl
+import threading
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -44,6 +46,35 @@ from pipecat.services.settings import NOT_GIVEN as _NOT_GIVEN
 from pipecat.services.settings import LLMSettings, _NotGiven, assert_given
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.tracing.service_decorators import traced_llm
+
+#: One TLS context for every provider client this process builds.
+#:
+#: httpx builds a context per ``AsyncClient`` and loads the system trust store
+#: into each one. A call constructs one to three of these clients -- the
+#: dialogue LLM, and optionally a variable-extraction and a voicemail one --
+#: and they live for the length of the call, so the trust store was being
+#: parsed and held once per client per call. Sharing one is safe: an
+#: ``ssl.SSLContext`` is designed to back many connections and httpx never
+#: mutates the one it is handed.
+_SSL_CONTEXT: ssl.SSLContext | None = None
+_SSL_CONTEXT_LOCK = threading.Lock()
+
+
+def shared_ssl_context() -> ssl.SSLContext:
+    """The process-wide TLS context provider clients verify against.
+
+    Built on first use rather than at import, because loading the trust store
+    is the cost being avoided and a process that never talks to a provider
+    should not pay it either.
+
+    Returns:
+        The shared context, with httpx's own defaults.
+    """
+    global _SSL_CONTEXT
+    with _SSL_CONTEXT_LOCK:
+        if _SSL_CONTEXT is None:
+            _SSL_CONTEXT = httpx.create_ssl_context()
+        return _SSL_CONTEXT
 
 
 @dataclass
@@ -299,6 +330,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 limits=httpx.Limits(
                     max_keepalive_connections=100, max_connections=1000, keepalive_expiry=None
                 ),
+                verify=shared_ssl_context(),
                 **http_kwargs,
             ),
             default_headers=default_headers,
