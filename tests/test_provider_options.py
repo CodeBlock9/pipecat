@@ -8,7 +8,8 @@ from pydantic import BaseModel
 from pydantic import Field as PydanticField
 
 from pipecat.services.ai_service import AIService
-from pipecat.services.settings import NOT_GIVEN, ServiceSettings, _NotGiven
+from pipecat.services.settings import ServiceSettings
+from pipecat.utils.types import NOT_GIVEN, NotGiven
 
 
 class NestedOptions(BaseModel):
@@ -18,7 +19,7 @@ class NestedOptions(BaseModel):
 
 @dataclass
 class NestedSettings(ServiceSettings):
-    nested: NestedOptions | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    nested: NestedOptions | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 def test_provider_options_apply_declared_settings_and_deep_merge_overflow():

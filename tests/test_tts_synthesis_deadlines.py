@@ -6,11 +6,10 @@
 
 """Tests that a synthesis can be given a deadline, in both shapes it takes.
 
-``run_tts`` has no deadline of its own. The 3s pause watchdog covers a
-synthesiser that returns *nothing* — which is why a service that drops a
-sentence recovers on the next one — and not one that never returns at all: the
-generator stays parked and the call goes silent for as long as the caller is
-prepared to wait.
+The synthesis deadline bounds a provider that never returns. Playback's idle
+timer cannot declare an empty completion while that deadline still owns the
+request; real-worker coverage for their interaction lives in
+``test_tts_worker_deadlines.py``.
 
 Two shapes, because two service families. An HTTP-shaped service yields its
 audio from the generator, so the deadline goes around the iteration. A
@@ -152,8 +151,9 @@ async def test_a_burst_of_timeouts_becomes_fatal():
         synthesis_timeout_burst=3,
     )
 
-    for _ in range(3):
-        await service.tts_process_generator("ctx", service.run_tts("hi", "ctx"))
+    for index in range(3):
+        context_id = f"ctx-{index}"
+        await service.tts_process_generator(context_id, service.run_tts("hi", context_id))
 
     assert [fatal for _msg, fatal in service.errors] == [False, False, True]
 
@@ -168,9 +168,11 @@ async def test_timeouts_spread_beyond_the_window_never_escalate():
         synthesis_timeout_window_s=0.0,
     )
 
-    for _ in range(3):
-        await service.tts_process_generator("ctx", service.run_tts("hi", "ctx"))
+    for index in range(3):
+        context_id = f"ctx-{index}"
+        await service.tts_process_generator(context_id, service.run_tts("hi", context_id))
 
+    assert len(service.errors) == 3
     assert all(not fatal for _msg, fatal in service.errors)
 
 
@@ -281,7 +283,9 @@ async def test_one_stalled_generator_shaped_synthesis_reports_once():
         synthesis_chunk_gap_timeout_s=0.05,
     )
 
-    await service._push_tts_frames(AggregatedTextFrame(text="hi", aggregated_by=AggregationType.SENTENCE))
+    await service._push_tts_frames(
+        AggregatedTextFrame(text="hi", aggregated_by=AggregationType.SENTENCE)
+    )
     await asyncio.sleep(0.3)
 
     assert len(service.errors) == 1, service.errors
@@ -299,7 +303,9 @@ async def test_three_stalled_sentences_reach_the_burst_and_not_two():
     )
 
     for _ in range(3):
-        await service._push_tts_frames(AggregatedTextFrame(text="hi", aggregated_by=AggregationType.SENTENCE))
+        await service._push_tts_frames(
+            AggregatedTextFrame(text="hi", aggregated_by=AggregationType.SENTENCE)
+        )
     await asyncio.sleep(0.3)
 
     assert [fatal for _msg, fatal in service.errors] == [False, False, True]
@@ -451,6 +457,7 @@ async def test_timeout_and_empty_completion_count_one_context_once():
     service = _StubTTS(chunks=[], synthesis_first_chunk_timeout_s=0.05)
 
     await service._report_synthesis_timeout("ctx", f"{TTS_SYNTHESIS_TIMEOUT}: no audio")
+    await service._report_synthesis_timeout("ctx", f"{TTS_SYNTHESIS_TIMEOUT}: still no audio")
     await service._record_context_audio_outcome("ctx", received_audio=False)
 
     assert len(service.errors) == 1

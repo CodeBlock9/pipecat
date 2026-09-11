@@ -896,7 +896,14 @@ class PipelineWorker(BaseWorker):
 
         try:
             # Setup processors.
-            if not await self._setup_within_timeout(params):
+            try:
+                setup_completed = await self._setup_within_timeout(params)
+            except BaseException:
+                # Setup can already have started observers and connected
+                # processors even though no worker push task exists yet.
+                await self._cleanup(cleanup_pipeline=True)
+                raise
+            if not setup_completed:
                 # Nothing was pushed into the pipeline, so there is nothing to
                 # drain: release whatever was set up and give up.
                 await self._cleanup(cleanup_pipeline=True)
@@ -1375,13 +1382,30 @@ class PipelineWorker(BaseWorker):
             # ``setup.pipeline_worker.app_resources`` instead.
             tool_resources=self._app_resources,
         )
-        await self.create_task(self._pipeline.setup(setup))
+        try:
+            await self.create_task(self._pipeline.setup(setup))
 
-        # Make sure lazy imports are done at this point.
-        await lazy_imports_task
+            # Make sure lazy imports are done at this point.
+            await lazy_imports_task
+        finally:
+            # Cancelling setup cannot stop a Python import already running in
+            # the shared thread pool, but it must retire this worker's waiter.
+            if not lazy_imports_task.done():
+                await self.cancel_task(lazy_imports_task)
 
     async def _cleanup(self, cleanup_pipeline: bool):
         """Clean up the pipeline worker and processors."""
+        cleanup_task = self.create_task(self._cleanup_resources(cleanup_pipeline))
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            # Event handlers may own durable finalization. Cancellation of run()
+            # must not abandon them or the observer/processor cleanup after them.
+            await asyncio.shield(cleanup_task)
+            raise
+
+    async def _cleanup_resources(self, cleanup_pipeline: bool):
+        """Join completion handlers before releasing worker resources."""
         # Cleanup base object.
         await self.cleanup()
 

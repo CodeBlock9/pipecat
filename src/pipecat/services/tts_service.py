@@ -13,7 +13,7 @@ import warnings
 from abc import abstractmethod
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import (
     Any,
@@ -112,6 +112,18 @@ class _WordTimestampEntry:
 #: Prefix on every line a synthesis deadline produces, so an operator can count
 #: them without matching a provider's own wording.
 TTS_SYNTHESIS_TIMEOUT = "TTS synthesis timeout"
+
+
+@dataclass
+class _SynthesisState:
+    """Coordinate the producer and playback consumer for one context lifetime."""
+
+    producer_done: asyncio.Event = field(default_factory=asyncio.Event)
+    received_audio: bool = False
+    closed: bool = False
+
+    def __post_init__(self):
+        self.producer_done.set()
 
 
 class TTSService(AIService):
@@ -341,6 +353,7 @@ class TTSService(AIService):
         self._synthesis_timeout_times: deque[float] = deque()
         self._synthesis_watchdogs: dict[str, asyncio.Task] = {}
         self._failed_audio_contexts: set[str] = set()
+        self._synthesis_states: dict[str, _SynthesisState] = {}
         # Whether the bot is currently speaking. Set on BotStartedSpeakingFrame,
         # cleared on BotStoppedSpeakingFrame and InterruptionFrame. Used by
         # InterruptibleTTSService to decide whether an interruption needs a
@@ -633,6 +646,7 @@ class TTSService(AIService):
         await self._stop_audio_context_task()
         await self._end_all_synthesis_watchdogs()
         self._failed_audio_contexts.clear()
+        self._synthesis_states.clear()
 
     async def start(self, frame: StartFrame):
         """Start the TTS service.
@@ -1075,6 +1089,7 @@ class TTSService(AIService):
         # first audio chunk from a receive loop.
         await self._end_all_synthesis_watchdogs()
         self._failed_audio_contexts.clear()
+        self._synthesis_states.clear()
         # Drops non-UninterruptibleFrame items while keeping uninterruptible ones
         # (e.g. FunctionCallResultFrame) that must not be lost mid-flight.
         self._serialization_queue.reset()
@@ -1396,22 +1411,32 @@ class TTSService(AIService):
             generator: An async generator yielding Frame objects or None.
 
         """
+        state = self._synthesis_states.setdefault(context_id, _SynthesisState())
+        state.producer_done.clear()
+        try:
+            await self._consume_synthesis_generator(context_id, generator)
+        finally:
+            state.producer_done.set()
+
+    async def _consume_synthesis_generator(self, context_id, generator):
+        """Enforce deadlines from audio receipt, never from control frames."""
         is_yielding_frames = False
         yielded_audio = False
         yielded_error = False
         timed_out = False
-        first = True
+        last_audio_at = time.monotonic()
         while True:
             timeout = (
                 self._synthesis_first_chunk_timeout_s
-                if first
+                if not yielded_audio
                 else self._synthesis_chunk_gap_timeout_s
             )
             try:
                 if timeout is None:
                     frame = await generator.__anext__()
                 else:
-                    frame = await asyncio.wait_for(generator.__anext__(), timeout)
+                    remaining = max(0, last_audio_at + timeout - time.monotonic())
+                    frame = await asyncio.wait_for(generator.__anext__(), remaining)
             except StopAsyncIteration:
                 break
             except TimeoutError:
@@ -1423,16 +1448,16 @@ class TTSService(AIService):
                 await self._report_synthesis_timeout(
                     context_id,
                     f"{TTS_SYNTHESIS_TIMEOUT}: no "
-                    f"{'audio' if first else 'further audio'} within {timeout:g}s"
+                    f"{'audio' if not yielded_audio else 'further audio'} within {timeout:g}s",
                 )
                 break
-            first = False
             if frame:
                 await self.append_to_audio_context(context_id, frame)
                 if isinstance(frame, TTSAudioRawFrame):
                     # Audio, and only audio, says this generator is the one
                     # delivering the synthesis. See below.
                     yielded_audio = True
+                    last_audio_at = time.monotonic()
                     is_yielding_frames = True
                 elif isinstance(frame, ErrorFrame):
                     # `yield ErrorFrame(...)` is how every HTTP service reports
@@ -1486,6 +1511,8 @@ class TTSService(AIService):
         back, and a caller listening to silence is better served by a line that
         drops than by another dropped sentence.
         """
+        if context_id in self._failed_audio_contexts:
+            return
         now = time.monotonic()
         self._synthesis_timeout_times.append(now)
         while (
@@ -1520,15 +1547,19 @@ class TTSService(AIService):
         """
         if self._synthesis_first_chunk_timeout_s is None:
             return
-        await self._cancel_synthesis_watchdog(context_id)
+        state = self._synthesis_states.setdefault(context_id, _SynthesisState())
+        if state.closed or state.received_audio or context_id in self._synthesis_watchdogs:
+            return
 
         async def _watch():
             try:
                 await asyncio.sleep(self._synthesis_first_chunk_timeout_s)
+                if self._synthesis_states.get(context_id) is not state:
+                    return
                 await self._report_synthesis_timeout(
                     context_id,
                     f"{TTS_SYNTHESIS_TIMEOUT}: no audio for context {context_id} "
-                    f"within {self._synthesis_first_chunk_timeout_s:g}s"
+                    f"within {self._synthesis_first_chunk_timeout_s:g}s",
                 )
             finally:
                 # A fired watchdog leaves nothing behind: without this the map
@@ -1702,6 +1733,7 @@ class TTSService(AIService):
         """
         await self._serialization_queue.put(context_id)
         self._audio_contexts[context_id] = asyncio.Queue()
+        self._synthesis_states.setdefault(context_id, _SynthesisState())
         logger.trace(f"{self} created audio context {context_id}")
 
     async def append_to_audio_context(
@@ -1724,6 +1756,9 @@ class TTSService(AIService):
             logger.debug(f"{self} unable to append audio to context: no context ID provided")
             return
         if isinstance(frame, TTSAudioRawFrame):
+            state = self._synthesis_states.get(context_id)
+            if state is not None:
+                state.received_audio = True
             await self._cancel_synthesis_watchdog(context_id)
         elif isinstance(frame, ErrorFrame):
             # The provider has already reported this context's failure. Do not
@@ -1758,6 +1793,9 @@ class TTSService(AIService):
         # including a synthesis that ended with no audio at all, which would
         # otherwise fire a timeout seconds after the fact.
         await self._end_synthesis_watchdog(context_id)
+        state = self._synthesis_states.get(context_id)
+        if state is not None:
+            state.closed = True
         if self.audio_context_available(context_id):
             # We just mark the audio context for deletion by appending
             # None. Once we reach None while handling audio we know we can
@@ -1864,6 +1902,7 @@ class TTSService(AIService):
                 # otherwise leave one armed and firing after it was over.
                 await self._end_synthesis_watchdog(context_id)
                 del self._audio_contexts[context_id]
+                self._synthesis_states.pop(context_id, None)
                 await self.on_audio_context_completed(context_id=context_id)
                 self.reset_active_audio_context()
             else:
@@ -1926,6 +1965,7 @@ class TTSService(AIService):
     async def _handle_audio_context(self, context_id: str):
         """Process items from an audio context queue until it is exhausted."""
         queue = self._audio_contexts[context_id]
+        state = self._synthesis_states.setdefault(context_id, _SynthesisState())
         running = True
         timestamps_started = False
         received_audio = False
@@ -1937,6 +1977,10 @@ class TTSService(AIService):
                     # Context is still in use, reset the timeout.
                     continue
                 elif frame is None:
+                    state.closed = True
+                    await self._end_synthesis_watchdog(context_id)
+                    if self._synthesis_first_chunk_timeout_s is not None:
+                        await state.producer_done.wait()
                     running = False
                 elif isinstance(frame, _WordTimestampEntry):
                     # Route word timestamps through _add_word_timestamps so they are
@@ -1980,6 +2024,13 @@ class TTSService(AIService):
                     else:
                         await self.push_frame(frame)
             except TimeoutError:
+                # Playback idleness is not provider completion while a bounded
+                # request or websocket first-audio watchdog still owns progress.
+                if (
+                    not state.producer_done.is_set()
+                    and self._synthesis_first_chunk_timeout_s is not None
+                ) or context_id in self._synthesis_watchdogs:
+                    continue
                 # We didn't get audio, so let's consider this context finished.
                 logger.trace(f"{self} time out on audio context {context_id}")
                 if should_push_stop_frame and self._push_stop_frames:

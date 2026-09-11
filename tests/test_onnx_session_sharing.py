@@ -18,6 +18,16 @@ import asyncio
 import unittest
 
 
+async def _infer(analyzer):
+    import time
+
+    import numpy as np
+
+    analyzer._audio_buffer = [(time.monotonic(), np.zeros(1600, dtype=np.int16)) for _ in range(10)]
+    _, metrics = await analyzer.analyze_end_of_turn()
+    assert metrics is not None  # Prove the shared model actually ran.
+
+
 class TestSileroSessionSharing(unittest.TestCase):
     def test_analyzers_share_one_session_but_not_their_state(self):
         from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -50,9 +60,17 @@ class TestSmartTurnSessionSharing(unittest.TestCase):
         second = LocalSmartTurnAnalyzerV3()
 
         self.assertIs(first._session, second._session)
+
         # One inference thread per audio stream: sharing it would serialise
         # end-of-turn detection across concurrent calls.
-        self.assertIsNot(first._executor, second._executor)
+        async def check():
+            try:
+                await asyncio.gather(_infer(first), _infer(second))
+                self.assertIsNot(first._executor, second._executor)
+            finally:
+                await asyncio.gather(first.cleanup(), second.cleanup())
+
+        asyncio.run(check())
 
     def test_cleanup_releases_the_inference_thread(self):
         from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import (
@@ -60,14 +78,23 @@ class TestSmartTurnSessionSharing(unittest.TestCase):
         )
 
         analyzer = LocalSmartTurnAnalyzerV3()
-        self.assertFalse(analyzer._executor._shutdown)
 
-        asyncio.run(analyzer.cleanup())
+        async def check():
+            try:
+                await _infer(analyzer)
+                executor = analyzer._executor
+                self.assertFalse(executor._shutdown)
+                await analyzer.cleanup()
+                self.assertTrue(executor._shutdown)
+                self.assertIsNone(analyzer._executor)
+                self.assertEqual(analyzer._audio_buffer, [])
+                await _infer(analyzer)
+                self.assertIsNot(analyzer._executor, executor)
+                self.assertFalse(analyzer._executor._shutdown)
+            finally:
+                await analyzer.cleanup()
 
-        # Without this the thread stays parked on its work queue for the life
-        # of the process, one leaked thread per call.
-        self.assertTrue(analyzer._executor._shutdown)
-        self.assertEqual(analyzer._audio_buffer, [])
+        asyncio.run(check())
 
     def test_the_arena_is_shrunk_after_every_run(self):
         """The pool is sized by peak overlap and never handed back on its own.
@@ -113,11 +140,20 @@ class TestSmartTurnSessionSharing(unittest.TestCase):
 
         first = LocalSmartTurnAnalyzerV3()
         second = LocalSmartTurnAnalyzerV3()
-        asyncio.run(first.cleanup())
 
-        # One call ending must not disturb the calls still running.
-        self.assertIsNotNone(second._session)
-        self.assertFalse(second._executor._shutdown)
+        async def check():
+            try:
+                await asyncio.gather(_infer(first), _infer(second))
+                executor = second._executor
+                await first.cleanup()
+                await _infer(second)
+                self.assertIs(first._session, second._session)
+                self.assertIs(second._executor, executor)
+                self.assertFalse(executor._shutdown)
+            finally:
+                await asyncio.gather(first.cleanup(), second.cleanup())
+
+        asyncio.run(check())
 
 
 if __name__ == "__main__":
