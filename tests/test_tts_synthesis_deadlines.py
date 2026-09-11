@@ -28,9 +28,9 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSStartedFrame,
 )
-from pipecat.utils.text.base_text_aggregator import AggregationType
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.tts_service import TTS_SYNTHESIS_TIMEOUT, TTSService
+from pipecat.utils.text.base_text_aggregator import AggregationType
 
 
 class _StubTTS(TTSService):
@@ -54,8 +54,15 @@ class _StubTTS(TTSService):
                 continue
             yield item
 
-    async def push_error(self, error_msg, exception=None, fatal=False):
-        self.errors.append((error_msg, fatal))
+    async def push_error(
+        self,
+        error_msg,
+        exception=None,
+        fatal=False,
+        force_treat_as_permanent=False,
+        **_kwargs,
+    ):
+        self.errors.append((error_msg, fatal or force_treat_as_permanent))
 
     async def append_to_audio_context(self, context_id, frame):
         if isinstance(frame, TTSAudioRawFrame):
@@ -432,6 +439,19 @@ async def test_a_context_torn_down_by_the_handler_takes_its_watchdog_with_it():
         assert "ctx" not in service._audio_contexts
         assert service._synthesis_watchdogs == {}
         await asyncio.sleep(0.2)
-        assert service.errors == []
+        assert len(service.errors) == 1
+        assert not service.errors[0][0].startswith(TTS_SYNTHESIS_TIMEOUT)
     finally:
         handler.cancel()
+
+
+@pytest.mark.asyncio
+async def test_timeout_and_empty_completion_count_one_context_once():
+    """A timed-out context is not reported again when playback finds no audio."""
+    service = _StubTTS(chunks=[], synthesis_first_chunk_timeout_s=0.05)
+
+    await service._report_synthesis_timeout("ctx", f"{TTS_SYNTHESIS_TIMEOUT}: no audio")
+    await service._record_context_audio_outcome("ctx", received_audio=False)
+
+    assert len(service.errors) == 1
+    assert service._consecutive_zero_audio_contexts == 0

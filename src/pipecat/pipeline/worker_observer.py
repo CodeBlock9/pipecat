@@ -18,36 +18,19 @@ from attr import dataclass
 from loguru import logger
 
 from pipecat.frames.frames import Frame
-from pipecat.observers.base_observer import BaseObserver, FrameProcessed, FramePushed
+from pipecat.observers.base_observer import (
+    BaseObserver,
+    FrameProcessed,
+    FramePushed,
+    ProcessorSetUp,
+)
+from pipecat.utils.asyncio.task_manager import BaseTaskManager
 
-#: The event methods a leaf observer may implement. An event is only queued
-#: for an observer that overrides the one it would be delivered to.
-_EVENT_HANDLERS = ("on_process_frame", "on_push_frame")
+_EVENT_HANDLERS = ("on_process_frame", "on_push_frame", "on_processor_setup")
 
 
 def _implemented_handlers(observer: BaseObserver) -> frozenset[str]:
-    """Which of the frame event methods this observer actually overrides.
-
-    Every processor emits a ``FrameProcessed`` for every frame it handles and a
-    ``FramePushed`` for every frame it forwards, and both used to be queued for
-    every observer. An observer that has not overridden the method an event is
-    delivered to inherits ``BaseObserver``'s, whose body is ``pass`` -- so the
-    queue put, the task wake-up and the dispatch all bought a no-op. Recorded
-    once, when the proxy is created, rather than tested per frame.
-
-    Comparing against ``BaseObserver``'s own functions rather than asking the
-    observer anything keeps this right for observers defined outside this tree:
-    one that overrides neither method is simply sent neither event. A class in
-    between that overrides nothing is no obstacle -- the MRO resolves to the
-    base's own function -- and a handler bound on the instance rather than the
-    class counts too, which the class lookup alone cannot see.
-
-    Args:
-        observer: The observer a proxy is being created for.
-
-    Returns:
-        The names of the event methods it implements.
-    """
+    """Return the high-volume event methods implemented by an observer."""
     return frozenset(
         name
         for name in _EVENT_HANDLERS
@@ -57,21 +40,7 @@ def _implemented_handlers(observer: BaseObserver) -> frozenset[str]:
 
 
 def _declared_push_types(observer: BaseObserver) -> tuple[type[Frame], ...] | None:
-    """The frame types this observer says its push handler acts on.
-
-    Read with ``getattr`` and validated here rather than trusted, because
-    observers arrive from packages versioned separately from this one -- the
-    tuner SDK and ``NoveumTraceObserver`` both register through
-    ``PipelineWorker.add_observer``. An absent declaration, or one that is not
-    a sequence of classes, means "send everything", which is what those
-    observers received before the declaration existed.
-
-    Args:
-        observer: The observer a proxy is being created for.
-
-    Returns:
-        The declared types, or None to send this observer every frame.
-    """
+    """Validate an observer's optional pushed-frame filter."""
     declared = getattr(observer, "observed_frame_types", None)
     if declared is None:
         return None
@@ -101,11 +70,6 @@ class Proxy:
         queue: Queue for frame data awaiting observer processing.
         task: Asyncio task running the observer's frame processing loop.
         observer: The actual observer instance being proxied.
-        handlers: The event methods this observer overrides. Events destined
-            for a method it did not override are never queued.
-        push_types: Frame types the observer's push handler acts on, or None
-            to send it every frame.
-        push_decisions: Memo of ``push_types`` against concrete frame types.
     """
 
     queue: asyncio.Queue
@@ -116,20 +80,9 @@ class Proxy:
     push_decisions: dict[type[Frame], bool]
 
     def observes(self, frame: Frame, frame_type: type[Frame]) -> bool:
-        """Whether this observer's push handler acts on this frame's type.
-
-        Args:
-            frame: The frame about to be queued.
-            frame_type: Its concrete class, already computed by the caller.
-
-        Returns:
-            True if the frame should be queued for this observer.
-        """
+        """Return whether this proxy accepts the concrete pushed-frame type."""
         if self.push_types is None:
             return True
-        # Memoised per concrete class: a call pushes tens of thousands of
-        # frames drawn from a handful of types, and the largest declaration in
-        # the tree has thirty entries for isinstance to walk.
         decided = self.push_decisions.get(frame_type)
         if decided is None:
             decided = isinstance(frame, self.push_types)
@@ -185,12 +138,12 @@ class WorkerObserver(BaseObserver):
         self._observers.append(observer)
 
         # If we already started, create a new proxy for the observer.
-        # Otherwise, it will be created in start(). The test is against None
-        # rather than truthiness: start() with no initial observers leaves an
-        # empty dict behind, and every observer added afterwards then went
-        # without a proxy and received nothing at all.
+        # Otherwise, it will be created in start().
         if self._proxies is not None:
-            proxy = self._create_proxy(observer)
+            # The public registration API is synchronous. Queue delivery behind
+            # the observer's asynchronous setup so a late observer still sees
+            # the same lifecycle as one supplied at construction time.
+            proxy = self._create_proxy(observer, setup_observer=True)
             self._proxies[observer] = proxy
 
     async def remove_observer(self, observer: BaseObserver):
@@ -211,17 +164,23 @@ class WorkerObserver(BaseObserver):
         if observer in self._observers:
             self._observers.remove(observer)
 
-    async def start(self):
-        """Start all proxy observer tasks."""
-        self._proxies = self._create_proxies(self._observers)
+    async def setup(self, task_manager: BaseTaskManager):
+        """Set up a proxy for every managed observer.
 
-    async def stop(self):
-        """Stop all proxy observer tasks."""
-        if not self._proxies:
-            return
+        Processors report their own setup to observers, so the proxies are in
+        place before any of them is set up.
 
-        for proxy in self._proxies.values():
-            await self.cancel_task(proxy.task)
+        Args:
+            task_manager: The task manager the proxies run their tasks on.
+        """
+        await super().setup(task_manager)
+        self._proxies = {}
+        for observer in list(self._observers):
+            await observer.setup(task_manager)
+            # An observer added concurrently after `_proxies` became a dict
+            # already has its dynamically initialized proxy.
+            if observer not in self._proxies:
+                self._proxies[observer] = self._create_proxy(observer)
 
     async def wait_until_idle(self) -> None:
         """Wait until every observer has processed its currently queued frames."""
@@ -236,6 +195,9 @@ class WorkerObserver(BaseObserver):
         if not self._proxies:
             return
 
+        for proxy in self._proxies.values():
+            await self.cancel_task(proxy.task)
+
         for observer in self._proxies:
             await observer.cleanup()
 
@@ -244,7 +206,7 @@ class WorkerObserver(BaseObserver):
         await self._send_to_proxy(_PipelineStartedSignal())
 
     async def on_process_frame(self, data: FrameProcessed):
-        """Queue frame data for the observers that handle it.
+        """Queue frame data for all managed observers.
 
         Args:
             data: The frame push event data to distribute to observers.
@@ -252,17 +214,31 @@ class WorkerObserver(BaseObserver):
         await self._send_to_proxy(data, "on_process_frame")
 
     async def on_push_frame(self, data: FramePushed):
-        """Queue frame data for the observers that handle it.
+        """Queue frame data for all managed observers.
 
         Args:
             data: The frame push event data to distribute to observers.
         """
         await self._send_to_proxy(data, "on_push_frame")
 
-    def _create_proxy(self, observer: BaseObserver) -> Proxy:
+    async def on_processor_setup(self, data: ProcessorSetUp):
+        """Queue processor setup timing for all managed observers.
+
+        Args:
+            data: The processor setup event data to distribute to observers.
+        """
+        await self._send_to_proxy(data, "on_processor_setup")
+
+    def _create_proxy(self, observer: BaseObserver, *, setup_observer: bool = False) -> Proxy:
         """Create a proxy for a single observer."""
         queue = asyncio.Queue()
-        task = self.create_task(self._proxy_task_handler(queue, observer))
+
+        async def run_proxy():
+            if setup_observer:
+                await observer.setup(self.task_manager)
+            await self._proxy_task_handler(queue, observer)
+
+        task = self.create_task(run_proxy())
         return Proxy(
             queue=queue,
             task=task,
@@ -281,19 +257,8 @@ class WorkerObserver(BaseObserver):
         return proxies
 
     async def _send_to_proxy(self, data: Any, handler: str | None = None):
-        """Queue an event for every observer that implements its handler.
-
-        Args:
-            data: The event to queue.
-            handler: Name of the observer method this event will be delivered
-                to, or None for an event -- the pipeline-started signal -- that
-                every observer receives whatever it implements.
-        """
         if not self._proxies:
             return
-        # Only the push leg carries a declaration, and only it has a frame to
-        # dispatch on: the pipeline-started signal is a bare sentinel with no
-        # ``frame`` attribute at all.
         frame = data.frame if handler == "on_push_frame" else None
         frame_type = type(frame) if frame is not None else None
         for proxy in self._proxies.values():
@@ -314,5 +279,7 @@ class WorkerObserver(BaseObserver):
                 await observer.on_push_frame(data)
             elif isinstance(data, FrameProcessed):
                 await observer.on_process_frame(data)
+            elif isinstance(data, ProcessorSetUp):
+                await observer.on_processor_setup(data)
 
             queue.task_done()

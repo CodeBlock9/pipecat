@@ -10,7 +10,6 @@ import base64
 import json
 from typing import TYPE_CHECKING, cast
 
-import aiohttp
 from loguru import logger
 
 from pipecat.audio.dtmf.types import KeypadEntry
@@ -25,8 +24,8 @@ from pipecat.frames.frames import (
     InterruptionFrame,
     OutputTransportMessageFrame,
     OutputTransportMessageUrgentFrame,
-    StartFrame,
 )
+from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.utils.enums import EndTaskReason
 
@@ -168,13 +167,13 @@ class TwilioFrameSerializer(FrameSerializer):
         self._hangup_attempted = False
         self._transfer_attempted = False
 
-    async def setup(self, frame: StartFrame):
+    async def setup(self, setup: FrameProcessorSetup):
         """Sets up the serializer with pipeline configuration.
 
         Args:
-            frame: The StartFrame containing pipeline configuration.
+            setup: Configuration object containing setup parameters.
         """
-        self._sample_rate = self._params.sample_rate or frame.audio_in_sample_rate
+        self._sample_rate = self._params.sample_rate or setup.audio_in_sample_rate
 
     async def serialize(self, frame: Frame) -> str | bytes | None:
         """Serializes a Pipecat frame to Twilio WebSocket format.
@@ -188,12 +187,10 @@ class TwilioFrameSerializer(FrameSerializer):
         Returns:
             Serialized data as string or bytes, or None if the frame isn't handled.
         """
-        frame_reason = None
         if isinstance(frame, (EndFrame, CancelFrame)):
             frame_reason = getattr(frame, "reason", None)
             logger.debug(f"Processing {type(frame).__name__} with reason: {frame_reason}")
 
-        if isinstance(frame, (EndFrame, CancelFrame)):
             if frame_reason == EndTaskReason.TRANSFER_CALL.value and not self._transfer_attempted:
                 self._transfer_attempted = True
                 if self._transfer_strategy:

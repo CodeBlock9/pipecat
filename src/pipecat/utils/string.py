@@ -15,33 +15,40 @@ Dependencies:
     tokenization. NLTK is licensed under the Apache License 2.0.
     See: https://www.nltk.org/
     Source: https://www.nltk.org/api/nltk.tokenize.punkt.html
+
+    The tokenizer and its ``punkt_tab`` data load on first use, and the data is
+    downloaded if it isn't already present. Deployments that build their own
+    image should bundle it at build time (``python -m nltk.downloader
+    punkt_tab``) or point ``NLTK_DATA`` at a directory that already has it, so
+    that a slow or unavailable network can't delay the first bot turn.
 """
 
 import re
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import cache
 
 from loguru import logger
 
-#: NLTK's sentence tokenizer, imported on first use. See
-#: ``_sentence_tokenizer`` for why this is not done at module scope.
-_SENT_TOKENIZE: Callable[[str], list[str]] | None = None
+_load_lock = threading.Lock()
 
 
-def _sentence_tokenizer() -> Callable[[str], list[str]]:
-    """Import NLTK and make sure its ``punkt_tab`` data is on disk.
+@cache
+def _sent_tokenizer() -> Callable[[str], list[str]]:
+    """Load NLTK's sentence tokenizer and its ``punkt_tab`` data.
 
-    Deferred out of import scope. This module is imported for its tag parsing
-    and its punctuation sets by processes that never tokenize a sentence, and
-    at import scope the data check reached the filesystem and the download that
-    follows it reached the network -- both before the caller had done anything.
-    NLTK also brings a large dependency tree of its own.
+    NLTK reaches scikit-learn through its optional classifier backends, so
+    importing it costs a few hundred milliseconds. Loading it here rather than
+    at module import keeps that cost off the startup path of pipelines that
+    never tokenize.
 
-    Returns:
-        NLTK's ``sent_tokenize``, ready to use.
+    A caller arriving while the pipeline's background warming is still loading
+    waits on the lock rather than loading alongside it, so the one-time
+    ``punkt_tab`` download cannot run twice at once. The cache keeps the lock
+    off the path once the tokenizer is loaded.
     """
-    global _SENT_TOKENIZE
-    if _SENT_TOKENIZE is None:
+    with _load_lock:
         import nltk
         from nltk.tokenize import sent_tokenize
 
@@ -55,12 +62,12 @@ def _sentence_tokenizer() -> Callable[[str], list[str]]:
                     f"Failed to download NLTK 'punkt_tab' tokenizer data: {e}. "
                     "This data is required for sentence tokenization features. "
                     "The download failed due to filesystem permissions. "
-                    "To resolve: pre-install the data in a location with appropriate read permissions, "
-                    "or set the NLTK_DATA environment variable to point to a writable directory. "
-                    "See https://www.nltk.org/data.html for more information."
+                    "To resolve: pre-install the data in a location with appropriate read "
+                    "permissions, or set the NLTK_DATA environment variable to point to a "
+                    "writable directory. See https://www.nltk.org/data.html for more information."
                 )
-        _SENT_TOKENIZE = sent_tokenize
-    return _SENT_TOKENIZE
+
+        return sent_tokenize
 
 
 SENTENCE_ENDING_PUNCTUATION: frozenset[str] = frozenset(
@@ -86,8 +93,6 @@ SENTENCE_ENDING_PUNCTUATION: frozenset[str] = frozenset(
         "؛",  # Arabic semicolon
         "۔",  # Urdu full stop
         "؏",  # Arabic sign misra (classical texts)
-        # Thai
-        "।",  # Thai uses Devanagari-style punctuation in some contexts
         # Myanmar/Burmese
         "၊",  # Myanmar sign little section
         "။",  # Myanmar sign section
@@ -96,7 +101,6 @@ SENTENCE_ENDING_PUNCTUATION: frozenset[str] = frozenset(
         "៕",  # Khmer sign bariyoosan
         # Lao
         "໌",  # Lao cancellation mark (used as period)
-        "༎",  # Tibetan mark delimiter tsheg bstar (also used in Lao contexts)
         # Tibetan
         "།",  # Tibetan mark intersyllabic tsheg
         "༎",  # Tibetan mark delimiter tsheg bstar
@@ -163,7 +167,7 @@ def match_endofsentence(text: str) -> int:
         return 0
 
     # Use NLTK's sentence tokenizer to find sentence boundaries
-    sentences = _sentence_tokenizer()(text)
+    sentences = _sent_tokenizer()(text)
 
     if not sentences:
         return 0
@@ -240,6 +244,32 @@ def parse_start_end_tags(
             return (None, len(text))
 
     return (None, current_tag_index)
+
+
+def longest_trailing_partial_match(text: str, candidates: Sequence[str]) -> int:
+    """Find the length of the longest suffix of text that is a proper prefix of a candidate.
+
+    Used to detect a delimiter (e.g., an XML-style start tag) that has been
+    split across two text chunks: the trailing partial delimiter can be held
+    back from output until the next chunk completes it, rather than being
+    flushed as plain text and losing the delimiter.
+
+    Args:
+        text: The text to check for a trailing partial match.
+        candidates: Full strings to match a proper prefix of against the end of text.
+
+    Returns:
+        The length of the longest matching suffix, or 0 if no candidate has a
+        proper prefix matching the end of text.
+    """
+    longest = 0
+    for candidate in candidates:
+        max_len = min(len(text), len(candidate) - 1)
+        for length in range(max_len, longest, -1):
+            if text[-length:] == candidate[:length]:
+                longest = length
+                break
+    return longest
 
 
 @dataclass

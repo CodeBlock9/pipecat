@@ -12,8 +12,10 @@ various audio formats used in Pipecat pipelines.
 """
 
 import audioop
-import math
+import io
+import wave
 
+import loudness
 import numpy as np
 
 from pipecat.audio.resamplers.base_audio_resampler import BaseAudioResampler
@@ -106,6 +108,42 @@ def interleave_stereo_audio(left_audio: bytes, right_audio: bytes) -> bytes:
     return stereo.astype(np.int16).tobytes()
 
 
+def pcm_to_wav(
+    pcm: bytes | bytearray | memoryview, sample_rate: int, num_channels: int = 1
+) -> bytes:
+    """Wrap raw PCM audio in a WAV container.
+
+    The PCM data is expected to be signed 16-bit little-endian samples, which
+    is what Pipecat pipelines carry (e.g. what ``AudioBufferProcessor`` emits
+    from its audio event handlers).
+
+    Trailing bytes that don't complete a frame are dropped. Without this the
+    WAV header would report a frame count that excludes them while the data
+    chunk still carries them, so readers would disagree about the length and a
+    stereo stream truncated mid-frame would swap channels.
+
+    Args:
+        pcm: Raw PCM audio data (16-bit signed integers).
+        sample_rate: Sample rate of the audio in Hz.
+        num_channels: Number of interleaved channels in the PCM data.
+
+    Returns:
+        A complete in-memory WAV file as bytes.
+    """
+    block_align = 2 * num_channels
+    remainder = len(pcm) % block_align
+    if remainder:
+        pcm = pcm[: len(pcm) - remainder]
+
+    with io.BytesIO() as buffer:
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(num_channels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(pcm)
+        return buffer.getvalue()
+
+
 def normalize_value(value, min_value, max_value):
     """Normalize a value to the range [0, 1] and clamp it to bounds.
 
@@ -122,52 +160,31 @@ def normalize_value(value, min_value, max_value):
     return normalized_clamped
 
 
-#: The absolute-scale offset from ITU-R BS.1770. The full loudness formula is
-#: ``-0.691 + 10*log10(sum of channel-weighted mean squares)``; for one channel
-#: at unit weight that is ``-0.691 + 20*log10(rms)``, which is what this
-#: computes. Keeping the offset keeps the scale, and therefore keeps every
-#: threshold expressed on it -- the VAD's ``min_volume`` of 0.6 above all.
-_LOUDNESS_OFFSET_DB = 0.691
-
-
 def calculate_audio_volume(audio: bytes, sample_rate: int) -> float:
-    """Calculate the loudness level of audio data.
-
-    Root-mean-square level on the BS.1770 absolute scale, normalised to [0, 1]
-    over the same -20..80 range the EBU R128 measurement this replaced used, so
-    a threshold calibrated against that measurement still means what it meant.
-
-    The measurement it replaced ran a single-block EBU R128 integrated loudness
-    over the chunk: a K-weighting filter bank, a gating pass and a fresh
-    ``pyln.Meter`` built per call, 50 times a second per call, over
-    un-normalised int16 -- and the result was compared against one threshold.
-    What K-weighting adds is a few dB of spectral tilt; ``tests/
-    test_audio_volume.py`` holds the two against each other over recorded
-    speech and noise and requires them to agree about the VAD gate wherever the
-    level is more than 5 dB clear of it.
+    """Calculate the loudness level of audio data using ITU-R BS.1770.
 
     Args:
-        audio: Audio data as raw bytes (16-bit signed integers).
-        sample_rate: Sample rate of the audio in Hz. Unused: the level of a
-            chunk does not depend on how fast it is played. Kept because this
-            is a public function with callers outside this tree.
+        audio: Audio data as raw bytes (16-bit signed integers). Must hold at
+            least 400ms of audio, the length of a BS.1770 gating block.
+        sample_rate: Sample rate of the audio in Hz.
 
     Returns:
         Normalized loudness value between 0 (quiet) and 1 (loud).
+
+    Raises:
+        ValueError: If the audio is shorter than a gating block.
     """
-    samples = np.frombuffer(audio, dtype=np.int16)
-    if samples.size == 0:
-        return 0.0
+    audio_np = np.frombuffer(audio, dtype=np.int16)
+    audio_float = audio_np.astype(np.float32) / 32768.0
 
-    mean_square = float(np.mean(np.square(samples.astype(np.float64))))
-    if mean_square <= 0.0:
-        return 0.0
+    level = loudness.integrated_loudness(audio_float, sample_rate)
 
-    # Loudness goes from -20 to 80 (more or less), where -20 is quiet and 80 is
-    # loud.
-    loudness = 10.0 * math.log10(mean_square) - _LOUDNESS_OFFSET_DB
+    # Loudness goes from -110 to -10 LUFS (more or less), where -110 is quiet
+    # and -10 is loud. Audio below the BS.1770 absolute gate measures as -inf,
+    # which normalizes to 0.
+    level = normalize_value(level, -110, -10)
 
-    return normalize_value(loudness, -20, 80)
+    return level
 
 
 def exp_smoothing(value: float, prev_value: float, factor: float) -> float:

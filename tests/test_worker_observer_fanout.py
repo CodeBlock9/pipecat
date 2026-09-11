@@ -149,10 +149,8 @@ def _record_puts(proxy) -> list:
 
 
 async def _started_proxy(observers: list[BaseObserver]) -> WorkerObserver:
-    worker_observer = WorkerObserver(
-        observers=observers, task_manager=TaskManager(loop=asyncio.get_running_loop())
-    )
-    await worker_observer.start()
+    worker_observer = WorkerObserver(observers=observers)
+    await worker_observer.setup(TaskManager(loop=asyncio.get_running_loop()))
     return worker_observer
 
 
@@ -176,7 +174,7 @@ class TestHandlerFanOut(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([type(e) for e in queued[both]], [FrameProcessed, FramePushed])
             self.assertEqual(queued[silent], [])
         finally:
-            await proxy.stop()
+            await proxy.cleanup()
 
     async def test_a_leaf_under_a_class_that_overrides_nothing_is_still_handled(self):
         """The tuner SDK's observer arrives through exactly this shape."""
@@ -188,7 +186,7 @@ class TestHandlerFanOut(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual([type(f) for f in leaf.pushed], [TextFrame])
         finally:
-            await proxy.stop()
+            await proxy.cleanup()
 
     async def test_a_handler_bound_on_the_instance_counts_as_implemented(self):
         """Nothing about it is visible on the class, so the class test misses it."""
@@ -200,7 +198,7 @@ class TestHandlerFanOut(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual([type(f) for f in observer.pushed], [TextFrame])
         finally:
-            await proxy.stop()
+            await proxy.cleanup()
 
     async def test_the_pipeline_started_signal_reaches_every_observer(self):
         """It carries no frame at all, so no type dispatch may touch it."""
@@ -218,7 +216,7 @@ class TestHandlerFanOut(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(queued[push_only]), 1)
             self.assertEqual(len(queued[silent]), 1)
         finally:
-            await proxy.stop()
+            await proxy.cleanup()
 
 
 class TestDeclaredPushTypes(unittest.IsolatedAsyncioTestCase):
@@ -236,7 +234,7 @@ class TestDeclaredPushTypes(unittest.IsolatedAsyncioTestCase):
             # An observer that declares nothing keeps receiving everything.
             self.assertEqual([type(f) for f in undeclared.pushed], [InputAudioRawFrame, TextFrame])
         finally:
-            await proxy.stop()
+            await proxy.cleanup()
 
     async def test_a_declared_base_class_still_admits_its_subclasses(self):
         """Every observer body branches with isinstance; the filter must agree."""
@@ -251,7 +249,7 @@ class TestDeclaredPushTypes(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual([type(f) for f in observer.pushed], [TTSAudioRawFrame])
         finally:
-            await proxy.stop()
+            await proxy.cleanup()
 
     async def test_a_malformed_declaration_is_ignored_rather_than_obeyed(self):
         """Observers arrive from packages versioned separately from this one."""
@@ -264,7 +262,7 @@ class TestDeclaredPushTypes(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual([type(f) for f in observer.pushed], [TextFrame])
         finally:
-            await proxy.stop()
+            await proxy.cleanup()
 
 
 class TestAddObserverAfterStart(unittest.IsolatedAsyncioTestCase):
@@ -280,4 +278,4 @@ class TestAddObserverAfterStart(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual([type(f) for f in late.pushed], [StartFrame])
         finally:
-            await proxy.stop()
+            await proxy.cleanup()

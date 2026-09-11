@@ -50,13 +50,12 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSStoppedFrame,
 )
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.transports.base_transport import TransportParams
 from pipecat.utils.frame_queue import FrameQueue
 from pipecat.utils.time import nanoseconds_to_seconds
 
 BOT_VAD_STOP_SECS = 0.35
-DRAIN_POLL_SECS = 0.25
 
 
 class BaseOutputTransport(FrameProcessor):
@@ -78,13 +77,13 @@ class BaseOutputTransport(FrameProcessor):
 
         self._params = params
 
-        # Output sample rate. It will be initialized on StartFrame.
+        # Output sample rate. It will be initialized during setup.
         self._sample_rate = 0
 
         # We write 10ms*CHUNKS of audio at a time (where CHUNKS is the
         # `audio_out_10ms_chunks` parameter). If we receive long audio frames we
         # will chunk them. This helps with interruption handling. It will be
-        # initialized on StartFrame.
+        # initialized during setup.
         self._audio_chunk_size = 0
 
         # We will have one media sender per output frame destination. This allow
@@ -122,19 +121,37 @@ class BaseOutputTransport(FrameProcessor):
         """
         return self._audio_chunk_size
 
-    async def start(self, frame: StartFrame):
-        """Start the output transport and initialize components.
+    async def setup(self, setup: FrameProcessorSetup):
+        """Set up the transport.
 
         Args:
-            frame: The start frame containing initialization parameters.
+            setup: Configuration object containing setup parameters.
         """
-        self._sample_rate = self._params.audio_out_sample_rate or frame.audio_out_sample_rate
+        await super().setup(setup)
+        self._sample_rate = self._params.audio_out_sample_rate or setup.audio_out_sample_rate
 
         # We will write 10ms*CHUNKS of audio at a time (where CHUNKS is the
         # `audio_out_10ms_chunks` parameter). If we receive long audio frames we
         # will chunk them. This will help with interruption handling.
         audio_bytes_10ms = int(self._sample_rate / 100) * self._params.audio_out_channels * 2
         self._audio_chunk_size = audio_bytes_10ms * self._params.audio_out_10ms_chunks
+
+    async def cleanup(self):
+        """Release output transport resources at teardown."""
+        await super().cleanup()
+        for _, sender in self._media_senders.items():
+            await sender.cleanup()
+
+    async def start(self, frame: StartFrame):
+        """Start the output transport.
+
+        Base hook for subclasses, which reach it through ``super()``. The
+        transport's own audio configuration is resolved in :meth:`setup`.
+
+        Args:
+            frame: The start frame containing initialization parameters.
+        """
+        pass
 
     async def stop(self, frame: EndFrame):
         """Stop the output transport and cleanup resources.
@@ -153,12 +170,6 @@ class BaseOutputTransport(FrameProcessor):
         """
         for _, sender in self._media_senders.items():
             await sender.cancel(frame)
-
-    async def cleanup(self):
-        """Release output transport resources at teardown."""
-        await super().cleanup()
-        for _, sender in self._media_senders.items():
-            await sender.cleanup()
 
     async def set_transport_ready(self, frame: StartFrame):
         """Called when the transport is ready to stream.
@@ -466,7 +477,6 @@ class BaseOutputTransport(FrameProcessor):
             self._audio_task: asyncio.Task | None = None
             self._video_task: asyncio.Task | None = None
             self._clock_task: asyncio.Task | None = None
-            self._audio_progress_time: float = 0.0
             self._audio_paused = False
             self._audio_resume_event = asyncio.Event()
             self._audio_resume_event.set()
@@ -538,33 +548,14 @@ class BaseOutputTransport(FrameProcessor):
             # also need to wait for these tasks before cancelling the video task
             # because it might be still rendering.
             #
-            # Transport writes are unbounded, so wait on progress rather than on
-            # elapsed time: queued audio plays out in real time and a slow drain
-            # is normal, but a stalled one never completes.
-            timeout = self._params.audio_out_drain_timeout_secs
+            # A peer that stopped reading can no longer strand us here: every
+            # write is bounded by `audio_out_write_timeout_secs`, and the first
+            # timeout costs the transport its usability, so whatever is still
+            # queued drains at once instead of paying the bound again.
             if self._audio_task:
-                self._audio_progress_time = time.monotonic()
-                while True:
-                    done, _ = await asyncio.wait({self._audio_task}, timeout=DRAIN_POLL_SECS)
-                    if done:
-                        break
-                    stalled_for = time.monotonic() - self._audio_progress_time
-                    if stalled_for > timeout:
-                        logger.warning(
-                            f"{self} audio task made no progress for {stalled_for:.1f}s "
-                            f"(peer not reading?); cancelling it so {frame} can continue "
-                            "downstream"
-                        )
-                        await self._cancel_audio_task()
-                        break
+                await self._audio_task
             if self._clock_task:
-                done, _ = await asyncio.wait({self._clock_task}, timeout=timeout)
-                if not done:
-                    logger.warning(
-                        f"{self} clock task did not drain in {timeout}s; cancelling it so "
-                        f"{frame} can continue downstream"
-                    )
-                    await self._cancel_clock_task()
+                await self._clock_task
 
             # Stop audio mixer.
             if self._mixer:
@@ -583,14 +574,17 @@ class BaseOutputTransport(FrameProcessor):
 
         async def cleanup(self):
             """Release media sender resources at teardown."""
-            # Since we are cancelling everything it doesn't matter what task we cancel first.
-            await self._cancel_audio_task()
-            await self._cancel_clock_task()
-            await self._cancel_video_task()
+            try:
+                # Since we are cancelling everything it doesn't matter what task we cancel first.
+                await self._cancel_audio_task()
+                await self._cancel_clock_task()
+                await self._cancel_video_task()
 
-            # Stop audio mixer so it doesn't keep generating frames after cancellation.
-            if self._mixer:
-                await self._mixer.stop()
+                # Stop audio mixer so it doesn't keep generating frames after cancellation.
+                if self._mixer:
+                    await self._mixer.stop()
+            finally:
+                self._executor.shutdown(wait=False)
 
         async def handle_interruptions(self, _: InterruptionFrame):
             """Handle interruption events by restarting tasks and clearing buffers.
@@ -967,13 +961,7 @@ class BaseOutputTransport(FrameProcessor):
             silence_frame = OutputAudioRawFrame(
                 audio=silence, sample_rate=self.sample_rate, num_channels=1
             )
-            try:
-                await asyncio.wait_for(
-                    self._transport.write_audio_frame(silence_frame),
-                    timeout=secs + 1,
-                )
-            except TimeoutError:
-                logger.warning(f"{self} timed out writing end-frame silence")
+            await self._internal_write_audio_frame(silence_frame)
 
         async def _audio_task_handler(self):
             """Main audio processing task handler."""
@@ -982,9 +970,6 @@ class BaseOutputTransport(FrameProcessor):
             sleep_between_consecutive_failures = self._params.audio_out_sleep_between_failures
 
             async for frame in self._next_frame():
-                # Progress signal for the drain in stop().
-                self._audio_progress_time = time.monotonic()
-
                 # No need to push EndFrame, it's pushed from process_frame().
                 if isinstance(frame, EndFrame):
                     # Send some final silence so words don't cut out.
@@ -1001,13 +986,21 @@ class BaseOutputTransport(FrameProcessor):
                 # Try to send audio to the transport.
                 try:
                     if isinstance(frame, OutputAudioRawFrame):
-                        push_downstream = await self._transport.write_audio_frame(frame)
+                        push_downstream = await self._internal_write_audio_frame(frame)
                 except Exception as e:
                     logger.error(f"{self} Error writing {frame} to transport: {e}")
                     push_downstream = False
 
                 # Handle write failures
                 if not push_downstream and isinstance(frame, OutputAudioRawFrame):
+                    # A bounded-write timeout already reports a permanent error
+                    # and marks the transport unusable. From that point the
+                    # worker's ProcessorUnusablePolicy owns disposition; drain
+                    # the remaining queue without sleeping or overriding that
+                    # policy with the older fork-level cancellation watchdog.
+                    if not self._transport.is_usable:
+                        continue
+
                     consecutive_failures += 1
                     logger.warning(
                         f"Failed to write audio frame (consecutive failures: {consecutive_failures}/{max_consecutive_failures})"
@@ -1041,6 +1034,36 @@ class BaseOutputTransport(FrameProcessor):
                 # downstream in case anyone else needs it.
                 if push_downstream:
                     await self._transport.push_frame(frame)
+
+        async def _internal_write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+            """Write a frame to the transport, giving up if the write never returns.
+
+            A client that stops reading is the common way to get there: the
+            connection stays up and nothing fails, so the transport has neither
+            an error to report nor state to check. That leaves how long the
+            write takes as the only signal available.
+
+            Returns:
+                Whether the transport took the frame.
+            """
+            # Reporting the timeout below costs the transport its usability, so
+            # a peer is only written off once however much audio is still queued.
+            if not self._transport.is_usable:
+                return False
+
+            timeout = self._params.audio_out_write_timeout_secs
+            try:
+                return await asyncio.wait_for(
+                    self._transport.write_audio_frame(frame), timeout=timeout
+                )
+            except TimeoutError as e:
+                await self._transport.push_error(
+                    f"{self._transport} timed out after {timeout}s writing audio to the "
+                    "transport; the peer has stopped reading",
+                    exception=e,
+                    force_treat_as_permanent=True,
+                )
+                return False
 
         #
         # Video handling

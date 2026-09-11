@@ -29,7 +29,7 @@ from pipecat.frames.frames import (
     StartFrame,
 )
 from pipecat.metrics.metrics import MetricsData
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.services.settings import ServiceSettings, is_given
 
 
@@ -50,8 +50,6 @@ def _pydantic_model_type(annotation: Any) -> type[BaseModel] | None:
         if isinstance(candidate, type) and issubclass(candidate, BaseModel):
             return candidate
     return None
-
-
 class AIService(FrameProcessor):
     """Base class for all AI services.
 
@@ -198,6 +196,16 @@ class AIService(FrameProcessor):
         if frame is not None:
             await self.broadcast_frame_instance(frame)
 
+    async def setup(self, setup: FrameProcessorSetup):
+        """Set up the service.
+
+        Args:
+            setup: Configuration object containing setup parameters.
+        """
+        await super().setup(setup)
+        self._tracing_enabled = setup.enable_tracing
+        self._tracing_context = setup.tracing_context
+
     async def start(self, frame: StartFrame):
         """Start the AI service.
 
@@ -208,8 +216,6 @@ class AIService(FrameProcessor):
             frame: The start frame containing initialization parameters.
         """
         self._settings.validate_complete()
-        self._tracing_enabled = frame.enable_tracing
-        self._tracing_context = frame.tracing_context
 
     async def stop(self, frame: EndFrame):
         """Stop the AI service on a graceful end (``EndFrame``).
@@ -258,6 +264,9 @@ class AIService(FrameProcessor):
 
         if changed:
             logger.info(f"{self.name}: updated settings fields: {set(changed)}")
+            # New settings may be the ones that make the service work, so give
+            # it another chance rather than leaving it permanently written off.
+            await self.set_usable(True)
 
         return changed
 

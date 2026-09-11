@@ -12,39 +12,42 @@ management, parameter configuration, and audio analysis framework.
 """
 
 import asyncio
+import math
 import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
+import numpy as np
 from loguru import logger
 from pydantic import BaseModel
 
-from pipecat.audio.utils import calculate_audio_volume, exp_smoothing
+from pipecat.audio.utils import exp_smoothing, normalize_value
 
-#: One pool for every analyzer in the process, created on first use.
-#:
-#: An analyzer is built per call, so a pool each meant one operating-system
-#: thread per concurrent call to do about 31 inferences a second on it. The
-#: reason the smart-turn analyzer keeps a thread per stream does not apply
-#: here: an end-of-turn decision takes roughly a quarter of a second and would
-#: serialise across calls, while a Silero window takes well under a
-#: millisecond, so even two dozen concurrent calls leave this pool almost
-#: entirely idle. ``ThreadPoolExecutor`` grows lazily -- it only starts a new
-#: worker when every existing one is busy -- so the thread count follows
-#: simultaneous inference rather than concurrent calls.
 _INFERENCE_POOL: ThreadPoolExecutor | None = None
 _INFERENCE_POOL_LOCK = threading.Lock()
+_LOUDNESS_OFFSET_DB = 0.691
 
 
 def _inference_pool() -> ThreadPoolExecutor:
-    """The process-wide pool VAD inference runs on."""
+    """Return the process-wide pool used for short VAD inference calls."""
     global _INFERENCE_POOL
     with _INFERENCE_POOL_LOCK:
         if _INFERENCE_POOL is None:
             _INFERENCE_POOL = ThreadPoolExecutor(thread_name_prefix="vad")
         return _INFERENCE_POOL
 
+
+def _calculate_vad_audio_volume(audio: bytes) -> float:
+    """Measure a single VAD window without BS.1770's 400 ms minimum block."""
+    samples = np.frombuffer(audio, dtype=np.int16)
+    if samples.size == 0:
+        return 0.0
+    mean_square = float(np.mean(np.square(samples.astype(np.float64))))
+    if mean_square <= 0.0:
+        return 0.0
+    level = 10.0 * math.log10(mean_square) - _LOUDNESS_OFFSET_DB
+    return normalize_value(level, -20, 80)
 
 VAD_CONFIDENCE = 0.7
 VAD_START_SECS = 0.2
@@ -105,13 +108,13 @@ class VADAnalyzer(ABC):
         self._num_channels = 1
 
         self._vad_buffer = b""
-
         # Volume exponential smoothing
         self._smoothing_factor = 0.2
-        self._prev_volume = 0
+        self._prev_volume = 0.0
 
-        # Inference runs on the process-wide pool. See _INFERENCE_POOL above
-        # for why this analyzer does not own a thread of its own.
+        # Analyzers are per call, while inference is short and naturally
+        # serialized per stream. Share workers across calls instead of owning
+        # one operating-system thread per active call.
         self._executor = _inference_pool()
 
     @property
@@ -192,7 +195,7 @@ class VADAnalyzer(ABC):
 
     def _get_smoothed_volume(self, audio: bytes) -> float:
         """Calculate smoothed audio volume using exponential smoothing."""
-        volume = calculate_audio_volume(audio, self.sample_rate)
+        volume = _calculate_vad_audio_volume(audio)
         return exp_smoothing(volume, self._prev_volume, self._smoothing_factor)
 
     async def analyze_audio(self, buffer: bytes) -> VADState:
@@ -207,11 +210,8 @@ class VADAnalyzer(ABC):
         Returns:
             Current VAD state after processing the buffer.
         """
-        # The accumulation happens here, on the event loop, rather than inside
-        # the executor. A transport delivers 20 ms chunks and Silero wants a
-        # 32 ms window, so more than a third of the chunks used to make a round
-        # trip to a thread that appended them and returned the state unchanged.
-        # Whole windows only, and the remainder waits for the next chunk.
+        # Buffer on the event loop and cross into the inference pool only when
+        # at least one complete model window is available.
         self._vad_buffer += buffer
 
         num_required_bytes = self._vad_frames_num_bytes
@@ -220,18 +220,12 @@ class VADAnalyzer(ABC):
 
         whole = len(self._vad_buffer) - len(self._vad_buffer) % num_required_bytes
         audio, self._vad_buffer = self._vad_buffer[:whole], self._vad_buffer[whole:]
-
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, self._run_analyzer, audio)
 
     def _run_analyzer(self, audio: bytes) -> VADState:
-        """Analyze whole windows of audio and return the current VAD state.
-
-        Runs on the inference pool. The caller has already cut ``audio`` to a
-        whole number of windows, so nothing here buffers.
-        """
+        """Analyze one or more complete VAD windows."""
         num_required_bytes = self._vad_frames_num_bytes
-
         for start in range(0, len(audio), num_required_bytes):
             audio_frames = audio[start : start + num_required_bytes]
 
@@ -280,10 +274,5 @@ class VADAnalyzer(ABC):
         return self._vad_state
 
     async def cleanup(self):
-        """Drop what this analyzer holds at teardown.
-
-        There is no executor to shut down: inference runs on the process-wide
-        pool, which outlives every analyzer. Shutting that down here would stop
-        voice detection for every other call in the process.
-        """
+        """Drop per-stream buffers while leaving the shared pool available."""
         self._vad_buffer = b""

@@ -20,12 +20,13 @@ import aiohttp
 from loguru import logger
 
 from pipecat.frames.frames import CancelFrame, EndFrame, ErrorFrame, Frame, TranscriptionFrame
-from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven, is_given
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_latency import HUGGINGFACE_TTFS_P99
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven, is_given
 
 
 def language_to_huggingface_language(language: Language) -> str:
@@ -52,8 +53,8 @@ class HuggingFaceSTTSettings(STTSettings):
         generation_parameters: Optional provider/model generation parameters.
     """
 
-    return_timestamps: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    generation_parameters: dict[str, Any] | None | _NotGiven = field(
+    return_timestamps: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    generation_parameters: dict[str, Any] | None | NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
 
@@ -143,6 +144,11 @@ class HuggingFaceSTTService(SegmentedSTTService):
     async def cancel(self, frame: CancelFrame):
         """Cancel the Hugging Face STT service."""
         await super().cancel(frame)
+        await self._close_session()
+
+    async def cleanup(self):
+        """Close an owned HTTP session on every pipeline teardown path."""
+        await super().cleanup()
         await self._close_session()
 
     async def _ensure_session(self):
