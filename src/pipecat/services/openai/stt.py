@@ -54,9 +54,21 @@ from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
 @dataclass
 class OpenAISTTSettings(BaseWhisperSTTService.Settings):
-    """Settings for the OpenAI STT service."""
+    """Settings for the OpenAI STT service.
 
-    pass
+    Parameters:
+        keywords: Keyword hints for GPT-Transcribe.
+        languages: ISO 639-1 language hints for GPT-Transcribe. ``None`` lets
+            the model detect the language.
+    """
+
+    keywords: list[str] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    languages: list[str] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+
+
+def _is_gpt_transcribe_model(model: str | None) -> bool:
+    """Whether a model uses GPT-Transcribe's plural context parameters."""
+    return model == "gpt-transcribe" or bool(model and model.startswith("gpt-transcribe-"))
 
 
 class OpenAISTTService(BaseWhisperSTTService):
@@ -124,6 +136,8 @@ class OpenAISTTService(BaseWhisperSTTService):
             language=_language,
             prompt=None,
             temperature=None,
+            keywords=None,
+            languages=None,
         )
 
         # --- 2. Deprecated direct-arg overrides ---
@@ -150,22 +164,34 @@ class OpenAISTTService(BaseWhisperSTTService):
             ttfs_p99_latency=ttfs_p99_latency,
             **kwargs,
         )
+        self._warned_prob_metrics_unsupported = False
 
     async def _transcribe(self, audio: bytes) -> Transcription:
-        assert self._settings.language is not None
+        model = assert_given(self._settings.model)
+        is_gpt_transcribe = _is_gpt_transcribe_model(model)
 
         # Build kwargs dict with only set parameters
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "file": ("audio.wav", audio, "audio/wav"),
-            "model": self._settings.model,
-            "language": self._settings.language,
+            "model": model,
         }
+        if not is_gpt_transcribe:
+            language = assert_given(self._settings.language)
+            assert language is not None
+            kwargs["language"] = language
 
         if self._include_prob_metrics:
             # GPT-4o-transcribe models only support logprobs (not verbose_json)
-            if self._settings.model in ("gpt-4o-transcribe", "gpt-4o-mini-transcribe"):
+            if model in ("gpt-4o-transcribe", "gpt-4o-mini-transcribe"):
                 kwargs["response_format"] = "json"
                 kwargs["include"] = ["logprobs"]
+            elif is_gpt_transcribe:
+                if not self._warned_prob_metrics_unsupported:
+                    logger.warning(
+                        "{} does not expose probability metrics; continuing without them",
+                        model,
+                    )
+                    self._warned_prob_metrics_unsupported = True
             else:
                 # Whisper models support verbose_json
                 kwargs["response_format"] = "verbose_json"
@@ -176,7 +202,47 @@ class OpenAISTTService(BaseWhisperSTTService):
         if self._settings.temperature is not None:
             kwargs["temperature"] = self._settings.temperature
 
+        if is_gpt_transcribe:
+            extra_body: dict[str, Any] = {}
+            languages = assert_given(self._settings.languages)
+            keywords = assert_given(self._settings.keywords)
+            if languages:
+                extra_body["languages"] = languages
+            if keywords:
+                extra_body["keywords"] = keywords
+            if extra_body:
+                # These arguments were added after Pipecat's supported OpenAI SDK floor.
+                # extra_body keeps the wire contract available across the whole range.
+                kwargs["extra_body"] = extra_body
+
         kwargs = self.merge_provider_options(kwargs)
+
+        if is_gpt_transcribe:
+            raw_extra_body = kwargs.get("extra_body")
+            if raw_extra_body is not None and not isinstance(raw_extra_body, dict):
+                raise ValueError("OpenAI transcription extra_body must be an object")
+            extra_body = dict(raw_extra_body or {})
+
+            # Provider options are authoritative, but the SDK floor cannot accept these
+            # newer fields as named arguments. Canonicalize them into extra_body.
+            for field_name in ("languages", "keywords"):
+                if field_name in kwargs:
+                    value = kwargs.pop(field_name)
+                    if value:
+                        extra_body[field_name] = value
+                    else:
+                        extra_body.pop(field_name, None)
+                if not extra_body.get(field_name):
+                    extra_body.pop(field_name, None)
+
+            # GPT-Transcribe replaces singular language with plural language hints.
+            # Sanitize after the provider-options merge so advanced JSON cannot send both.
+            kwargs.pop("language", None)
+            extra_body.pop("language", None)
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+            else:
+                kwargs.pop("extra_body", None)
 
         return await self._client.audio.transcriptions.create(**kwargs)
 
