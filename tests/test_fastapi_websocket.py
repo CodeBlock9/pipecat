@@ -379,7 +379,12 @@ class TestOutputAudioFramePassthrough(unittest.IsolatedAsyncioTestCase):
         output = FastAPIWebsocketOutputTransport(AsyncMock(), client, params)
         output._sample_rate = 8000
         written = []
-        output._write_frame = AsyncMock(side_effect=lambda frame: written.append(frame))
+
+        def _record(frame):
+            written.append(frame)
+            return True
+
+        output._write_frame = AsyncMock(side_effect=_record)
         output._write_audio_sleep = AsyncMock()
         return output, written
 

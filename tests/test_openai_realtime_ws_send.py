@@ -39,9 +39,11 @@ class _FakeWebsocket:
 class _ErrorRecorder:
     def __init__(self):
         self.frames: list[ErrorFrame] = []
+        self.permanent: list[bool] = []
 
-    async def __call__(self, error: ErrorFrame):
+    async def __call__(self, error: ErrorFrame, force_treat_as_permanent: bool = False):
         self.frames.append(error)
+        self.permanent.append(force_treat_as_permanent)
 
 
 def _service(**kwargs) -> OpenAIRealtimeLLMService:
@@ -71,7 +73,7 @@ async def test_send_failure_is_reported_once_as_fatal():
     await service.send_client_event(events.InputAudioBufferAppendEvent(audio="AAAA"))
 
     assert len(errors.frames) == 1
-    assert errors.frames[0].fatal is True
+    assert errors.permanent == [True]
     assert "keepalive ping timeout" in errors.frames[0].error
     assert service._websocket is None
     assert service._dead_websocket is websocket
@@ -173,7 +175,7 @@ async def test_connect_failure_is_fatal():
         realtime_llm.websocket_connect = original
 
     assert len(errors.frames) == 1
-    assert errors.frames[0].fatal is True
+    assert errors.permanent == [True]
     assert service._websocket is None
 
 
@@ -203,5 +205,5 @@ async def test_azure_connect_failure_is_fatal():
         azure_llm.websocket_connect = original
 
     assert len(errors.frames) == 1
-    assert errors.frames[0].fatal is True
+    assert errors.permanent == [True]
     assert service._websocket is None

@@ -2838,7 +2838,7 @@ class TestRealtimeServiceModeAggregator(unittest.IsolatedAsyncioTestCase):
         user._user_turn_controller.cleanup = AsyncMock()
         user._user_idle_controller.cleanup = AsyncMock()
 
-        await user._cleanup()
+        await user.cleanup()
 
         user.cancel_task.assert_awaited_once_with(flush_task)
         self.assertIsNone(user._realtime_handoff_flush_task)
