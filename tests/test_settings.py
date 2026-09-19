@@ -8,7 +8,8 @@
 
 from unittest.mock import patch
 
-from pipecat.services.deepgram.sagemaker.stt import DeepgramSageMakerSTTSettings
+import pytest
+
 from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
 from pipecat.services.inworld.realtime import events as inworld_events
 from pipecat.services.inworld.realtime.llm import InworldRealtimeLLMSettings
@@ -464,6 +465,9 @@ class TestDeepgramSTTSettingsFromMapping:
 class TestDeepgramSageMakerSTTSettings:
     def test_inherits_flat_settings_behavior(self):
         """Smoke test: SageMaker settings inherit the flat base correctly."""
+        pytest.importorskip("aws_sdk_sagemaker_runtime_http2")
+        from pipecat.services.deepgram.sagemaker.stt import DeepgramSageMakerSTTSettings
+
         store = DeepgramSageMakerSTTSettings(
             model="nova-3",
             language="en",

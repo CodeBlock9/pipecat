@@ -13,6 +13,8 @@ import aiohttp
 import pytest
 from aiohttp import web
 
+pytest.importorskip("piper")
+
 from pipecat.frames.frames import (
     AggregatedTextFrame,
     ErrorFrame,

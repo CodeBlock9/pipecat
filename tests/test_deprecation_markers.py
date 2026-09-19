@@ -27,12 +27,18 @@ from pathlib import Path
 import pytest
 
 # The shared parser lives under scripts/ (build tooling, not shipped runtime
-# code). Put it on the path so the audit and the generator validate identically.
+# code). Put it on the path so the audit and the generator validate identically,
+# then take it back off together with the entry generate.py adds for itself:
+# left in place, scripts/daily/ imports as a namespace package named `daily`, and
+# every daily-python guard collected after this module believes the SDK is there.
+_SYS_PATH = list(sys.path)
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from deprecations import generate as dgen  # noqa: E402
 from deprecations import generate_removals as drem  # noqa: E402
 from deprecations import scan as dscan  # noqa: E402
+
+sys.path[:] = _SYS_PATH
 
 from pipecat.frames.frames import (  # noqa: E402
     CancelTaskFrame,

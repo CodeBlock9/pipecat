@@ -11,6 +11,8 @@ but video tracks are subscribed. The fix ensures video stream processing
 only starts when there is a consumer for the frames.
 """
 
+from __future__ import annotations
+
 import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch

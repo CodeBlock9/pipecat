@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+pytest.importorskip("daily")
+
 from pipecat.frames.frames import OutputAudioRawFrame
 from pipecat.transports.tavus.transport import (
     TavusOutputTransport,

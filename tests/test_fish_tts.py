@@ -8,6 +8,8 @@
 
 import pytest
 
+pytest.importorskip("ormsgpack")
+
 from pipecat.services.fish.tts import FishAudioTTSService
 
 

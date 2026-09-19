@@ -6,6 +6,10 @@
 
 import unittest
 
+import pytest
+
+pytest.importorskip("langchain_core")
+
 from langchain_core.language_models import FakeStreamingListLLM
 from langchain_core.prompts import ChatPromptTemplate
 

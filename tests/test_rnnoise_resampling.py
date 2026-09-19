@@ -4,21 +4,19 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 
 # We don't need to mock sys.modules here if we use patch on the imported module member
-# But we need to ensure RNNoiseFilter is imported so we can patch its member
-try:
-    from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
-    from pipecat.frames.frames import FilterEnableFrame
-except ImportError as e:
-    # If dependencies are missing (like numpy?), we can't test
-    print(f"Failed to import RNNoiseFilter: {e}")
-    sys.exit(1)
+# But we need to ensure RNNoiseFilter is imported so we can patch its member.
+# rnnoise_filter degrades on its own when pyrnnoise is missing, so the only
+# import error that can reach here is a genuine break in pipecat: let it
+# surface as an ordinary collection error rather than a skip that reads like
+# a missing extra (or, as before, a sys.exit that kills the whole session).
+from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
+from pipecat.frames.frames import FilterEnableFrame
 
 
 class TestRNNoiseResampling(unittest.IsolatedAsyncioTestCase):

@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+pytest.importorskip("daily")
+
 from pipecat.frames.frames import BotConnectedFrame, STTMetadataFrame
 from pipecat.services.stt_latency import DEEPGRAM_TTFS_P99
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
