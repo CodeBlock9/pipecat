@@ -7,13 +7,23 @@
 """Tests for PiperTTSService."""
 
 import asyncio
+import importlib.util
 import unittest
 
 import aiohttp
 import pytest
 from aiohttp import web
 
-pytest.importorskip("piper")
+# Both tests here drive PiperHttpTTSService, which talks to a separate Piper
+# server and needs nothing from the GPL `piper` package. What stops them running
+# is pipecat's own import policy: services/piper/tts.py re-raises as a plain
+# ImportError when `piper` is missing, which pytest reports as a collection
+# error rather than a skip, so the guard names the module the tests import and
+# the exception it raises. Only when `piper` is absent: with it installed there
+# is no guard, and a genuine break inside that pipecat module stays a visible
+# collection error instead of reading as a missing extra.
+if importlib.util.find_spec("piper") is None:
+    pytest.importorskip("pipecat.services.piper.tts", exc_type=ImportError)
 
 from pipecat.frames.frames import (
     AggregatedTextFrame,
@@ -146,8 +156,11 @@ async def test_run_piper_tts_error(aiohttp_client):
 
         expected_down_frames = [AggregatedTextFrame, TTSStartedFrame, TTSStoppedFrame, TTSTextFrame]
 
-        # The 404, then the context completing with no audio.
-        expected_up_frames = [ErrorFrame, ErrorFrame]
+        # Just the 404. A context whose generator already yielded an ErrorFrame
+        # is recorded in the service's `_failed_audio_contexts`, so when it then
+        # completes without audio that silence is not reported a second time:
+        # one failure, one report.
+        expected_up_frames = [ErrorFrame]
 
         frames_received = await run_test(
             tts_service,
@@ -160,6 +173,9 @@ async def test_run_piper_tts_error(aiohttp_client):
         assert isinstance(up_frames[0], ErrorFrame), "Must receive an ErrorFrame for 404"
         assert "status: 404" in up_frames[0].error, (
             "ErrorFrame should contain details about the 404"
+        )
+        assert not [f for f in up_frames if "completed with no audio" in getattr(f, "error", "")], (
+            "The 404 is the only report this failure gets"
         )
 
 
