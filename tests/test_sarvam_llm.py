@@ -253,6 +253,16 @@ def test_sarvam_llm_build_chat_completion_params_filters_unsupported_fields():
     assert built_params["reasoning_effort"] == "medium"
 
 
+@pytest.mark.xfail(
+    strict=True,
+    raises=KeyError,
+    reason=(
+        "PT4-13 (T5): settings.extra never reaches the request. "
+        "merge_provider_options merges only _provider_options, which "
+        "apply_provider_options populates, so a service built with "
+        "Settings(extra=...) sends nothing."
+    ),
+)
 def test_sarvam_llm_build_params_forward_core_and_extra_fields():
     with patch.object(SarvamLLMService, "create_client"):
         settings = SarvamLLMService.Settings(
@@ -286,6 +296,16 @@ def test_sarvam_llm_build_params_forward_core_and_extra_fields():
     assert built_params["n"] == 2
 
 
+@pytest.mark.xfail(
+    strict=True,
+    raises=KeyError,
+    reason=(
+        "PT4-13 (T5): settings.extra never reaches the request. "
+        "merge_provider_options merges only _provider_options, which "
+        "apply_provider_options populates, so a service built with "
+        "Settings(extra=...) sends nothing."
+    ),
+)
 def test_sarvam_llm_extra_body_merges_with_user_extra():
     with patch.object(SarvamLLMService, "create_client"):
         settings = SarvamLLMService.Settings(

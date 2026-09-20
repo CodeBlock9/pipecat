@@ -70,21 +70,36 @@ async def test_openai_run_inference_with_llm_context():
         mock_adapter.get_llm_invocation_params.assert_called_once_with(
             mock_context, system_instruction=None, convert_developer_to_user=False
         )
-        service._client.chat.completions.create.assert_called_once_with(
-            model="gpt-4",
-            stream=False,
-            frequency_penalty=0.5,
-            presence_penalty=OPENAI_NOT_GIVEN,
-            seed=42,
-            temperature=0.7,
-            top_p=OPENAI_NOT_GIVEN,
-            max_tokens=100,
-            max_completion_tokens=OPENAI_NOT_GIVEN,
-            service_tier=OPENAI_NOT_GIVEN,
-            messages=test_messages,
-            tools=OPENAI_NOT_GIVEN,
-            tool_choice=OPENAI_NOT_GIVEN,
-        )
+        # build_chat_completion_params passes its payload through
+        # merge_provider_options, whose deep copy (services/ai_service.py) mints
+        # a fresh openai.NotGiven for every omitted field -- and NotGiven defines
+        # neither __eq__ nor __deepcopy__, so assert_called_once_with compares
+        # those by identity and fails while printing byte-identical reprs. Pin
+        # the omitted fields by type instead; everything else stays pinned
+        # exactly: the call count, that nothing is passed positionally, each
+        # given value, and that no other keyword joins the call.
+        service._client.chat.completions.create.assert_called_once()
+        call = service._client.chat.completions.create.call_args
+        assert call.args == ()
+        sent = dict(call.kwargs)
+        for name in (
+            "presence_penalty",
+            "top_p",
+            "max_completion_tokens",
+            "service_tier",
+            "tools",
+            "tool_choice",
+        ):
+            assert isinstance(sent.pop(name), NotGiven), name
+        assert sent == {
+            "model": "gpt-4",
+            "stream": False,
+            "frequency_penalty": 0.5,
+            "seed": 42,
+            "temperature": 0.7,
+            "max_tokens": 100,
+            "messages": test_messages,
+        }
 
 
 @pytest.mark.asyncio
