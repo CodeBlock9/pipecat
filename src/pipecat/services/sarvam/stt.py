@@ -542,20 +542,6 @@ class SarvamSTTService(STTService):
 
         return changed
 
-    @deprecated(
-        "`SarvamSTTService.set_prompt` is deprecated since 0.0.104 and will be removed in "
-        "2.0.0. Use `STTUpdateSettingsFrame(SarvamSTTService.Settings(prompt=...))` instead."
-    )
-    async def set_prompt(self, prompt: str | None):
-        """Update the legacy translation prompt and reconnect."""
-        if not self._config.supports_prompt:
-            if prompt is not None:
-                raise ValueError(f"Model '{self._settings.model}' does not support prompt parameter.")
-            return
-        self._settings.prompt = prompt
-        await self._disconnect()
-        await self._connect()
-
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the service and connect.
 
