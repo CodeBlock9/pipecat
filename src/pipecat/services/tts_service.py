@@ -241,6 +241,14 @@ class TTSService(AIService):
             silence_time_s: Duration of silence to push when push_silence_after_stop is True.
             pause_frame_processing: Whether to pause frame processing during audio generation.
             pause_watchdog_timeout_s: Unused deprecated compatibility argument.
+
+                .. deprecated:: 1.8.0
+                    No replacement. Frame processing is now paused only while there is
+                    audio still to be played, so the pause is lifted by the
+                    ``BotStoppedSpeakingFrame`` that follows playback or by the audio
+                    context completing in silence, and no timer is needed to break it.
+                    Will be removed in 2.0.0.
+
             synthesis_first_chunk_timeout_s: Deadline for the first audio of one
                 synthesis. ``None`` leaves synthesis unbounded, which is the
                 default. Applied around the ``run_tts`` iteration and, for
