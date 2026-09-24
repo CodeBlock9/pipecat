@@ -1,0 +1,1 @@
+- `GeminiLLMAdapter`'s parallel-tool merge ends a group at the first message that is neither a tool call nor a tool response. It kept scanning past the model's reply and the user's next turn, so a later unsigned call and its result were pulled into the earlier group and sent ahead of the instruction that caused them.

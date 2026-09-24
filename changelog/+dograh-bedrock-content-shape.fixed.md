@@ -1,0 +1,1 @@
+- `AWSBedrockLLMAdapter` emits Converse text blocks (`{"text": ...}`) for the `(empty)` fallback of an empty content list and for string content it merges with a neighbouring message of the same role. Both used Anthropic's `{"type": "text", ...}` shape, which the Converse API rejects before the request is sent.
