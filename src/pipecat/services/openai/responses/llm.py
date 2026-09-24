@@ -26,7 +26,6 @@ from openai.types.responses import (
     ResponseCompletedEvent,
     ResponseErrorEvent,
     ResponseFailedEvent,
-    ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseFunctionToolCall,
     ResponseIncompleteEvent,
@@ -348,6 +347,12 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
     def _build_response_params(self, invocation_params: OpenAIResponsesLLMInvocationParams) -> dict:
         """Build parameters for a Responses API call.
 
+        ``settings.extra`` is deep-merged over the built parameters, and the
+        applied provider options are deep-merged over that, so an applied
+        option wins and a partial nested one keeps the builder's sibling keys.
+        Keys the SDK method has no parameter for are then moved into
+        ``extra_body``.
+
         Args:
             invocation_params: Parameters derived from the LLM context.
 
@@ -402,6 +407,7 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
             self._maybe_disable_reasoning(params)
 
         # Extra settings
+        params = self.merge_provider_options(params, include_declared=False)
         params = self.merge_provider_options(params)
         params = self._route_unsupported_options_to_extra_body(params)
 
@@ -452,6 +458,10 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
     ) -> list[FunctionCallFromLLM]:
         """Convert accumulated function call data into FunctionCallFromLLM list.
 
+        A call whose arguments do not parse is skipped with a warning, as the
+        chat-completions loop does, rather than run with fabricated empty
+        arguments. Empty arguments are a call with no parameters.
+
         Args:
             context: The LLM context for the current inference.
             function_calls: Map of item_id to {name, call_id, arguments}.
@@ -467,7 +477,7 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
                 logger.warning(
                     f"{self}: Failed to parse function call arguments: {fc['arguments']}"
                 )
-                arguments = {}
+                continue
             fc_list.append(
                 FunctionCallFromLLM(
                     context=context,
@@ -477,6 +487,27 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
                 )
             )
         return fc_list
+
+    @staticmethod
+    def _completed_function_calls(
+        function_calls: dict[str, dict[str, str]],
+    ) -> dict[str, dict[str, str]]:
+        """Keep the calls whose arguments finished streaming.
+
+        Both transports apply this when a response ends in a terminal error: a
+        call announced before it may never have finished its arguments, and
+        must not run with fabricated ones. ``arguments`` is only written by the
+        Done events, so a non-empty string means the call completed (e.g.
+        parallel tool calls finished before a later item was truncated) and it
+        still runs.
+
+        Args:
+            function_calls: Map of item_id to {name, call_id, arguments}.
+
+        Returns:
+            The same map, restricted to the completed calls.
+        """
+        return {item_id: call for item_id, call in function_calls.items() if call["arguments"]}
 
     # -- reasoning ------------------------------------------------------------
 
@@ -1053,6 +1084,11 @@ class OpenAIResponsesLLMService(
     ):
         """Receive and process WebSocket events until the response completes.
 
+        A response that ends in ``response.failed``, ``response.incomplete`` or
+        an ``error`` event that is not raised for a retry reports the server's
+        message, and runs only the function calls whose arguments finished
+        streaming, as the HTTP variant does.
+
         Args:
             context: The LLM context for the current inference.
             full_input: The complete input items list (for storing state on success).
@@ -1070,8 +1106,8 @@ class OpenAIResponsesLLMService(
             ConnectionClosed: Connection was lost and could not be recovered.
         """
         function_calls: dict[str, dict[str, str]] = {}
-        current_arguments: dict[str, str] = {}
         reasoning_summary_open = False
+        stream_errored = False
 
         deadline = time.monotonic() + output_timeout_secs if output_timeout_secs else None
 
@@ -1124,12 +1160,6 @@ class OpenAIResponsesLLMService(
                         "call_id": item.get("call_id", ""),
                         "arguments": "",
                     }
-                    current_arguments[item_id] = ""
-
-            elif event_type == "response.function_call_arguments.delta":
-                item_id = event.get("item_id", "")
-                if item_id in current_arguments:
-                    current_arguments[item_id] += event.get("delta", "")
 
             elif event_type == "response.function_call_arguments.done":
                 item_id = event.get("item_id", "")
@@ -1161,14 +1191,16 @@ class OpenAIResponsesLLMService(
                 response = event.get("response", {})
                 usage = response.get("usage")
                 if usage:
+                    # A Responses-compatible server may send any count as null;
+                    # coalesce each to 0, as the HTTP variant does.
                     input_details = usage.get("input_tokens_details") or {}
                     output_details = usage.get("output_tokens_details") or {}
                     tokens = LLMTokenUsage(
-                        prompt_tokens=usage.get("input_tokens", 0),
-                        completion_tokens=usage.get("output_tokens", 0),
-                        total_tokens=usage.get("total_tokens", 0),
-                        cache_read_input_tokens=input_details.get("cached_tokens", 0),
-                        reasoning_tokens=output_details.get("reasoning_tokens", 0),
+                        prompt_tokens=usage.get("input_tokens") or 0,
+                        completion_tokens=usage.get("output_tokens") or 0,
+                        total_tokens=usage.get("total_tokens") or 0,
+                        cache_read_input_tokens=input_details.get("cached_tokens") or 0,
+                        reasoning_tokens=output_details.get("reasoning_tokens") or 0,
                     )
                     await self.start_llm_usage_metrics(tokens)
 
@@ -1185,11 +1217,14 @@ class OpenAIResponsesLLMService(
                 break  # Response complete
 
             elif event_type in ("response.failed", "response.incomplete"):
-                response = event.get("response", {})
-                status_details = response.get("status_details") or {}
-                error_info = status_details.get("error") or {}
-                error_msg = error_info.get("message", f"Response {event_type.split('.')[-1]}")
-                await self.push_error(error_msg=f"LLM response error: {error_msg}")
+                # The Responses API's own fields, either of which may be absent.
+                response = event.get("response") or {}
+                error = response.get("error") or {}
+                details = response.get("incomplete_details") or {}
+                message = error.get("message") or details.get("reason")
+                fallback = f"Response {event_type.split('.')[-1]}"
+                await self.push_error(error_msg=f"LLM response error: {message or fallback}")
+                stream_errored = True
                 break
 
             elif event_type == "error":
@@ -1203,7 +1238,11 @@ class OpenAIResponsesLLMService(
                     raise _ConnectionLimitReachedError(message)
                 else:
                     await self.push_error(error_msg=f"WebSocket API error: {message}")
+                    stream_errored = True
                     break
+
+        if stream_errored:
+            function_calls = self._completed_function_calls(function_calls)
 
         # Process any function calls
         if function_calls:
@@ -1307,7 +1346,6 @@ class OpenAIResponsesHttpLLMService(_BaseOpenAIResponsesLLMService):
 
         # Track function calls across stream events
         function_calls: dict[str, dict[str, str]] = {}  # item_id -> {name, call_id, arguments}
-        current_arguments: dict[str, str] = {}  # item_id -> accumulated arguments
         reasoning_summary_open = False
         stream_errored = False
 
@@ -1359,12 +1397,6 @@ class OpenAIResponsesHttpLLMService(_BaseOpenAIResponsesLLMService):
                             "call_id": item.call_id,
                             "arguments": "",
                         }
-                        current_arguments[item_id] = ""
-
-                elif isinstance(event, ResponseFunctionCallArgumentsDeltaEvent):
-                    item_id = event.item_id
-                    if item_id in current_arguments:
-                        current_arguments[item_id] += event.delta
 
                 elif isinstance(event, ResponseFunctionCallArgumentsDoneEvent):
                     item_id = event.item_id
@@ -1448,16 +1480,8 @@ class OpenAIResponsesHttpLLMService(_BaseOpenAIResponsesLLMService):
                     stream_errored = True
                     break
 
-        # A stream that ended in a terminal error may have announced a function
-        # call whose arguments never finished streaming — drop those rather than
-        # run them with fabricated empty arguments. `arguments` is only written
-        # by the Done events, so a non-empty string means the call completed
-        # (e.g. parallel tool calls finished before a later item was truncated)
-        # and it still runs.
         if stream_errored:
-            function_calls = {
-                item_id: call for item_id, call in function_calls.items() if call["arguments"]
-            }
+            function_calls = self._completed_function_calls(function_calls)
 
         # Process any function calls
         if function_calls:
