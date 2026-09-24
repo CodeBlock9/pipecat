@@ -26,6 +26,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.serializers.base_serializer import FrameSerializer
+from pipecat.serializers.call_strategies import CARRIER_REQUEST_TIMEOUT_SECS
 
 
 class VobizFrameSerializer(FrameSerializer):
@@ -202,7 +203,9 @@ class VobizFrameSerializer(FrameSerializer):
             }
 
             # Make the DELETE request to hang up the call
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=CARRIER_REQUEST_TIMEOUT_SECS)
+            ) as session:
                 async with session.delete(endpoint, headers=headers) as response:
                     if response.status == 204:
                         logger.info(f"Successfully terminated Vobiz call {call_id}")

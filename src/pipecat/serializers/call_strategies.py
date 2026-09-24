@@ -7,6 +7,12 @@ to delegate call operations (transfer, hangup) to provider-specific implementati
 from abc import ABC, abstractmethod
 from typing import Any
 
+# Total bound, in seconds, on a carrier REST request a serializer makes itself
+# to end a call. It runs inside the terminal frame's traversal, so without one
+# (aiohttp's default total is 300 s) a carrier that stops answering holds the
+# pipeline's end for as long.
+CARRIER_REQUEST_TIMEOUT_SECS = 5.0
+
 
 class CallOperationStrategy(ABC):
     """Base strategy for call operations."""

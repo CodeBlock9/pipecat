@@ -241,10 +241,12 @@ class PipelineWorker(BaseWorker):
 
               - StopFrame: pipeline was stopped (processors keep connections open)
               - EndFrame: pipeline ended normally
-              - CancelFrame: pipeline was cancelled
+              - CancelFrame: pipeline was cancelled, including while an EndFrame or
+                StopFrame was still on its way to the end of the pipeline
 
-          Use this event for cleanup, logging, or post-processing tasks. Users can inspect
-          the frame if they need to handle specific cases.
+          It fires once, for whichever of these lands first. Use this event for cleanup,
+          logging, or post-processing tasks. Users can inspect the frame if they need to
+          handle specific cases.
 
     - on_pipeline_timeout: Called when a frame the worker was waiting on never
           reached the end of the pipeline, meaning a processor is blocked. Inspect
@@ -501,6 +503,13 @@ class PipelineWorker(BaseWorker):
 
         self._finished = False
         self._cancelled = False
+        # A cancel is signalled as well as queued. While an EndFrame or
+        # StopFrame is still traversing the pipeline, the task that would take
+        # the CancelFrame from the push queue is the one waiting for it.
+        self._cancel_frame: CancelFrame | None = None
+        self._cancel_requested = asyncio.Event()
+        # The pipeline finishes once, for the first terminal frame to land.
+        self._pipeline_finished_fired = False
 
         # This queue is the queue used to push frames to the pipeline.
         self._push_queue = asyncio.Queue()
@@ -921,9 +930,12 @@ class PipelineWorker(BaseWorker):
                 logger.debug(f"Pipeline worker {self} got cancelled from outside...")
                 # We have been cancelled from outside, let's just cancel everything.
                 await self._cancel()
-                # Wait again for pipeline to finish. This time we have really
-                # cancelled, so it should really finish.
-                await self._wait_for_pipeline_finished()
+                # Wait for the push task itself, not for _finished_event: only the
+                # pipeline's own tasks set the event, and a cancellation that
+                # also cancelled them leaves nothing to set it. asyncio.run's
+                # final sweep does exactly that, cancelling every task at once.
+                if self._process_push_task:
+                    await asyncio.wait({self._process_push_task})
                 # Re-raise in case there's more cleanup to do.
                 raise
         finally:
@@ -938,6 +950,9 @@ class PipelineWorker(BaseWorker):
             await self._cancel_tasks()
             self._print_dangling_tasks()
             self._finished = True
+            # Release BaseWorker.wait() callers however run() ended. The
+            # pipeline sets the event only when it winds down itself.
+            self._finished_event.set()
             logger.debug(f"Pipeline worker {self} has finished")
 
     async def queue_frame(
@@ -1188,7 +1203,9 @@ class PipelineWorker(BaseWorker):
             self._cancelled = True
             if not self._pipeline_start_event.is_set():
                 self._pipeline_start_event.set()
-            await self.queue_frame(CancelFrame(reason=reason))
+            self._cancel_frame = CancelFrame(reason=reason)
+            self._cancel_requested.set()
+            await self.queue_frame(self._cancel_frame)
 
     async def _create_tasks(self):
         """Create and start all pipeline processing tasks."""
@@ -1268,10 +1285,15 @@ class PipelineWorker(BaseWorker):
         logger.debug(f"{self}: {frame} reached the end of the pipeline, pipeline is now ready.")
         return True
 
-    async def _wait_for_pipeline_end(self, frame: Frame):
-        """Wait for the specified frame to reach the end of the pipeline."""
+    async def _wait_for_pipeline_end(self, frame: Frame) -> Frame:
+        """Wait for the specified frame to reach the end of the pipeline.
 
-        async def wait_for_cancel():
+        Returns:
+            The frame that ended the pipeline: the one given, or the
+            ``CancelFrame`` of a cancel that preempted it.
+        """
+
+        async def wait_for_cancel(frame: CancelFrame):
             timeout = (
                 self._cancel_timeout_secs
                 if self._pending_cancel_timeout_secs is None
@@ -1287,24 +1309,69 @@ class PipelineWorker(BaseWorker):
                 )
                 await self._call_event_handler("on_pipeline_timeout", frame)
             finally:
-                await self._call_event_handler("on_pipeline_finished", frame)
+                await self._fire_pipeline_finished(frame)
 
         logger.debug(f"{self}: Closing. Waiting for {frame} to reach the end of the pipeline...")
 
         if isinstance(frame, CancelFrame):
-            await wait_for_cancel()
+            await wait_for_cancel(frame)
         else:
-            # Ending flushes what is queued, so cutting the wait short would
-            # drop the audio the EndFrame exists to play out. A processor that
-            # could hold it up watches for that itself.
-            await self._pipeline_end_event.wait()
-            logger.debug(f"{self}: {frame} reached the end of the pipeline, pipeline is closing.")
+            # Ending flushes what is queued, so no timeout cuts this wait short:
+            # that would drop the audio the EndFrame exists to play out. A
+            # processor that could hold it up watches for that itself. Only a
+            # cancel preempts it, leaving whatever the traversal was still
+            # doing unfinished and its outcome unknown. The push queue cannot
+            # deliver that cancel, because its task is this one waiting, so the
+            # CancelFrame goes to the pipeline directly.
+            cancel_frame = await self._wait_for_end_or_cancel()
+            if cancel_frame:
+                logger.warning(
+                    f"{self}: cancelled while waiting for {frame} to reach the end of the pipeline"
+                )
+                frame = cancel_frame
+                await self._pipeline.queue_frame(frame)
+                await wait_for_cancel(frame)
+            else:
+                logger.debug(
+                    f"{self}: {frame} reached the end of the pipeline, pipeline is closing."
+                )
 
         self._pipeline_end_event.clear()
 
         # We are really done. Setting ``_finished_event`` makes
         # ``BaseWorker.wait()`` resolve for callers awaiting this worker.
         self._finished_event.set()
+        return frame
+
+    async def _wait_for_end_or_cancel(self) -> CancelFrame | None:
+        """Wait for an EndFrame or StopFrame to land, unless a cancel preempts it.
+
+        Returns:
+            The ``CancelFrame`` of the cancel that preempted the wait, or
+            ``None`` once the frame has reached the end of the pipeline, which
+            wins a tie.
+        """
+        waits = [
+            asyncio.create_task(self._pipeline_end_event.wait()),
+            asyncio.create_task(self._cancel_requested.wait()),
+        ]
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for wait in waits:
+                wait.cancel()
+        return None if self._pipeline_end_event.is_set() else self._cancel_frame
+
+    async def _fire_pipeline_finished(self, frame: Frame):
+        """Fire ``on_pipeline_finished`` for the first terminal frame to land.
+
+        A cancel that preempts an EndFrame or StopFrame races it to the end of
+        the pipeline, and whichever lands first finishes it.
+        """
+        if self._pipeline_finished_fired:
+            return
+        self._pipeline_finished_fired = True
+        await self._call_event_handler("on_pipeline_finished", frame)
 
     def _cancel_progress_report(self) -> str:
         """Describe which leaf processors have not seen cancellation."""
@@ -1486,7 +1553,7 @@ class PipelineWorker(BaseWorker):
             frame = await self._push_queue.get()
             await self._pipeline.queue_frame(frame)
             if isinstance(frame, (CancelFrame, EndFrame, StopFrame)):
-                await self._wait_for_pipeline_end(frame)
+                frame = await self._wait_for_pipeline_end(frame)
             running = not isinstance(frame, (CancelFrame, EndFrame, StopFrame))
             cleanup_pipeline = not isinstance(frame, StopFrame)
             self._push_queue.task_done()
@@ -1631,10 +1698,10 @@ class PipelineWorker(BaseWorker):
 
             self._pipeline_start_event.set()
         elif isinstance(frame, EndFrame):
-            await self._call_event_handler("on_pipeline_finished", frame)
+            await self._fire_pipeline_finished(frame)
             self._pipeline_end_event.set()
         elif isinstance(frame, StopFrame):
-            await self._call_event_handler("on_pipeline_finished", frame)
+            await self._fire_pipeline_finished(frame)
             self._pipeline_end_event.set()
         elif isinstance(frame, CancelFrame):
             self._pipeline_end_event.set()

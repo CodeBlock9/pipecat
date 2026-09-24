@@ -1,0 +1,1 @@
+- `DeepgramSTTService` cancels its connection handler on every disconnect, including one whose close message fails on a socket Deepgram has already closed. That failure used to skip the cancel, so the handler lived on, reconnected once the socket dropped, and outlived the service's `cleanup()` holding a live connection. The close message stays best effort.

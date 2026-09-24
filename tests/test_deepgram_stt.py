@@ -14,7 +14,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from deepgram.core import ApiError
 from loguru import logger
+from websockets.exceptions import ConnectionClosedError
 
+from pipecat.frames.frames import EndFrame
 from pipecat.services.deepgram.stt import DeepgramSTTService, _derive_deepgram_urls
 from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.utils.network import QuickFailureTracker
@@ -467,3 +469,109 @@ async def test_connection_handler_does_not_reconnect_after_cancel():
         for task in remaining:
             task.cancel()
         await asyncio.gather(*remaining, return_exceptions=True)
+
+
+class _ClosedSocket:
+    """A connection Deepgram has already closed, so the close message fails on it.
+
+    ``start_listening`` ends, by raising, once ``dropped`` is set: the way the
+    SDK's listener ends when Deepgram finishes closing the socket.
+    """
+
+    def __init__(self):
+        self.dropped = asyncio.Event()
+
+    def on(self, *args, **kwargs):
+        pass
+
+    async def start_listening(self):
+        await self.dropped.wait()
+        raise ConnectionError("Deepgram closed the socket")
+
+    async def send_close_stream(self, *args, **kwargs):
+        raise ConnectionClosedError(None, None)
+
+    async def send_keep_alive(self, *args, **kwargs):
+        pass
+
+
+def _service_on_closed_sockets(monkeypatch):
+    """A real service on a real TaskManager, whose every connection is a `_ClosedSocket`."""
+    monkeypatch.setattr("pipecat.services.deepgram.stt.exponential_backoff_time", lambda attempt: 0)
+    task_manager = TaskManager(loop=asyncio.get_running_loop())
+    service = DeepgramSTTService(api_key="fake-key-offline-test")
+    service.create_task = lambda coro, name="deepgram-test": task_manager.create_task(coro, name)
+    service.cancel_task = task_manager.cancel_task
+    connections: list[_ClosedSocket] = []
+
+    def connect(**kwargs):
+        connection = _ClosedSocket()
+        connections.append(connection)
+
+        @asynccontextmanager
+        async def cm():
+            yield connection
+
+        return cm()
+
+    service._client = SimpleNamespace(listen=SimpleNamespace(v1=SimpleNamespace(connect=connect)))
+    return service, task_manager, connections
+
+
+async def _cancel_remaining(task_manager: TaskManager):
+    remaining = [task for task in task_manager.current_tasks() if not task.done()]
+    for task in remaining:
+        task.cancel()
+    if remaining:
+        await asyncio.wait(remaining, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_close_message_still_cancels_the_connection_handler(monkeypatch):
+    """The close message is best effort: its failure must not spare the handler."""
+    service, task_manager, _ = _service_on_closed_sockets(monkeypatch)
+    try:
+        await asyncio.wait_for(service._connect(), 5)
+        handler = service._connection_task
+        assert handler is not None and not handler.done()
+
+        # What AIService.process_frame(EndFrame) calls; it logs and swallows.
+        await asyncio.wait_for(service._stop(EndFrame()), 5)
+        await asyncio.sleep(0.05)
+
+        assert handler.done(), (
+            "the connection handler is still running after stop() whose close message failed"
+        )
+        assert service._connection_task is None
+    finally:
+        await _cancel_remaining(task_manager)
+
+
+@pytest.mark.asyncio
+async def test_the_handler_cannot_outlive_cleanup(monkeypatch):
+    """A handler that survives stop() reconnects once its socket drops, and then
+    cleanup's own close fails the same way, so it would outlive the service."""
+    service, task_manager, connections = _service_on_closed_sockets(monkeypatch)
+    try:
+        await asyncio.wait_for(service._connect(), 5)
+        handler = service._connection_task
+        await asyncio.wait_for(service._stop(EndFrame()), 5)
+
+        # Deepgram finishes closing the first socket; a surviving handler
+        # reconnects on its own.
+        connections[0].dropped.set()
+        for _ in range(100):
+            if len(connections) >= 2 and service._connection is connections[-1]:
+                break
+            await asyncio.sleep(0.01)
+
+        with contextlib.suppress(ConnectionClosedError):
+            await asyncio.wait_for(service.cleanup(), 5)
+        await asyncio.sleep(0.05)
+
+        assert handler.done(), (
+            f"the connection handler outlived cleanup(); it opened "
+            f"{len(connections)} connections, the last one still open"
+        )
+    finally:
+        await _cancel_remaining(task_manager)

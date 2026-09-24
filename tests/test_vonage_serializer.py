@@ -8,8 +8,10 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import aiohttp
 import pytest
 
+from pipecat.serializers.call_strategies import CARRIER_REQUEST_TIMEOUT_SECS
 from pipecat.serializers.vonage import VonageFrameSerializer
 
 
@@ -27,7 +29,8 @@ class _FakeResponse:
 
 
 class _FakeClientSession:
-    def __init__(self):
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
         self.put_calls = []
 
     async def __aenter__(self):
@@ -41,10 +44,17 @@ class _FakeClientSession:
         return _FakeResponse()
 
 
-@pytest.mark.asyncio
-async def test_vonage_hangup_treats_204_as_success():
-    session = _FakeClientSession()
-    fake_aiohttp = SimpleNamespace(ClientSession=lambda: session)
+async def _hang_up() -> _FakeClientSession:
+    """Hang up through a stand-in aiohttp, returning the one session it built."""
+    sessions = []
+
+    def client_session(**kwargs):
+        sessions.append(_FakeClientSession(**kwargs))
+        return sessions[-1]
+
+    fake_aiohttp = SimpleNamespace(
+        ClientSession=client_session, ClientTimeout=aiohttp.ClientTimeout
+    )
     fake_jwt = SimpleNamespace(encode=lambda claims, private_key, algorithm: "token")
 
     serializer = VonageFrameSerializer(
@@ -56,6 +66,14 @@ async def test_vonage_hangup_treats_204_as_success():
     with patch.dict(sys.modules, {"aiohttp": fake_aiohttp, "jwt": fake_jwt}):
         await serializer._hang_up_call()
 
+    assert len(sessions) == 1
+    return sessions[0]
+
+
+@pytest.mark.asyncio
+async def test_vonage_hangup_treats_204_as_success():
+    session = await _hang_up()
+
     assert session.put_calls == [
         (
             "https://api.nexmo.com/v1/calls/call-123",
@@ -63,3 +81,15 @@ async def test_vonage_hangup_treats_204_as_success():
             {"action": "hangup"},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_vonage_hangup_is_bounded():
+    """The hangup runs inside the EndFrame's traversal, so a carrier that stops
+    answering would otherwise hold the call's end for aiohttp's 300 s."""
+    session = await _hang_up()
+
+    timeout = session.kwargs.get("timeout")
+    assert timeout is not None and timeout.total == CARRIER_REQUEST_TIMEOUT_SECS, (
+        f"the hangup session is built with timeout={timeout!r}"
+    )

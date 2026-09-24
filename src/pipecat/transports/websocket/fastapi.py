@@ -505,7 +505,11 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
             frame: The cancel frame signaling immediate cancellation.
         """
         await super().cancel(frame)
-        await self._write_frame(frame)
+        # A cancel that preempts a transfer's EndFrame leaves the redirect's
+        # outcome unknown, so it hangs nothing up: the serializer would take
+        # this CancelFrame as a hangup.
+        if not self._client._transfer_in_progress:
+            await self._write_frame(frame)
         await self._client.disconnect()
 
     async def cleanup(self):

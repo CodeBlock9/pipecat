@@ -25,6 +25,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.serializers.base_serializer import FrameSerializer
+from pipecat.serializers.call_strategies import CARRIER_REQUEST_TIMEOUT_SECS
 
 
 class VonageFrameSerializer(FrameSerializer):
@@ -249,7 +250,9 @@ class VonageFrameSerializer(FrameSerializer):
 
             data = {"action": "hangup"}
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=CARRIER_REQUEST_TIMEOUT_SECS)
+            ) as session:
                 async with session.put(endpoint, headers=headers, json=data) as response:
                     if response.status in (200, 204):
                         logger.info(f"Successfully terminated Vonage call {self._call_uuid}")
