@@ -126,6 +126,34 @@ class _SynthesisState:
         self.producer_done.set()
 
 
+def _wav_audio_start(head: bytes | bytearray) -> tuple[int, int | None] | None:
+    """Find where the audio starts in the head of a WAV stream.
+
+    Walks the RIFF chunks that follow the 12-byte ``RIFF``/``WAVE`` preamble (a
+    4-byte id, a little-endian size, the body padded to an even length) until
+    the ``data`` chunk's header has arrived, so a header of any length, such as
+    one with a ``LIST`` chunk before ``data``, is found whole.
+
+    Args:
+        head: The first bytes of the stream, starting with ``RIFF``.
+
+    Returns:
+        The offset of the first audio byte and the sample rate from the ``fmt ``
+        chunk (None if there was none), or None while the ``data`` chunk's
+        header has not arrived yet.
+    """
+    pos, sample_rate = 12, None
+    while pos + 8 <= len(head):
+        chunk_id = head[pos : pos + 4]
+        size = int.from_bytes(head[pos + 4 : pos + 8], "little")
+        if chunk_id == b"data":
+            return pos + 8, sample_rate
+        if chunk_id == b"fmt " and pos + 16 <= len(head):
+            sample_rate = int.from_bytes(head[pos + 12 : pos + 16], "little")
+        pos += 8 + size + (size & 1)
+    return None
+
+
 class TTSService(AIService):
     """Base class for text-to-speech services.
 
@@ -1026,9 +1054,12 @@ class TTSService(AIService):
         """Stream audio frames from an async byte iterator with optional resampling.
 
         For WAV data, use `strip_wav_header=True` to strip the header and
-        auto-detect the source sample rate. For raw PCM data, pass
-        `in_sample_rate` directly. Audio is resampled to `self.sample_rate` when
-        the source rate differs.
+        auto-detect the source sample rate. The head of the stream is held until
+        the header has been read, however the network splits it and whatever
+        chunks come before `data`; a stream that does not start with `RIFF` is
+        audio from its first byte. For raw PCM data, pass `in_sample_rate`
+        directly. Audio is resampled to `self.sample_rate` when the source rate
+        differs.
 
         Args:
             iterator: Async iterator yielding audio bytes.
@@ -1040,7 +1071,8 @@ class TTSService(AIService):
         """
         buffer = bytearray()
         source_sample_rate = in_sample_rate
-        need_to_strip_wav_header = strip_wav_header
+        # The stream's first bytes, held while it is not yet known where its audio starts.
+        head = bytearray() if strip_wav_header else None
 
         async def maybe_resample(audio: bytes) -> bytes:
             if source_sample_rate and source_sample_rate != self.sample_rate:
@@ -1048,12 +1080,21 @@ class TTSService(AIService):
             return audio
 
         async for chunk in iterator:
-            if need_to_strip_wav_header and chunk.startswith(b"RIFF"):
-                # Parse sample rate from WAV header (bytes 24-28, little-endian uint32).
-                if len(chunk) >= 44 and source_sample_rate is None:
-                    source_sample_rate = int.from_bytes(chunk[24:28], "little")
-                chunk = chunk[44:]
-                need_to_strip_wav_header = False
+            if head is not None:
+                head.extend(chunk)
+                if len(head) < 12:
+                    continue
+                if not head.startswith(b"RIFF"):
+                    # No WAV header: the stream is audio from its first byte.
+                    chunk, head = bytes(head), None
+                else:
+                    start = _wav_audio_start(head)
+                    if start is None:
+                        continue
+                    offset, header_sample_rate = start
+                    if source_sample_rate is None:
+                        source_sample_rate = header_sample_rate
+                    chunk, head = bytes(head[offset:]), None
 
             # Append to current buffer.
             buffer.extend(chunk)
@@ -1070,12 +1111,22 @@ class TTSService(AIService):
                     )
                     yield frame
 
+        if head is not None:
+            if head.startswith(b"RIFF"):
+                logger.warning(
+                    f"{self}: audio stream ended inside its WAV header "
+                    f"({len(head)} bytes, no data chunk); nothing was played"
+                )
+            else:
+                # Fewer than 12 bytes and no WAV header: they are audio.
+                buffer.extend(head)
+
         if len(buffer) > 0:
             # Make sure we don't need an extra padding byte.
             if len(buffer) % 2 == 1:
                 buffer.extend(b"\x00")
             audio = await maybe_resample(bytes(buffer))
-            yield TTSAudioRawFrame(audio, self.sample_rate, 1)
+            yield TTSAudioRawFrame(audio, self.sample_rate, 1, context_id=context_id)
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         self._processing_text = False
