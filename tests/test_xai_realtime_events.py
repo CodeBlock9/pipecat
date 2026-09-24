@@ -6,11 +6,15 @@
 
 """Tests for xAI (Grok) Realtime server event parsing and handling."""
 
+import io
 import json
+from unittest.mock import AsyncMock
 
 import pytest
+from loguru import logger
 
 from pipecat.services.xai.realtime import events
+from pipecat.services.xai.realtime.llm import GrokRealtimeLLMService
 
 
 def _event(payload: dict) -> str:
@@ -154,3 +158,61 @@ def test_session_properties_accept_extended_fields():
     assert dumped["resumption"]["enabled"] is True
     assert dumped["turn_detection"]["idle_timeout_ms"] == 5000
     assert dumped["audio"]["input"]["transcription"]["model"] == "grok-transcribe"
+
+
+class _FakeWebsocket:
+    def __init__(self, messages):
+        self._messages = list(messages)
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for message in self._messages:
+            yield message
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_event_is_logged_by_type_and_first_line_only():
+    """The receive loop skips an event it cannot parse, and never logs the raw event.
+
+    The parse error repeats the whole event after its first line, and the event
+    can carry what the caller said.
+    """
+    private_words = "my card number is 4111 1111 1111 1111"
+    unmodelled = _event(
+        {"type": "response.future_event", "event_id": "evt-9", "transcript": private_words}
+    )
+    with pytest.raises(Exception, match="Unimplemented server event type") as raised:
+        events.parse_server_event(unmodelled)
+    assert private_words in str(raised.value)
+
+    service = GrokRealtimeLLMService(api_key="test-key")
+    service._handle_evt_speech_started = AsyncMock()
+    service._websocket = _FakeWebsocket(
+        [
+            unmodelled,
+            _event(
+                {
+                    "type": "input_audio_buffer.speech_started",
+                    "event_id": "evt-10",
+                    "item_id": "item-1",
+                }
+            ),
+        ]
+    )
+    sink = io.StringIO()
+    handler_id = logger.add(sink, level="WARNING", format="{message}")
+    try:
+        await service._receive_task_handler()
+    finally:
+        logger.remove(handler_id)
+    warnings = sink.getvalue().splitlines()
+
+    service._handle_evt_speech_started.assert_awaited_once()
+    assert len(warnings) == 1
+    assert (
+        "Failed to parse server event of type response.future_event: "
+        "Unimplemented server event type"
+    ) in warnings[0]
+    assert "4111" not in warnings[0]

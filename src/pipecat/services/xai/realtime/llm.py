@@ -66,6 +66,14 @@ from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 from . import events
 
 
+def _server_event_type(message) -> str:
+    """Return the ``type`` of a raw server event, to log one that failed to parse."""
+    try:
+        return str(json.loads(message)["type"])
+    except Exception:
+        return "unknown"
+
+
 @dataclass
 class CurrentAudioResponse:
     """Tracks the current audio response from the assistant.
@@ -749,7 +757,13 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             try:
                 evt = events.parse_server_event(message)
             except Exception as e:
-                logger.warning(f"Failed to parse server event: {e}")
+                # The error repeats the raw event, which can hold a transcript or
+                # audio, so only its first line is logged, with the event's type.
+                first_line = str(e).split("\n", 1)[0].strip()
+                logger.warning(
+                    f"{self} Failed to parse server event of type "
+                    f"{_server_event_type(message)}: {first_line}"
+                )
                 continue
 
             if evt.type == "ping":
