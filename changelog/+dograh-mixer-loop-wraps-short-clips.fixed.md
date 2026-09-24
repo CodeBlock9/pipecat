@@ -1,0 +1,1 @@
+- `SoundfileMixer` wraps a looping clip around its end inside the output chunk, so the loop plays without a seam and a clip shorter than one chunk loops instead of raising `ValueError`. A clip that does not loop plays its last partial chunk padded with silence instead of dropping it, and an empty clip leaves the audio unchanged.

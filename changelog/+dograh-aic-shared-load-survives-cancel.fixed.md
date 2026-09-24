@@ -1,0 +1,1 @@
+- `AICModelManager.acquire` keeps a shared model load running when one of its waiters is cancelled. The cancellation used to cancel the load under every other waiter, and the next caller started a second load of the same model.

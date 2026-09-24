@@ -18,7 +18,9 @@ import aiohttp
 import numpy as np
 from loguru import logger
 
+from pipecat.audio.turn.base_turn_analyzer import EndOfTurnState
 from pipecat.audio.turn.smart_turn.base_smart_turn import BaseSmartTurn, SmartTurnTimeoutException
+from pipecat.metrics.metrics import MetricsData
 
 
 class HttpSmartTurnAnalyzer(BaseSmartTurn):
@@ -48,6 +50,23 @@ class HttpSmartTurnAnalyzer(BaseSmartTurn):
         self._url = url
         self._headers = headers or {}
         self._aiohttp_session = aiohttp_session
+        # The loop that owns the aiohttp session. The prediction runs on the
+        # model thread, which has no running loop, so the request is submitted
+        # back to this one.
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    async def analyze_end_of_turn(self) -> tuple[EndOfTurnState, MetricsData | None]:
+        """Analyze the current audio state to determine if turn has ended.
+
+        Records the running loop before the base hands the prediction to the
+        model thread, so the request can be sent from there.
+
+        Returns:
+            Tuple containing the end-of-turn state and optional metrics data
+            from the ML model analysis.
+        """
+        self._loop = asyncio.get_running_loop()
+        return await super().analyze_end_of_turn()
 
     def _serialize_array(self, audio_array: np.ndarray) -> bytes:
         """Serialize NumPy audio array to bytes for HTTP transmission."""
@@ -105,14 +124,21 @@ class HttpSmartTurnAnalyzer(BaseSmartTurn):
             raise Exception("Failed to send raw request to Daily Smart Turn.")
 
     def _predict_endpoint(self, audio_array: np.ndarray) -> dict[str, Any]:
-        """Predict end-of-turn using remote HTTP ML service."""
+        """Predict end-of-turn using remote HTTP ML service.
+
+        Runs on the model thread and blocks it until the request, sent on the
+        loop recorded by :meth:`analyze_end_of_turn`, completes. A timed-out
+        request propagates to the base, which completes the turn.
+        """
         try:
+            assert self._loop is not None  # recorded by analyze_end_of_turn
             serialized_array = self._serialize_array(audio_array)
-            loop = asyncio.get_running_loop()
             future = asyncio.run_coroutine_threadsafe(
-                self._send_raw_request(serialized_array), loop
+                self._send_raw_request(serialized_array), self._loop
             )
             return future.result()
+        except SmartTurnTimeoutException:
+            raise
         except Exception as e:
             logger.error(f"Smart turn prediction failed: {str(e)}")
             # Return an incomplete prediction when a failure occurs

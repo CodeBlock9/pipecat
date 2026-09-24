@@ -1,0 +1,1 @@
+- `BaseSmartTurn` holds only the last `max_duration_secs` of audio, plus at most one chunk, while speech is triggered, instead of every chunk of the turn; the prediction still receives exactly the last `max_duration_secs`.

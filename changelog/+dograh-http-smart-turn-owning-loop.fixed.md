@@ -1,0 +1,1 @@
+- `HttpSmartTurnAnalyzer` sends its prediction request on the event loop that runs `analyze_end_of_turn`. The request is made from the model thread, which has no running loop, so no request was ever sent and every turn was judged incomplete; a request that times out after `stop_secs` now completes the turn, as `BaseSmartTurn` intends.

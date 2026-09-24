@@ -946,5 +946,50 @@ class TestUserTurnController(unittest.IsolatedAsyncioTestCase):
         await strategy.cleanup()
 
 
+class TestDeferredHandlerRemoval(unittest.IsolatedAsyncioTestCase):
+    """The controller's handlers leave a deferred() strategy the way they came in.
+
+    ``deferred()`` attaches the controller's handlers to its inner strategy, so
+    the controller's symmetric removal (``_cleanup_strategies``) has to reach the
+    inner strategy too, or re-applying the same strategies accumulates handlers.
+    """
+
+    @staticmethod
+    def _count(strategy, event, handler) -> int:
+        return strategy._event_handlers[event].handlers.count(handler)
+
+    async def asyncSetUp(self):
+        self.inner = SpeechTimeoutUserTurnStopStrategy()
+        self.wrapped = deferred(self.inner)
+        self.controller = UserTurnController(
+            user_turn_strategies=UserTurnStrategies(stop=[self.wrapped])
+        )
+        await self.controller.setup(frame_processor_setup(TaskManager()))
+
+    async def test_setup_registers_on_the_inner_strategy(self):
+        self.assertEqual(
+            self._count(self.inner, "on_push_frame", self.controller._on_push_frame), 1
+        )
+        await self.controller.cleanup()
+
+    async def test_reapplying_the_same_strategies_keeps_one_registration(self):
+        await self.controller.update_strategies(UserTurnStrategies(stop=[self.wrapped]))
+
+        for event, handler in (
+            ("on_push_frame", self.controller._on_push_frame),
+            ("on_broadcast_frame", self.controller._on_broadcast_frame),
+            ("on_user_turn_inference_triggered", self.controller._on_user_turn_inference_triggered),
+        ):
+            self.assertEqual(self._count(self.inner, event, handler), 1, event)
+        await self.controller.cleanup()
+
+    async def test_cleanup_leaves_no_controller_handler_on_the_inner_strategy(self):
+        await self.controller.cleanup()
+
+        self.assertEqual(
+            self._count(self.inner, "on_push_frame", self.controller._on_push_frame), 0
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

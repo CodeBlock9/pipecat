@@ -14,6 +14,8 @@ appended audio frame. These tests verify:
      converted each chunk in append_audio.
   2. The pre-speech trim loop still bounds buffer size when no speech ever
      triggers.
+  3. During speech the buffer holds only what a prediction reads, the last
+     max_duration_secs, and the model still gets exactly that.
 """
 
 import time
@@ -24,11 +26,15 @@ import pytest
 
 ort = pytest.importorskip("onnxruntime")  # noqa: F841 -- needed by BaseSmartTurn subclasses
 
+import pipecat.audio.turn.smart_turn.base_smart_turn as base_smart_turn_module  # noqa: E402
 from pipecat.audio.turn.base_turn_analyzer import EndOfTurnState  # noqa: E402
 from pipecat.audio.turn.smart_turn.base_smart_turn import (  # noqa: E402
     BaseSmartTurn,
     SmartTurnParams,
 )
+
+CHUNK = 320  # 20 ms at 16 kHz
+RATE = 16_000
 
 
 class _RecordingSmartTurn(BaseSmartTurn):
@@ -43,9 +49,41 @@ class _RecordingSmartTurn(BaseSmartTurn):
         return {"prediction": 1, "probability": 0.99}
 
 
+class _ScriptedClock:
+    """Stands in for ``time`` in base_smart_turn's namespace: it moves only when told."""
+
+    def __init__(self, now: float = 5000.0):
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def perf_counter(self) -> float:
+        return self.now
+
+
 def _pcm_bytes(values: np.ndarray) -> bytes:
     """Pack a numpy int16 array into PCM bytes, the wire format append_audio expects."""
     return values.astype(np.int16).tobytes()
+
+
+def _numbered_chunk(i: int) -> bytes:
+    """One 20 ms chunk whose samples all carry the chunk's number."""
+    return np.full(CHUNK, i % 30_000, dtype=np.int16).tobytes()
+
+
+def _last_eight_seconds(total: int) -> np.ndarray:
+    """The float32 segment of the last max_duration_secs of ``total`` numbered chunks."""
+    window_chunks = int(SmartTurnParams().max_duration_secs * RATE) // CHUNK  # 400
+    return (
+        np.concatenate(
+            [
+                np.full(CHUNK, i % 30_000, dtype=np.int16)
+                for i in range(total - window_chunks, total)
+            ]
+        ).astype(np.float32)
+        / 32768.0
+    )
 
 
 def test_segment_matches_eager_conversion_bit_identical():
@@ -96,60 +134,93 @@ def test_segment_audio_is_normalized_float32():
     """When a turn completes, _process_speech_segment must emit float32 in [-1, 1]."""
     analyzer = _RecordingSmartTurn(sample_rate=16_000, params=SmartTurnParams())
     analyzer.set_sample_rate(16_000)
+    analyzer._speech_triggered = True
+    analyzer._speech_start_time = time.monotonic()
 
-    # Feed a speech-then-silence sequence: a few speech frames, then enough
-    # silence to cross stop_secs (default 3 s) so the turn closes.
     chunk_size = 320  # 20 ms @ 16 kHz
     speech = np.array([16_000] * chunk_size, dtype=np.int16)  # constant 0.488...
-    silence = np.zeros(chunk_size, dtype=np.int16)
-
-    # Two speech chunks (40 ms) to trigger.
-    for _ in range(2):
+    for _ in range(4):
         analyzer.append_audio(_pcm_bytes(speech), is_speech=True)
-    # Then ~3.1 s of silence to exceed stop_secs.
-    state = EndOfTurnState.INCOMPLETE
-    for _ in range(160):  # 160 * 20 ms = 3.2 s
-        state = analyzer.append_audio(_pcm_bytes(silence), is_speech=False)
-        if state == EndOfTurnState.COMPLETE:
-            break
 
     # Run the segment processor synchronously (it normally runs on the executor).
-    # We rebuild the audio buffer first by re-feeding, because _clear() emptied
-    # it when stop_secs fired. Easier path: drive a fresh sequence and call
-    # _process_speech_segment directly.
-    analyzer2 = _RecordingSmartTurn(sample_rate=16_000, params=SmartTurnParams())
-    analyzer2.set_sample_rate(16_000)
-    analyzer2._speech_triggered = True
-    analyzer2._speech_start_time = time.monotonic()
-    for _ in range(4):
-        analyzer2.append_audio(_pcm_bytes(speech), is_speech=True)
-
-    state, _metrics = analyzer2._process_speech_segment(analyzer2._audio_buffer)
-    assert analyzer2.captured_segment is not None
-    assert analyzer2.captured_segment.dtype == np.float32
-    assert float(np.max(np.abs(analyzer2.captured_segment))) <= 1.0
+    analyzer._process_speech_segment(analyzer._audio_buffer)
+    assert analyzer.captured_segment is not None
+    assert analyzer.captured_segment.dtype == np.float32
+    assert float(np.max(np.abs(analyzer.captured_segment))) <= 1.0
     # The constant 16000 / 32768 ≈ 0.48828125 should appear throughout.
-    assert np.allclose(analyzer2.captured_segment, 16_000 / 32768.0)
+    assert np.allclose(analyzer.captured_segment, 16_000 / 32768.0)
 
 
-def test_pre_speech_buffer_trim_still_bounds_growth():
+def test_pre_speech_buffer_trim_still_bounds_growth(monkeypatch):
     """Without speech, the buffer must stay bounded by pre_speech_ms + stop_secs + max_duration_secs."""
+    clock = _ScriptedClock()
+    monkeypatch.setattr(base_smart_turn_module, "time", clock)
     params = SmartTurnParams(pre_speech_ms=100, stop_secs=0.2, max_duration_secs=0.5)
     analyzer = _RecordingSmartTurn(sample_rate=16_000, params=params)
     analyzer.set_sample_rate(16_000)
 
     chunk = np.array([0] * 320, dtype=np.int16)
-    # Feed 200 chunks of non-speech (4 seconds wall time would be too slow; just
-    # rely on the fact that all timestamps are taken via time.monotonic() inside
-    # append_audio, and any chunk older than 0.8 s gets popped on each call).
+    # 50 chunks of non-speech, the clock moving 20 ms per chunk: one second.
     for _ in range(50):
         analyzer.append_audio(_pcm_bytes(chunk), is_speech=False)
-        time.sleep(0.02)  # advance monotonic clock past the trim window cumulatively
+        clock.now += 0.02
 
-    # max_buffer_time is 0.1 + 0.2 + 0.5 = 0.8 s; at 50 Hz that caps the buffer
-    # well below 50 entries. We're conservative — anything < 50 proves the
-    # trim ran.
-    assert len(analyzer._audio_buffer) < 50
+    # max_buffer_time is 0.1 + 0.2 + 0.5 = 0.8 s: at 20 ms a chunk the trim
+    # keeps 40 chunks, or 41 when a timestamp lands exactly on the window's
+    # edge. One chunk more means the trim kept audio it should have dropped.
+    assert len(analyzer._audio_buffer) <= 41
+
+
+def test_continuous_speech_retains_at_most_the_prediction_window():
+    """300 s of unbroken speech holds the last max_duration_secs, not all of it."""
+    analyzer = _RecordingSmartTurn(sample_rate=RATE, params=SmartTurnParams())
+    analyzer.set_sample_rate(RATE)
+    for i in range(15_000):
+        analyzer.append_audio(_numbered_chunk(i), is_speech=True)
+
+    retained = sum(len(chunk) for _, chunk in analyzer._audio_buffer)
+    window = int(SmartTurnParams().max_duration_secs * RATE)
+    assert retained <= window + CHUNK, (
+        f"{len(analyzer._audio_buffer)} chunks / {retained} samples retained "
+        f"for a {window}-sample prediction window"
+    )
+
+
+def test_long_speech_model_sees_the_last_eight_seconds():
+    analyzer = _RecordingSmartTurn(sample_rate=RATE, params=SmartTurnParams())
+    analyzer.set_sample_rate(RATE)
+    for i in range(15_000):
+        analyzer.append_audio(_numbered_chunk(i), is_speech=True)
+
+    analyzer._process_speech_segment(analyzer._audio_buffer)
+
+    assert analyzer.captured_segment is not None
+    assert np.array_equal(analyzer.captured_segment, _last_eight_seconds(15_000))
+
+
+def test_pre_speech_then_long_speech_model_sees_last_eight_seconds(monkeypatch):
+    """20 s of non-speech, trimmed by time, then 20 s of speech: still the last 8 s.
+
+    The pre-speech trim pops chunks as well as the speech bound, and both must
+    keep the sample count: a count that missed the pre-speech pops would drop
+    speech it still needs.
+    """
+    clock = _ScriptedClock()
+    monkeypatch.setattr(base_smart_turn_module, "time", clock)
+    analyzer = _RecordingSmartTurn(sample_rate=RATE, params=SmartTurnParams())
+    analyzer.set_sample_rate(RATE)
+    for i in range(2_000):
+        analyzer.append_audio(_numbered_chunk(i), is_speech=i >= 1_000)
+        clock.now += 0.02
+
+    analyzer._process_speech_segment(analyzer._audio_buffer)
+
+    assert analyzer.captured_segment is not None
+    assert len(analyzer.captured_segment) == int(SmartTurnParams().max_duration_secs * RATE), (
+        f"segment {len(analyzer.captured_segment)} samples, "
+        f"buffer {sum(len(c) for _, c in analyzer._audio_buffer)}"
+    )
+    assert np.array_equal(analyzer.captured_segment, _last_eight_seconds(2_000))
 
 
 def test_clear_prevents_stale_stop_secs_completion():

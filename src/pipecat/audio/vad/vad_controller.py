@@ -90,8 +90,9 @@ class VADController(BaseObject):
 
         self._task_manager: BaseTaskManager | None = None
 
-        # Last time a on_speech_activity was triggered.
-        self._speech_activity_time = 0
+        # Last time (monotonic) a on_speech_activity was triggered; the first
+        # speaking chunk always triggers one.
+        self._speech_activity_time = float("-inf")
         # How often a on_speech_activity event should be triggered (value should
         # be greater than the audio chunks to have any effect).
         self._speech_activity_period = speech_activity_period
@@ -181,22 +182,25 @@ class VADController(BaseObject):
         self._vad_state = await self._handle_vad(frame.audio, self._vad_state)
 
         if self._vad_state == VADState.SPEAKING:
-            await self._call_event_handler("on_speech_activity")
+            await self._maybe_speech_activity()
 
     async def _handle_vad(self, audio: bytes, vad_state: VADState) -> VADState:
-        """Handle Voice Activity Detection results and trigger appropriate events."""
+        """Handle Voice Activity Detection results and trigger appropriate events.
+
+        The analyzer returns at a speech start or stop and keeps the audio after
+        it, so after each one it is asked again, with no new audio, until a call
+        reports no change: every start and stop the audio completes is reported
+        before the next audio arrives.
+        """
         new_vad_state = await self._vad_analyzer.analyze_audio(audio)
-        if (
-            new_vad_state != vad_state
-            and new_vad_state != VADState.STARTING
-            and new_vad_state != VADState.STOPPING
-        ):
+        while new_vad_state not in (vad_state, VADState.STARTING, VADState.STOPPING):
             if new_vad_state == VADState.SPEAKING:
                 await self._call_event_handler("on_speech_started")
             elif new_vad_state == VADState.QUIET:
                 await self._call_event_handler("on_speech_stopped")
 
             vad_state = new_vad_state
+            new_vad_state = await self._vad_analyzer.analyze_audio(b"")
         return vad_state
 
     async def _audio_idle_handler(self):
@@ -223,10 +227,10 @@ class VADController(BaseObject):
             await asyncio.sleep(self._audio_idle_timeout)
 
     async def _maybe_speech_activity(self):
-        """Handle user speaking frame."""
-        diff_time = time.time() - self._speech_activity_time
-        if diff_time >= self._speech_activity_period:
-            self._speech_activity_time = time.time()
+        """Trigger `on_speech_activity` at most once per `speech_activity_period`."""
+        now = time.monotonic()
+        if now - self._speech_activity_time >= self._speech_activity_period:
+            self._speech_activity_time = now
             await self._call_event_handler("on_speech_activity")
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
