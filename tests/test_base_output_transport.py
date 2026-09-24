@@ -25,6 +25,7 @@ from pipecat.frames.frames import (
     InterruptionFrame,
     MixerControlFrame,
     OutputAudioRawFrame,
+    SpeechOutputAudioRawFrame,
     StartFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
@@ -560,6 +561,61 @@ class TestBaseOutputTransportAudioBuffering(unittest.IsolatedAsyncioTestCase):
                 second_head,
                 "response 2 lost its first quarter chunk: the chunk starts with "
                 f"{written[5][:8]!r} and ends with {written[5][-8:]!r}",
+            )
+        finally:
+            await transport.cancel(CancelFrame())
+
+    async def test_the_next_utterances_partial_chunk_survives_a_speech_silence_stop(self):
+        """The silence that ends a speech stream must not clear the next utterance's audio.
+
+        A speech stream has no TTSStoppedFrame: the bot stops speaking once its
+        played audio has been silent for ``BOT_VAD_STOP_SECS``. Playback runs
+        behind the producer, so by then the buffer can hold the next
+        utterance's first partial chunk. Each write takes 20 ms.
+        """
+        transport = await _make_transport(mixer=None, audio_out_end_silence_secs=0)
+        try:
+
+            async def slow_write(frame):
+                await asyncio.sleep(0.02)
+                return True
+
+            async def send(audio):
+                await transport.process_frame(
+                    SpeechOutputAudioRawFrame(audio=audio, sample_rate=rate, num_channels=1),
+                    FrameDirection.DOWNSTREAM,
+                )
+
+            async def until_written(count):
+                for _ in range(300):
+                    if transport.write_audio_frame.await_count >= count:
+                        return
+                    await asyncio.sleep(0.01)
+
+            transport.write_audio_frame = AsyncMock(side_effect=slow_write)
+            sender = transport._media_senders[None]
+            chunk = sender.audio_chunk_size
+            rate = sender.sample_rate
+
+            speech = b"\x00\x40" * (chunk // 2) * 2  # two whole chunks of speech
+            silence = b"\x00\x00" * (chunk // 2) * 25  # 25 silent chunks: 0.5 s of playback
+            next_head = b"\x00\x41" * (chunk // 8)  # the next utterance: a quarter chunk
+            next_rest = b"\x00\x42" * (3 * chunk // 8)  # three quarters: completes one chunk
+
+            await send(speech)
+            await send(silence)
+            await send(next_head)
+            await until_written(27)  # the silence plays out and stops the bot speaking
+            self.assertFalse(sender._bot_speaking, "the speech-silence stop never fired")
+            await send(next_rest)
+            await until_written(28)
+
+            written = [call.args[0].audio for call in transport.write_audio_frame.call_args_list]
+            self.assertEqual(len(written), 28, f"{len(written)} chunks written")
+            self.assertEqual(
+                written[27][: len(next_head)],
+                next_head,
+                f"the next utterance lost its first quarter chunk: it starts {written[27][:8]!r}",
             )
         finally:
             await transport.cancel(CancelFrame())
