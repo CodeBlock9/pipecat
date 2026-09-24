@@ -49,6 +49,7 @@ def _calculate_vad_audio_volume(audio: bytes) -> float:
     level = 10.0 * math.log10(mean_square) - _LOUDNESS_OFFSET_DB
     return normalize_value(level, -20, 80)
 
+
 VAD_CONFIDENCE = 0.7
 VAD_START_SECS = 0.2
 VAD_STOP_SECS = 0.2
@@ -203,12 +204,16 @@ class VADAnalyzer(ABC):
 
         Processes incoming audio data, maintains internal state, and determines
         voice activity status based on confidence and volume thresholds.
+        Analysis stops at the first speech start or stop, so that each one is
+        returned; the audio after it stays buffered for the next call, which
+        may pass no new audio (``b""``) to analyze it.
 
         Args:
             buffer: Audio buffer to analyze.
 
         Returns:
-            Current VAD state after processing the buffer.
+            Current VAD state after processing the buffer, up to the first
+            start or stop.
         """
         # Buffer on the event loop and cross into the inference pool only when
         # at least one complete model window is available.
@@ -224,7 +229,12 @@ class VADAnalyzer(ABC):
         return await loop.run_in_executor(self._executor, self._run_analyzer, audio)
 
     def _run_analyzer(self, audio: bytes) -> VADState:
-        """Analyze one or more complete VAD windows."""
+        """Analyze one or more complete VAD windows, up to the first start or stop.
+
+        The caller sees only the state returned, so a start or stop is returned
+        before a later window can move past it; the windows after it go back to
+        the front of the buffer, for the next call.
+        """
         num_required_bytes = self._vad_frames_num_bytes
         for start in range(0, len(audio), num_required_bytes):
             audio_frames = audio[start : start + num_required_bytes]
@@ -257,19 +267,23 @@ class VADAnalyzer(ABC):
                     case VADState.STOPPING:
                         self._vad_stopping_count += 1
 
-        if (
-            self._vad_state == VADState.STARTING
-            and self._vad_starting_count >= self._vad_start_frames
-        ):
-            self._vad_state = VADState.SPEAKING
-            self._vad_starting_count = 0
+            if (
+                self._vad_state == VADState.STARTING
+                and self._vad_starting_count >= self._vad_start_frames
+            ):
+                self._vad_state = VADState.SPEAKING
+                self._vad_starting_count = 0
+            elif (
+                self._vad_state == VADState.STOPPING
+                and self._vad_stopping_count >= self._vad_stop_frames
+            ):
+                self._vad_state = VADState.QUIET
+                self._vad_stopping_count = 0
+            else:
+                continue
 
-        if (
-            self._vad_state == VADState.STOPPING
-            and self._vad_stopping_count >= self._vad_stop_frames
-        ):
-            self._vad_state = VADState.QUIET
-            self._vad_stopping_count = 0
+            self._vad_buffer = audio[start + num_required_bytes :] + self._vad_buffer
+            return self._vad_state
 
         return self._vad_state
 

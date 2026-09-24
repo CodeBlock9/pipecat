@@ -22,12 +22,13 @@ from pipecat.tests.utils import run_test
 
 
 class MockVADAnalyzer(VADAnalyzer):
-    """A mock VAD analyzer that returns states from a predefined sequence."""
+    """A mock VAD analyzer that returns states from a predefined sequence, one per chunk."""
 
     def __init__(self, states: list[VADState]):
         super().__init__(sample_rate=16000)
         self._states = list(states)
         self._call_index = 0
+        self._state = VADState.QUIET
 
     def num_frames_required(self) -> int:
         return 512
@@ -36,11 +37,17 @@ class MockVADAnalyzer(VADAnalyzer):
         return 0.9
 
     async def analyze_audio(self, buffer: bytes) -> VADState:
+        # The controller asks again with no audio after each start or stop. As
+        # in the real analyzer with nothing buffered, that leaves the state as
+        # it is.
+        if not buffer:
+            return self._state
         if self._call_index < len(self._states):
-            state = self._states[self._call_index]
+            self._state = self._states[self._call_index]
             self._call_index += 1
-            return state
-        return VADState.QUIET
+        else:
+            self._state = VADState.QUIET
+        return self._state
 
 
 class TestVADProcessor(unittest.IsolatedAsyncioTestCase):

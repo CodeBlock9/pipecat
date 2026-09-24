@@ -10,12 +10,18 @@ One analyzer is built per call, so whatever it holds multiplies by concurrency
 and whatever work it does per chunk multiplies by 50 a second per call. Two
 things follow: inference runs on a pool shared by the whole process, and audio
 is accumulated into whole windows on the event loop before any of it is sent
-there.
+there. Sending several windows at once must not hide a speech start or stop
+from the controller, whatever the packet size.
 """
 
+import random
 import unittest
 
 from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADParams, VADState
+from pipecat.audio.vad.vad_controller import VADController
+from pipecat.frames.frames import InputAudioRawFrame
+from pipecat.utils.asyncio.task_manager import TaskManager
+from tests.frame_processor_helpers import frame_processor_setup
 
 
 class StubVADAnalyzer(VADAnalyzer):
@@ -122,6 +128,103 @@ class TestAnalysisStillWorks(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state, VADState.QUIET)
         finally:
             await analyzer.cleanup()
+
+
+WINDOW = 512 * 2  # bytes in one 32 ms model window at 16 kHz
+VOICED = b"\x01" + b"\x00" * (WINDOW - 1)
+QUIET = b"\x00" * WINDOW
+
+
+class ScriptedVADAnalyzer(VADAnalyzer):
+    """The real analyzer with a scripted model: a window is speech when its first byte is not 0.
+
+    start_secs and stop_secs are 0.2 s, six 32 ms windows each; min_volume 0
+    lets the script alone decide speech.
+    """
+
+    def __init__(self):
+        super().__init__(sample_rate=16000, params=VADParams(stop_secs=0.2, min_volume=0.0))
+
+    def num_frames_required(self) -> int:
+        return 512
+
+    def voice_confidence(self, buffer: bytes) -> float:
+        return 1.0 if buffer[0] else 0.0
+
+
+def _seeded_stream(seed: int = 7, windows: int = 3000) -> bytes:
+    """Alternating quiet and voiced runs of 1 to 20 windows each, from a fixed seed."""
+    rng = random.Random(seed)
+    runs: list[bytes] = []
+    voiced = False
+    while len(runs) < windows:
+        runs.extend([VOICED if voiced else QUIET] * rng.randint(1, 20))
+        voiced = not voiced
+    return b"".join(runs[:windows])
+
+
+def _packets(stream: bytes, size: int) -> list[bytes]:
+    return [stream[pos : pos + size] for pos in range(0, len(stream), size)]
+
+
+async def _edges(packets: list[bytes]) -> list[tuple[str, int]]:
+    """Each speech start and stop a real VADController reports, with the packet it came in."""
+    controller = VADController(ScriptedVADAnalyzer(), audio_idle_timeout=0)
+    edges: list[tuple[str, int]] = []
+    index = 0
+
+    @controller.event_handler("on_speech_started")
+    async def on_speech_started(_controller):
+        edges.append(("started", index))
+
+    @controller.event_handler("on_speech_stopped")
+    async def on_speech_stopped(_controller):
+        edges.append(("stopped", index))
+
+    await controller.setup(frame_processor_setup(TaskManager()))
+    try:
+        for index, packet in enumerate(packets):
+            await controller.process_frame(
+                InputAudioRawFrame(audio=packet, sample_rate=16000, num_channels=1)
+            )
+    finally:
+        await controller.cleanup()
+    return edges
+
+
+class TestEveryEdgeReachesTheController(unittest.IsolatedAsyncioTestCase):
+    """A packet that completes several windows still reports each start and stop."""
+
+    async def test_speech_start_one_window_per_packet(self):
+        edges = await _edges([VOICED] * 7 + [QUIET])
+        self.assertEqual([kind for kind, _ in edges], ["started"])
+
+    async def test_speech_start_in_one_packet_with_a_trailing_quiet_window(self):
+        edges = await _edges([VOICED * 7 + QUIET])
+        self.assertEqual(
+            [kind for kind, _ in edges], ["started"], "seven voiced windows then one quiet"
+        )
+
+    async def test_speech_stop_in_one_packet_with_a_trailing_voiced_window(self):
+        edges = await _edges([VOICED] * 7 + [QUIET * 6 + VOICED])
+        self.assertEqual(
+            [kind for kind, _ in edges], ["started", "stopped"], "six quiet windows then one voiced"
+        )
+
+    async def test_packet_size_does_not_change_the_edges(self):
+        """Any packet size reports the edges of one window per packet, each in the packet completing it.
+
+        A seeded stream of 3,000 windows, in 20 ms (640 B), 100 ms (3,200 B)
+        and 0.5 s (16,000 B) packets, reports the starts and stops the same
+        stream reports one window per packet, each in the packet that holds the
+        last byte of the window that completes it.
+        """
+        stream = _seeded_stream()
+        reference = await _edges(_packets(stream, WINDOW))
+        self.assertGreater(len(reference), 100)
+        for size in (640, 3200, 16000):
+            expected = [(kind, ((window + 1) * WINDOW - 1) // size) for kind, window in reference]
+            self.assertEqual(await _edges(_packets(stream, size)), expected, f"{size} B packets")
 
 
 if __name__ == "__main__":
