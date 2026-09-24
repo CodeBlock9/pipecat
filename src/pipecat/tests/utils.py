@@ -19,9 +19,14 @@ from pipecat.frames.frames import (
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.pipeline.worker import CANCEL_TIMEOUT_SECS, PipelineParams, PipelineWorker
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.workers.runner import WorkerRunner
+
+# How long run_test waits for its pipeline to stop once either side has failed:
+# the worker bounds its cancellation by CANCEL_TIMEOUT_SECS, and the rest covers
+# the cleanup after it.
+_STOP_TIMEOUT_SECS = CANCEL_TIMEOUT_SECS + 5.0
 
 
 @dataclass
@@ -161,7 +166,10 @@ async def run_test(
 
     Raises:
         AssertionError: If the received frames don't match the expected frame types.
-        TimeoutError: If the pipeline doesn't start within ``start_timeout``.
+        TimeoutError: If the pipeline doesn't start within ``start_timeout``, or
+            ends before it starts.
+        RuntimeError: If, after either side has failed, the pipeline doesn't stop
+            within the worker's cancel timeout and a margin for its cleanup.
     """
     observers = observers or []
     pipeline_params = pipeline_params or PipelineParams()
@@ -210,7 +218,27 @@ async def run_test(
 
     runner = WorkerRunner()
     await runner.add_workers(worker)
-    await asyncio.gather(runner.run(), push_frames())
+
+    # Neither side may outlive the other. gather() would leave the runner, and
+    # the worker under it, running after the pusher had failed.
+    running = asyncio.create_task(runner.run())
+    pushing = asyncio.create_task(push_frames())
+    try:
+        await asyncio.wait((running, pushing), return_when=asyncio.FIRST_COMPLETED)
+        if pushing.done():
+            pushing.result()
+            await running
+        else:
+            running.result()
+            if not pipeline_started.is_set():
+                raise TimeoutError("the pipeline ended before it started")
+    finally:
+        pushing.cancel()
+        if not running.done():
+            await runner.cancel(reason="run_test is stopping")
+        _, still_running = await asyncio.wait((running, pushing), timeout=_STOP_TIMEOUT_SECS)
+        if still_running:
+            raise RuntimeError(f"the test pipeline did not stop within {_STOP_TIMEOUT_SECS}s")
 
     #
     # Down frames
