@@ -1425,11 +1425,13 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
         input_format = input_audio.format if input_audio else None
         configured_format = input_format.type if input_format else "audio/pcm"
         payload_audio = frame.audio
+        wire_rate = frame.sample_rate
 
         if configured_format == "audio/pcm" and frame.sample_rate != OPENAI_SAMPLE_RATE:
             payload_audio = await self._input_resampler.resample(
                 frame.audio, frame.sample_rate, OPENAI_SAMPLE_RATE
             )
+            wire_rate = OPENAI_SAMPLE_RATE
 
         if len(payload_audio) == 0:
             return
@@ -1440,12 +1442,11 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
         # In manual turn-detection mode, keep a rolling pre-roll buffer of the
         # most recent audio so _handle_interruption can replay the speech onset
         # after clearing the input buffer. (Server-side turn detection never
-        # clears it, so no buffer is needed.)
+        # clears it, so no buffer is needed.) The replay goes back on the same
+        # wire, so the buffer holds the bytes sent, measured at the wire rate.
         if self._is_turn_detection_disabled():
-            self._user_audio_preroll_buffer.extend(frame.audio)
-            preroll_len = int(
-                frame.sample_rate * frame.num_channels * 2 * self._user_audio_preroll_secs
-            )
+            self._user_audio_preroll_buffer.extend(payload_audio)
+            preroll_len = int(wire_rate * frame.num_channels * 2 * self._user_audio_preroll_secs)
             self._user_audio_preroll_buffer = self._user_audio_preroll_buffer[-preroll_len:]
 
     async def _replay_user_audio_preroll(self):

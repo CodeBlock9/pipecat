@@ -161,22 +161,43 @@ async def test_manual_mode_interruption_with_empty_buffer_skips_replay():
     assert recorder.kinds() == ["InputAudioBufferClearEvent", "ResponseCancelEvent"]
 
 
+def _resample_to_a_distinct_pattern(service) -> None:
+    """Stand in for the resampler: the 24 kHz length, in bytes unlike the input.
+
+    The pre-roll holds what went on the wire, so each window test compares the
+    buffer with the tail of the resampled payload, byte for byte.
+    """
+
+    async def resample(audio, in_rate, out_rate):
+        return bytes(i % 251 for i in range(len(audio) * out_rate // in_rate))
+
+    service._input_resampler.resample = resample  # type: ignore[method-assign]
+
+
+def _wire_audio(recorder: _EventRecorder) -> bytes:
+    return b"".join(base64.b64decode(payload) for payload in recorder.append_payloads())
+
+
 @pytest.mark.asyncio
 async def test_manual_mode_preroll_capped_to_default_window():
     """Before VAD params are known, the pre-roll keeps DEFAULT_USER_AUDIO_PREROLL_SECS."""
-    service, _ = _make_service(manual_turn_detection=True)
+    service, recorder = _make_service(manual_turn_detection=True)
+    _resample_to_a_distinct_pattern(service)
 
-    # 1s at 16kHz mono / 16-bit = 32000 bytes; buffer should keep the most
-    # recent 0.5s = 16000 bytes.
+    # 1s at 16kHz goes on the wire as 1s at 24kHz mono / 16-bit = 48000 bytes;
+    # the buffer keeps the most recent 0.5s of it = 24000 bytes.
     await service._send_user_audio(_audio_frame(sample_rate=16000, data=bytes(32000)))
 
-    assert len(service._user_audio_preroll_buffer) == 16000
+    expected = int(OPENAI_SAMPLE_RATE * 1 * 2 * 0.5)
+    assert bytes(service._user_audio_preroll_buffer) == _wire_audio(recorder)[-expected:]
+    assert len(service._user_audio_preroll_buffer) == 24000
 
 
 @pytest.mark.asyncio
 async def test_manual_mode_preroll_sized_from_vad_start_secs():
     """A SpeechControlParamsFrame sizes the pre-roll to start_secs + margin."""
-    service, _ = _make_service(manual_turn_detection=True)
+    service, recorder = _make_service(manual_turn_detection=True)
+    _resample_to_a_distinct_pattern(service)
 
     start_secs = 0.5
     service._handle_speech_control_params(
@@ -186,23 +207,28 @@ async def test_manual_mode_preroll_sized_from_vad_start_secs():
     # capped to (start_secs + margin), not limited by how much we sent.
     await service._send_user_audio(_audio_frame(sample_rate=16000, data=bytes(64000)))
 
-    # 16kHz mono / 16-bit = 2 bytes/sample.
-    expected = int(16000 * 1 * 2 * (start_secs + AUTOSIZED_USER_AUDIO_PREROLL_MARGIN_SECS))
+    # The window is measured at the wire rate: 24kHz mono / 16-bit.
+    expected = int(
+        OPENAI_SAMPLE_RATE * 1 * 2 * (start_secs + AUTOSIZED_USER_AUDIO_PREROLL_MARGIN_SECS)
+    )
+    assert bytes(service._user_audio_preroll_buffer) == _wire_audio(recorder)[-expected:]
     assert len(service._user_audio_preroll_buffer) == expected
 
 
 @pytest.mark.asyncio
 async def test_manual_mode_preroll_override_pins_value_and_ignores_vad_params():
     """An explicit user_audio_preroll_secs pins the pre-roll; VAD params don't resize it."""
-    service, _ = _make_service(manual_turn_detection=True, preroll_secs=0.1)
+    service, recorder = _make_service(manual_turn_detection=True, preroll_secs=0.1)
+    _resample_to_a_distinct_pattern(service)
 
     service._handle_speech_control_params(
         SpeechControlParamsFrame(vad_params=VADParams(start_secs=0.5))
     )
-    # 0.1s at 16kHz mono / 16-bit = 3200 bytes.
+    # 0.1s at 24kHz mono / 16-bit = 4800 bytes of the wire audio.
     await service._send_user_audio(_audio_frame(sample_rate=16000, data=bytes(32000)))
 
-    assert len(service._user_audio_preroll_buffer) == 3200
+    assert bytes(service._user_audio_preroll_buffer) == _wire_audio(recorder)[-4800:]
+    assert len(service._user_audio_preroll_buffer) == 4800
 
 
 # ---------------------------------------------------------------------------
