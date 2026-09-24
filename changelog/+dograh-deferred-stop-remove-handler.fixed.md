@@ -1,0 +1,1 @@
+- A `deferred()` stop strategy forwards `remove_event_handler` to its inner strategy, as it does `add_event_handler`. `UserTurnController` removals used to leave its handlers on the inner strategy, and re-applying the same strategies registered a second set, so each event reached the controller twice.

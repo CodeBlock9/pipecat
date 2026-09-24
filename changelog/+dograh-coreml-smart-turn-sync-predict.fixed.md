@@ -1,0 +1,1 @@
+- `LocalCoreMLSmartTurnAnalyzer._predict_endpoint` is a plain method, as `BaseSmartTurn` calls it. As a coroutine it made every analysis raise `TypeError` on the model thread.
