@@ -6,7 +6,9 @@
 
 import asyncio
 import unittest
+from unittest.mock import patch
 
+import pipecat.audio.vad.vad_controller as vad_controller_module
 from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADParams, VADState
 from pipecat.audio.vad.vad_controller import VADController
 from pipecat.frames.frames import Frame, InputAudioRawFrame, SpeechControlParamsFrame
@@ -40,6 +42,16 @@ class MockVADAnalyzer(VADAnalyzer):
     async def analyze_audio(self, buffer: bytes) -> VADState:
         """Return the configured state."""
         return self._next_state
+
+
+class ScriptedClock:
+    """Stands in for the controller module's ``time``: ``monotonic`` returns ``now``."""
+
+    def __init__(self, now: float):
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
 
 
 class TestVADController(unittest.IsolatedAsyncioTestCase):
@@ -100,28 +112,45 @@ class TestVADController(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(speech_stopped)
         await controller.cleanup()
 
-    async def test_speech_activity_event(self):
-        """Test that on_speech_activity event is triggered while speaking."""
+    async def _speaking_controller(self, clock: ScriptedClock):
+        """A controller whose analyzer always says SPEAKING, recording activity times."""
         analyzer = MockVADAnalyzer()
-        controller = VADController(analyzer)
-
-        activity_count = 0
+        analyzer.set_next_state(VADState.SPEAKING)
+        controller = VADController(analyzer, speech_activity_period=0.2)
+        events: list[float] = []
 
         @controller.event_handler("on_speech_activity")
         async def on_speech_activity(_controller):
-            nonlocal activity_count
-            activity_count += 1
+            events.append(clock.now)
 
         await controller.setup(frame_processor_setup(self.task_manager))
+        return controller, events
 
-        audio_frame = InputAudioRawFrame(audio=b"\x00" * 1024, sample_rate=16000, num_channels=1)
+    async def test_speech_activity_once_per_period(self):
+        """speech_activity_period is 0.2 s: 20 ms chunks must not each report activity."""
+        audio_frame = InputAudioRawFrame(audio=b"\x00" * 640, sample_rate=16000, num_channels=1)
+        clock = ScriptedClock(1000.0)
+        with patch.object(vad_controller_module, "time", clock):
+            controller, events = await self._speaking_controller(clock)
+            await controller.process_frame(audio_frame)
+            clock.now += 0.02
+            await controller.process_frame(audio_frame)
+            clock.now += 0.02
+            await controller.process_frame(audio_frame)
+            self.assertEqual(len(events), 1, f"activity events inside one period: {events}")
+            clock.now = 1000.0 + 0.25
+            await controller.process_frame(audio_frame)
+            self.assertEqual(len(events), 2, f"activity events after the period: {events}")
+            await controller.cleanup()
 
-        # Activity events fire while in SPEAKING state
-        analyzer.set_next_state(VADState.SPEAKING)
-        await controller.process_frame(audio_frame)
-        await controller.process_frame(audio_frame)
-        self.assertEqual(activity_count, 2)
-        await controller.cleanup()
+    async def test_first_speaking_chunk_reports_activity(self):
+        audio_frame = InputAudioRawFrame(audio=b"\x00" * 640, sample_rate=16000, num_channels=1)
+        clock = ScriptedClock(1000.0)
+        with patch.object(vad_controller_module, "time", clock):
+            controller, events = await self._speaking_controller(clock)
+            await controller.process_frame(audio_frame)
+            self.assertEqual(len(events), 1)
+            await controller.cleanup()
 
     async def test_push_frame_event(self):
         """Test that push_frame emits on_push_frame event."""

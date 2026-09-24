@@ -5,7 +5,10 @@
 #
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import pipecat.audio.vad.vad_controller as vad_controller_module
 from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADState
 from pipecat.frames.frames import (
     InputAudioRawFrame,
@@ -92,24 +95,24 @@ class TestVADProcessor(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_pushes_user_speaking_frame(self):
-        """Test that UserSpeakingFrame is pushed while speaking."""
+    async def test_pushes_one_user_speaking_frame_per_period(self):
+        """Two chunks inside one speech_activity_period push one UserSpeakingFrame."""
         analyzer = MockVADAnalyzer([VADState.SPEAKING, VADState.SPEAKING])
         processor = VADProcessor(vad_analyzer=analyzer)
 
-        # Audio frames are forwarded first, then VAD processes and broadcasts VAD frames
-        await run_test(
-            processor,
-            frames_to_send=[self._make_audio_frame(), self._make_audio_frame()],
-            expected_down_frames=[
-                SpeechControlParamsFrame,
-                InputAudioRawFrame,
-                VADUserStartedSpeakingFrame,
-                UserSpeakingFrame,
-                InputAudioRawFrame,
-                UserSpeakingFrame,
-            ],
-        )
+        # The controller's clock stands still, so both chunks fall inside one period.
+        with patch.object(vad_controller_module, "time", SimpleNamespace(monotonic=lambda: 1000.0)):
+            await run_test(
+                processor,
+                frames_to_send=[self._make_audio_frame(), self._make_audio_frame()],
+                expected_down_frames=[
+                    SpeechControlParamsFrame,
+                    InputAudioRawFrame,
+                    VADUserStartedSpeakingFrame,
+                    UserSpeakingFrame,
+                    InputAudioRawFrame,
+                ],
+            )
 
     async def test_no_vad_frames_on_starting_state(self):
         """Test that STARTING state doesn't push VAD frames."""
