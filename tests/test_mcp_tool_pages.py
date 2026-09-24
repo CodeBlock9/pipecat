@@ -26,6 +26,7 @@ pytest.importorskip("mcp")
 
 from mcp import types  # noqa: E402
 from mcp.client.session_group import StreamableHttpParameters  # noqa: E402
+from mcp.shared.exceptions import McpError  # noqa: E402
 
 from pipecat.services.mcp_service import MCPClient  # noqa: E402
 
@@ -47,7 +48,10 @@ class _Transport:
 
 
 class _PagedSession:
-    """Answers tools/list from a map of cursor to page, recording each cursor asked for."""
+    """Answers tools/list from a map of cursor to page, recording each cursor asked for.
+
+    A page given as an exception is raised, as a server's error reaches the caller.
+    """
 
     def __init__(self, pages):
         self._pages = pages
@@ -70,7 +74,10 @@ class _PagedSession:
         # A real request yields to the event loop, so a caller's timeout can end
         # a listing that never stops; the fake does the same.
         await asyncio.sleep(0)
-        return self._pages[key]
+        page = self._pages[key]
+        if isinstance(page, Exception):
+            raise page
+        return page
 
 
 TWO_PAGES = {
@@ -99,6 +106,12 @@ NAME_ON_TWO_PAGES = {
         tools=[_tool("lookup_order", "the second listing"), _tool("book_table")],
         nextCursor=None,
     ),
+}
+
+# A server whose second page fails.
+PAGE_2_FAILS = {
+    None: TWO_PAGES[None],
+    "page-2": McpError(types.ErrorData(code=types.INTERNAL_ERROR, message="page 2 failed")),
 }
 
 
@@ -173,3 +186,11 @@ class TestMCPToolPages(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([t.name for t in schema.standard_tools], ["lookup_order", "book_table"])
         self.assertEqual(schema.standard_tools[0].description, "the first listing")
+
+    async def test_a_later_page_that_fails_keeps_the_pages_listed_before_it(self):
+        client, session = self._client(PAGE_2_FAILS)
+
+        names = await self._schema_names(client)
+
+        self.assertEqual(names, ["lookup_order", "check_hours"])
+        self.assertEqual(session.requests, [None, "page-2"])

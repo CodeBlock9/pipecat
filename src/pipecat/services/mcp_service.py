@@ -501,10 +501,11 @@ class MCPClient(BaseObject):
         page comes back without one. A cursor the server has already returned
         ends the listing, so a server that ignores the cursor cannot loop, and a
         tool name listed twice keeps its first listing, so no name reaches the
-        LLM twice. The listing has no bound of its own: a caller that needs one
-        wraps the call in its own timeout. The tools filter, the
-        ``tools_arguments`` check and the conversion then run once over the
-        whole catalog.
+        LLM twice. A later page that fails ends the listing with a warning, and
+        the tools already listed are kept. The listing has no bound of its own:
+        a caller that needs one wraps the call in its own timeout. The tools
+        filter, the ``tools_arguments`` check and the conversion then run once
+        over the whole catalog.
 
         Args:
             session: The active MCP client session.
@@ -536,7 +537,14 @@ class MCPClient(BaseObject):
                 )
                 break
             seen_cursors.add(cursor)
-            page = await session.list_tools(params=PaginatedRequestParams(cursor=cursor))
+            try:
+                page = await session.list_tools(params=PaginatedRequestParams(cursor=cursor))
+            except Exception as e:
+                logger.warning(
+                    f"{self} the MCP server failed the tools/list page after cursor {cursor!r}: "
+                    f"{e}; keeping the {len(available_tools)} tool(s) listed before it"
+                )
+                break
 
         if repeated_names:
             logger.warning(

@@ -81,6 +81,14 @@ class TestNovaSonicToolArguments(unittest.IsolatedAsyncioTestCase):
             [("transfer_call", "tooluse_rec_1", {"destination": "+61400000000"})],
         )
 
+    async def test_empty_arguments_dispatch_as_an_empty_object(self):
+        service = _service()
+
+        await service._handle_tool_use_event(_tool_use("transfer_call", ""))
+
+        service.run_function_calls.assert_awaited_once()
+        self.assertEqual(_dispatched(service), [("transfer_call", "tooluse_rec_1", {})])
+
 
 class TestNovaSonicUnknownTool(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_function_name_goes_to_the_runner_without_raising(self):

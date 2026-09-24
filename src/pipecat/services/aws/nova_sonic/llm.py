@@ -1472,7 +1472,7 @@ class AWSNovaSonicLLMService(LLMService[AWSNovaSonicLLMAdapter]):
         function_name = tool_use["toolName"]
         tool_call_id = tool_use["toolUseId"]
         try:
-            arguments = json.loads(tool_use["content"])
+            arguments = json.loads(tool_use["content"] or "{}")
         except json.JSONDecodeError:
             # Skip the call, as the chat loop does, rather than raise into the
             # receive loop, which would reset the whole session.
