@@ -8,6 +8,7 @@
 
 import asyncio
 
+import httpx
 import pytest
 from aiohttp import web
 
@@ -21,6 +22,11 @@ from pipecat.frames.frames import (
 )
 from pipecat.services.speaches.tts import SpeachesTTSService, SpeachesTTSSettings
 from pipecat.tests.utils import run_test
+from pipecat.utils.asyncio.task_manager import TaskManager
+from tests.frame_processor_helpers import frame_processor_setup
+
+CHUNK = bytes(range(0, 240)) * 4  # 960 bytes, 20 ms at 24 kHz, distinct samples
+CHUNKS = 25
 
 
 @pytest.mark.asyncio
@@ -82,3 +88,54 @@ async def test_run_speaches_tts_allows_custom_voice(aiohttp_client):
         "voice": "fettah",
         "response_format": "pcm",
     }
+
+
+def _streaming_client(sent: list[int]) -> httpx.AsyncClient:
+    """A client whose server streams CHUNKS network chunks, recording each one sent."""
+
+    async def body():
+        for i in range(CHUNKS):
+            sent.append(i)
+            yield CHUNK
+
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=body()))
+    )
+
+
+async def _streaming_service(sent: list[int]) -> SpeachesTTSService:
+    service = SpeachesTTSService(
+        base_url="http://speaches.invalid/v1",
+        sample_rate=24000,
+        http_client=_streaming_client(sent),
+        settings=SpeachesTTSSettings(model="speaches-model", voice="custom-voice"),
+    )
+    await service.setup(frame_processor_setup(TaskManager()))  # sets the output sample rate
+    return service
+
+
+@pytest.mark.asyncio
+async def test_the_first_frame_follows_the_first_network_chunk():
+    sent: list[int] = []
+    service = await _streaming_service(sent)
+    frames = service.run_tts("Hello there.", "ctx")
+
+    first = await anext(frames)
+    chunks_sent_before_first_frame = len(sent)
+    await frames.aclose()
+
+    assert isinstance(first, TTSAudioRawFrame)
+    assert chunks_sent_before_first_frame <= 2, (
+        f"{chunks_sent_before_first_frame} x 20 ms chunks arrived before the first frame"
+    )
+
+
+@pytest.mark.asyncio
+async def test_every_byte_is_yielded_in_order():
+    sent: list[int] = []
+    service = await _streaming_service(sent)
+
+    frames = [f async for f in service.run_tts("Hello there.", "ctx")]
+
+    assert b"".join(f.audio for f in frames) == CHUNK * CHUNKS
+    assert all(f.context_id == "ctx" for f in frames)

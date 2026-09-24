@@ -23,7 +23,6 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     StartFrame,
-    TTSAudioRawFrame,
 )
 from pipecat.services.openai._constants import OPENAI_SAMPLE_RATE
 from pipecat.services.settings import TTSSettings
@@ -294,12 +293,13 @@ class OpenAITTSService(TTSService):
 
                 await self.start_tts_usage_metrics(text)
 
-                CHUNK_SIZE = self.chunk_size
-
-                async for chunk in r.iter_bytes(CHUNK_SIZE):
-                    if len(chunk) > 0:
-                        await self.stop_ttfb_metrics()
-                        frame = TTSAudioRawFrame(chunk, self.sample_rate, 1, context_id=context_id)
-                        yield frame
+                # Yield each network chunk as it arrives: the output transport
+                # paces playback, so waiting for a fixed amount of audio first
+                # would only delay the start of every sentence.
+                async for frame in self._stream_audio_frames_from_iterator(
+                    r.iter_bytes(), context_id=context_id
+                ):
+                    await self.stop_ttfb_metrics()
+                    yield frame
         except BadRequestError as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")

@@ -807,6 +807,10 @@ class SegmentedSTTService(STTService):
     small audio buffer to account for the delay between actual speech start and
     VAD detection.
 
+    While muted (``STTMuteFrame``) the service buffers nothing, and a mute that
+    starts between turns also drops that small buffer, so a turn spoken wholly
+    inside the mute is neither transcribed nor billed.
+
     The buffered segment is passed to :meth:`run_stt` as a WAV container by
     default, which is what cloud providers want for their upload APIs. Local
     models that consume raw 16-bit PCM directly override
@@ -872,12 +876,21 @@ class SegmentedSTTService(STTService):
             await self._handle_user_started_speaking(frame)
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             await self._handle_user_stopped_speaking(frame)
+        elif isinstance(frame, STTMuteFrame) and frame.mute and not self._user_speaking:
+            # The pre-roll holds audio from before the mute. A turn spoken wholly
+            # inside the mute would otherwise flush it as a segment at its VAD stop.
+            # Speech already in progress keeps its pre-mute part.
+            self._audio_buffer.clear()
 
     async def _handle_user_started_speaking(self, frame: VADUserStartedSpeakingFrame):
         self._user_speaking = True
 
     async def _handle_user_stopped_speaking(self, frame: VADUserStoppedSpeakingFrame):
         self._user_speaking = False
+
+        # Nothing buffered (a turn spoken wholly while muted): nothing to transcribe or bill.
+        if not self._audio_buffer:
+            return
 
         # A service that can no longer work can't transcribe this segment.
         if not self.is_usable:
@@ -906,6 +919,7 @@ class SegmentedSTTService(STTService):
 
         Continuously buffers audio, growing the buffer while user is speaking and
         maintaining a small buffer when not speaking to account for VAD delay.
+        While the service is muted the frame is dropped, as in STTService.
 
         If the frame has a user_id, it is stored for later use in transcription.
 
@@ -913,6 +927,9 @@ class SegmentedSTTService(STTService):
             frame: The audio frame to process.
             direction: The direction of frame processing.
         """
+        if self._muted:
+            return
+
         # UserAudioRawFrame contains a user_id (e.g. Daily, Livekit)
         if isinstance(frame, UserAudioRawFrame):
             self._user_id = frame.user_id

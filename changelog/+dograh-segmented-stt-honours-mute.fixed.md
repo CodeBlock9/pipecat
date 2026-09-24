@@ -1,0 +1,1 @@
+- `SegmentedSTTService` honours `STTMuteFrame`: audio that arrives while muted is not buffered, a mute that starts between turns drops the pre-roll, and a VAD stop with nothing buffered records no usage and calls no `run_stt`, so a turn spoken wholly inside a mute is neither transcribed nor billed. Speech already in progress when the mute starts keeps its pre-mute part.
