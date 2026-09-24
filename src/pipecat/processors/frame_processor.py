@@ -773,8 +773,8 @@ class FrameProcessor(BaseObject):
 
         Both queues are held, so a processor left paused could not process the
         frames that shut it down. The pause is therefore always lifted: when
-        ``ready`` resolves, when ``timeout`` elapses, or at teardown, whichever
-        comes first.
+        ``ready`` resolves or raises, when ``timeout`` elapses, or at teardown,
+        whichever comes first.
 
         Args:
             ready: Awaited to learn when frames can be acted on, e.g.
@@ -800,7 +800,10 @@ class FrameProcessor(BaseObject):
             logger.warning(
                 f"{self}: still not ready after {timeout}s, resuming frame processing anyway"
             )
-        await self.__resume_processing_all_frames()
+        except Exception:
+            logger.exception(f"{self}: readiness check failed, resuming frame processing")
+        finally:
+            await self.__resume_processing_all_frames()
 
     async def __cancel_pause_watcher(self):
         """Stop watching, and lift the pause the watcher was going to lift."""

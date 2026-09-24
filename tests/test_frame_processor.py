@@ -597,5 +597,75 @@ class TestFrameProcessor(unittest.IsolatedAsyncioTestCase):
             await processor.cleanup()
 
 
+class _DirectCollector(FrameProcessor):
+    def __init__(self):
+        super().__init__(enable_direct_mode=True)
+        self.frames: list[str] = []
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        self.frames.append(type(frame).__name__)
+
+
+class _PausingOnStartProcessor(FrameProcessor):
+    def __init__(self, ready):
+        super().__init__()
+        self._ready = ready
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, StartFrame):
+            await self.pause_processing_all_frames_until(self._ready, timeout=0.2)
+        await self.push_frame(frame, direction)
+
+
+async def _delivered_after_pause(ready) -> list[str]:
+    """Frames a processor that pauses on its StartFrame delivers within 0.6 s.
+
+    Driven directly rather than through ``run_test``: a processor left paused
+    also holds the frames that shut a pipeline down, so ``run_test`` would
+    never return.
+    """
+    processor = _PausingOnStartProcessor(ready)
+    collector = _DirectCollector()
+    processor.link(collector)
+    setup = frame_processor_setup(TaskManager(loop=asyncio.get_running_loop()))
+    await processor.setup(setup)
+    await collector.setup(setup)
+    try:
+        await processor.queue_frame(StartFrame())
+        await processor.queue_frame(TextFrame("a"))
+        await asyncio.sleep(0.6)  # well past the 0.2 s readiness timeout
+        return list(collector.frames)
+    finally:
+        await processor.cleanup()
+        await collector.cleanup()
+
+
+class TestPauseUntilReadyFailure(unittest.IsolatedAsyncioTestCase):
+    """The pause is lifted however the readiness wait ends."""
+
+    async def test_frames_flow_again_after_the_readiness_callback_fails(self):
+        """A readiness callback that raises lifts the pause, as a timeout does."""
+
+        async def ready():
+            raise ValueError("connection refused")
+
+        frames = await _delivered_after_pause(ready)
+        self.assertEqual(frames, ["StartFrame", "TextFrame"], f"delivered: {frames}")
+
+    async def test_frames_flow_again_when_never_ready(self):
+        """The timeout lifts the pause."""
+        frames = await _delivered_after_pause(asyncio.Event().wait)
+        self.assertEqual(frames, ["StartFrame", "TextFrame"], f"delivered: {frames}")
+
+    async def test_frames_flow_once_ready(self):
+        """A condition that is met lifts the pause."""
+        ready = asyncio.Event()
+        ready.set()
+        frames = await _delivered_after_pause(ready.wait)
+        self.assertEqual(frames, ["StartFrame", "TextFrame"], f"delivered: {frames}")
+
+
 if __name__ == "__main__":
     unittest.main()
