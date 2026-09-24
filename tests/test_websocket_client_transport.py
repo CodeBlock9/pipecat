@@ -7,13 +7,18 @@
 """Tests for the WebSocket client transport."""
 
 import asyncio
-from unittest.mock import AsyncMock
+import unittest
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import websockets
 
 import pipecat.transports.websocket.client as websocket_client
+from pipecat.frames.frames import Frame, TextFrame
+from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.websocket.client import (
     WebsocketClientCallbacks,
+    WebsocketClientOutputTransport,
     WebsocketClientParams,
     WebsocketClientSession,
 )
@@ -95,3 +100,49 @@ async def test_the_websocket_outlives_the_first_transport_to_disconnect(monkeypa
 
     await session.disconnect()
     assert opened[0].closed
+
+
+class _RaisingWebsocket:
+    """An open connection whose every send fails."""
+
+    state = websockets.State.OPEN
+
+    async def send(self, message):
+        raise ConnectionError("socket gone")
+
+
+class _StubSerializer(FrameSerializer):
+    async def serialize(self, frame: Frame) -> str | bytes | None:
+        return b"payload"
+
+    async def deserialize(self, data: str | bytes) -> Frame | None:
+        return None
+
+
+class TestSendFailurePropagation(unittest.IsolatedAsyncioTestCase):
+    """A send the session reports as failed must not be counted as written.
+
+    ``write_audio_frame`` returns what ``_write_frame`` reports, and the output
+    transport's consecutive-failure counter only moves on a False.
+    """
+
+    async def asyncSetUp(self):
+        callbacks = WebsocketClientCallbacks(
+            on_connected=AsyncMock(), on_disconnected=AsyncMock(), on_message=AsyncMock()
+        )
+        self.params = WebsocketClientParams(serializer=_StubSerializer(), audio_out_enabled=True)
+        self.session = WebsocketClientSession("ws://example.com", self.params, callbacks, "Test")
+        self.session._websocket = _RaisingWebsocket()
+
+    async def test_the_session_reports_the_failure(self):
+        """``send`` returns False when the socket raises."""
+        self.assertTrue(self.session.is_connected)
+        self.assertFalse(await self.session.send(b"payload"))
+
+    async def test_the_transport_reports_the_failure(self):
+        """``_write_frame`` passes the session's result on."""
+        transport = WebsocketClientOutputTransport(MagicMock(), self.session, self.params)
+        self.assertFalse(
+            await transport._write_frame(TextFrame("x")),
+            "_write_frame reported success for a send the session reported as failed",
+        )
