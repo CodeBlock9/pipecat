@@ -100,3 +100,37 @@ async def test_uncancelled_waiters_share_one_load():
     assert [r[0] for r in results] == [model, model] and loads == 1
     manager.release(results[0][1])
     manager.release(results[0][1])
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_load_is_forgotten_without_an_error():
+    """The load itself cancelled, as asyncio.run cancels tasks left at shutdown.
+
+    Its done-callback forgets the entry and must not ask a cancelled task for
+    its exception, which raises inside the callback.
+    """
+    manager = _aic_filter_module().AICModelManager
+    loop = asyncio.get_running_loop()
+    errors: list[str] = []
+    loop.set_exception_handler(lambda _loop, context: errors.append(context["message"]))
+    gate = asyncio.Event()
+
+    async def load(cache_key, **kwargs):
+        await gate.wait()
+        return object()
+
+    path = Path("cancelled-load.aicmodel")
+    key = manager._get_cache_key(model_path=path)
+    try:
+        with patch.object(manager, "_load_model_from_file", load):
+            waiter = asyncio.create_task(manager.acquire(model_path=path))
+            await asyncio.sleep(0.01)
+            manager._loading[key].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(None)
+
+    assert key not in manager._loading
+    assert errors == []
