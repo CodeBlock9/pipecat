@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from loguru import logger
 from openai import BadRequestError
 
-from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame
+from pipecat.frames.frames import ErrorFrame
 from pipecat.services.openai.tts import OpenAITTSService, OpenAITTSSettings
 from pipecat.utils.tracing.service_decorators import traced_tts
 
@@ -88,14 +88,11 @@ class SpeachesTTSService(OpenAITTSService):
 
                 await self.start_tts_usage_metrics(text)
 
-                async for chunk in response.iter_bytes(self.chunk_size):
-                    if len(chunk) > 0:
-                        await self.stop_ttfb_metrics()
-                        yield TTSAudioRawFrame(
-                            chunk,
-                            self.sample_rate,
-                            1,
-                            context_id=context_id,
-                        )
+                # Each network chunk as it arrives, as OpenAITTSService does.
+                async for frame in self._stream_audio_frames_from_iterator(
+                    response.iter_bytes(), context_id=context_id
+                ):
+                    await self.stop_ttfb_metrics()
+                    yield frame
         except BadRequestError as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")
