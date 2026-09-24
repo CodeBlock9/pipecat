@@ -202,24 +202,36 @@ class OpenAIResponsesLLMAdapter(BaseLLMAdapter[OpenAIResponsesLLMInvocationParam
                 result.append(cast(ResponseInputItemParam, {"role": "user", "content": content}))
 
             elif role == "assistant":
-                tool_calls = message.get("tool_calls")
-                if tool_calls:
-                    for tc in tool_calls:
-                        func = tc.get("function", {})
-                        result.append(
-                            {
-                                "type": "function_call",
-                                "call_id": tc.get("id", ""),
-                                "name": func.get("name", ""),
-                                "arguments": func.get("arguments", ""),
-                            }
-                        )
-                else:
-                    content = message.get("content", "")
+                # Text the model said beside its calls is an assistant item
+                # ahead of their function_call items, the order the model
+                # produced them in; missing, empty or whitespace-only text
+                # beside calls adds none.
+                tool_calls = message.get("tool_calls") or []
+                content = message.get("content", "")
+                texts = (
+                    [content]
+                    if isinstance(content, str)
+                    else [
+                        part.get("text", "")
+                        for part in cast(list[dict[str, Any]], content or [])
+                        if part.get("type") == "text"
+                    ]
+                )
+                if not tool_calls or any(text.strip() for text in texts):
                     if isinstance(content, list):
                         content = self._convert_multimodal_content(content)
                     result.append(
                         cast(ResponseInputItemParam, {"role": "assistant", "content": content})
+                    )
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    result.append(
+                        {
+                            "type": "function_call",
+                            "call_id": tc.get("id", ""),
+                            "name": func.get("name", ""),
+                            "arguments": func.get("arguments", ""),
+                        }
                     )
 
             elif role == "tool":
