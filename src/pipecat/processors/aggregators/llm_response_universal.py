@@ -1916,30 +1916,32 @@ class LLMAssistantAggregator(LLMContextAggregator):
             # If an image frame has been added to the context, let's run inference.
             run_llm = await self._maybe_append_image_to_context(image_frame)
 
-        # Run inference if the function call result requires it.
-        if frame.result:
-            if properties and properties.run_llm is not None:
-                # If the tool call result has a run_llm property, use it.
-                run_llm = properties.run_llm
-            elif frame.run_llm is not None:
-                # If the frame is indicating we should run the LLM, do it.
-                run_llm = frame.run_llm
+        # Run inference if the function call result requires it. An explicit
+        # request is honoured whatever the result is. Otherwise a result runs
+        # inference when there is one: None is the absence of a result, and any
+        # other value, falsey or not, is an answer the LLM has to hear.
+        if properties and properties.run_llm is not None:
+            # If the tool call result has a run_llm property, use it.
+            run_llm = properties.run_llm
+        elif frame.run_llm is not None:
+            # If the frame is indicating we should run the LLM, do it.
+            run_llm = frame.run_llm
+        elif frame.result is not None:
+            # Run the LLM when this is the last function call in the group
+            # to complete. If group_id is set, only consider sibling calls;
+            # otherwise always execute as soon as we receive the result.
+            if group_id:
+                run_llm = not any(
+                    f is not None
+                    and f.group_id == group_id
+                    # We are now able to receive "updates", so the current
+                    # frame can still be in the in progress list, and we need to
+                    # ignore it.
+                    and f.tool_call_id != frame.tool_call_id
+                    for f in self._function_calls_in_progress.values()
+                )
             else:
-                # Run the LLM when this is the last function call in the group
-                # to complete. If group_id is set, only consider sibling calls;
-                # otherwise always execute as soon as we receive the result.
-                if group_id:
-                    run_llm = not any(
-                        f is not None
-                        and f.group_id == group_id
-                        # We are now able to receive "updates", so the current
-                        # frame can still be in the in progress list, and we need to
-                        # ignore it.
-                        and f.tool_call_id != frame.tool_call_id
-                        for f in self._function_calls_in_progress.values()
-                    )
-                else:
-                    run_llm = True
+                run_llm = True
 
         if run_llm and not self._user_speaking:
             await self._maybe_push_context_after_function_result()
@@ -1993,7 +1995,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
         Injects an intermediate developer message into the context without
         removing the call from the in-progress map.
         """
-        if not frame.result:
+        if frame.result is None:
             logger.warning(f"{self} result_callback called with is_final=False but no result!")
             return
 
@@ -2013,7 +2015,9 @@ class LLMAssistantAggregator(LLMContextAggregator):
         is_async = not in_progress_frame.cancel_on_interruption
         del self._function_calls_in_progress[frame.tool_call_id]
 
-        result = json.dumps(frame.result, ensure_ascii=False) if frame.result else "COMPLETED"
+        result = (
+            "COMPLETED" if frame.result is None else json.dumps(frame.result, ensure_ascii=False)
+        )
 
         if is_async:
             # For async function calls inject a developer message so the LLM is

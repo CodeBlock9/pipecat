@@ -1149,6 +1149,33 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["content"] for m in user_messages], ["I'm thinking", "about pizza"])
 
 
+def _lookup_in_progress(*, cancel_on_interruption: bool = True) -> FunctionCallInProgressFrame:
+    return FunctionCallInProgressFrame(
+        function_name="lookup",
+        tool_call_id="1",
+        arguments={},
+        cancel_on_interruption=cancel_on_interruption,
+    )
+
+
+def _lookup_result(result, *, properties=None) -> FunctionCallResultFrame:
+    return FunctionCallResultFrame(
+        function_name="lookup",
+        tool_call_id="1",
+        arguments={},
+        result=result,
+        properties=properties,
+    )
+
+
+async def _run_lookup(frames) -> tuple[LLMContext, list[str]]:
+    """Run the frames through a real assistant aggregator; return its context and upstream frames."""
+    context = LLMContext()
+    aggregator = LLMAssistantAggregator(context)
+    _, up = await run_test(aggregator, frames_to_send=frames, expected_down_frames=[])
+    return context, [type(f).__name__ for f in up]
+
+
 class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
     async def test_empty(self):
         context = LLMContext()
@@ -1786,6 +1813,75 @@ class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
         )
         assert json.loads(context.messages[-1]["content"]) == {"conditions": "Sunny"}
         assert context_updated
+
+    async def test_a_falsey_final_result_is_stored_as_its_value_and_runs_inference(self):
+        """False, 0, "", [] and {} are answers: each is stored as its JSON value and runs inference."""
+        for value in (False, 0, "", [], {}):
+            with self.subTest(value=value):
+                context, up = await _run_lookup(
+                    [_lookup_in_progress(), SleepFrame(), _lookup_result(value)]
+                )
+                stored = context.messages[-1]["content"]
+                self.assertEqual(
+                    stored,
+                    json.dumps(value, ensure_ascii=False),
+                    f"{value!r} was stored as {stored!r}",
+                )
+                self.assertEqual(up, ["LLMContextFrame"], f"{value!r} ran no inference: {up}")
+
+    async def test_an_explicit_run_llm_is_honoured_for_a_falsey_result(self):
+        """run_llm=True on a falsey result runs inference."""
+        _, up = await _run_lookup(
+            [
+                _lookup_in_progress(),
+                SleepFrame(),
+                _lookup_result([], properties=FunctionCallResultProperties(run_llm=True)),
+            ]
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"explicit run_llm=True ran no inference: {up}")
+
+    async def test_a_falsey_intermediate_result_reaches_the_context(self):
+        """An intermediate [] is recorded, not dropped as if there were no result."""
+        context, _ = await _run_lookup(
+            [
+                _lookup_in_progress(cancel_on_interruption=False),
+                SleepFrame(),
+                _lookup_result([], properties=FunctionCallResultProperties(is_final=False)),
+            ]
+        )
+        payload = async_tool_messages.parse_message(context.messages[-1])
+        self.assertIsNotNone(payload, f"no async-tool message: {context.messages[-1]}")
+        self.assertEqual(
+            (payload.kind, payload.result),
+            ("intermediate", "[]"),
+            f"the intermediate [] was dropped; the last message is the {payload.kind} one",
+        )
+
+    async def test_control_a_missing_result_is_stored_as_completed(self):
+        """None is the documented absence of a result: stored as COMPLETED, no inference."""
+        context, up = await _run_lookup([_lookup_in_progress(), SleepFrame(), _lookup_result(None)])
+        self.assertEqual(context.messages[-1]["content"], "COMPLETED")
+        self.assertEqual(up, [])
+
+    async def test_an_explicit_run_llm_is_honoured_for_a_missing_result(self):
+        """run_llm=True runs inference even when the function returned nothing."""
+        context, up = await _run_lookup(
+            [
+                _lookup_in_progress(),
+                SleepFrame(),
+                _lookup_result(None, properties=FunctionCallResultProperties(run_llm=True)),
+            ]
+        )
+        self.assertEqual(context.messages[-1]["content"], "COMPLETED")
+        self.assertEqual(up, ["LLMContextFrame"], f"explicit run_llm=True ran no inference: {up}")
+
+    async def test_control_a_truthy_result_runs_inference(self):
+        """A non-empty result is stored and inference runs."""
+        context, up = await _run_lookup(
+            [_lookup_in_progress(), SleepFrame(), _lookup_result({"conditions": "Sunny"})]
+        )
+        self.assertEqual(json.loads(context.messages[-1]["content"]), {"conditions": "Sunny"})
+        self.assertEqual(up, ["LLMContextFrame"])
 
     async def test_thought(self):
         context = LLMContext()
