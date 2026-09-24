@@ -333,6 +333,7 @@ class DeepgramTTSService(WebsocketTTSService):
             # LLM finishes a complete response via flush_audio()
             speak_msg = {"type": "Speak", "text": text}
             await self._get_websocket().send(json.dumps(speak_msg))
+            await self.start_tts_usage_metrics(text)
 
             # The audio frames will be handled in _receive_messages
             yield None
