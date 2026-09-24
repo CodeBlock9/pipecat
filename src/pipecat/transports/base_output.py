@@ -533,6 +533,10 @@ class BaseOutputTransport(FrameProcessor):
             Args:
                 frame: The end frame signaling sender shutdown.
             """
+            # Raw and speech-stream audio has no TTSStoppedFrame to flush its
+            # trailing partial chunk, so it is queued here, ahead of the EndFrame.
+            await self._enqueue_flushed_audio_buffer()
+
             # Let the sink tasks process the queue until they reach this EndFrame.
             await self._clock_queue.put((float("inf"), next(self._clock_queue_counter), frame))
             await self._audio_queue.put(frame)

@@ -404,9 +404,10 @@ class TestBaseOutputTransportAudioBuffering(unittest.IsolatedAsyncioTestCase):
 
     ``MediaSender._audio_buffer`` only enqueues complete ``audio_chunk_size``
     chunks (see ``handle_audio_frame``); whatever hasn't reached a full chunk
-    stays buffered. When ``TTSStoppedFrame`` arrives, that leftover audio is
-    padded with silence to a full chunk and queued for playback (see
-    ``handle_tts_stopped``), instead of being silently discarded.
+    stays buffered. When ``TTSStoppedFrame`` or ``EndFrame`` arrives, that
+    leftover audio is padded with silence to a full chunk and queued for
+    playback (see ``handle_tts_stopped`` and ``stop``), instead of being
+    silently discarded.
     """
 
     async def test_tts_stopped_frame_flushes_partial_chunk_padded_with_silence(self):
@@ -560,6 +561,52 @@ class TestBaseOutputTransportAudioBuffering(unittest.IsolatedAsyncioTestCase):
                 "response 2 lost its first quarter chunk: the chunk starts with "
                 f"{written[5][:8]!r} and ends with {written[5][-8:]!r}",
             )
+        finally:
+            await transport.cancel(CancelFrame())
+
+    async def test_a_trailing_partial_chunk_is_flushed_before_the_end(self):
+        """Raw audio has no TTSStoppedFrame, so the EndFrame flushes its last partial chunk."""
+        transport = await _make_transport(mixer=None, audio_out_end_silence_secs=0)
+        try:
+            sender = transport._media_senders[None]
+            chunk = sender.audio_chunk_size
+
+            partial = b"\x03\x00" * (chunk // 8)
+            await transport.process_frame(
+                OutputAudioRawFrame(audio=partial, sample_rate=sender.sample_rate, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+            self.assertEqual(len(sender._audio_buffer), len(partial))
+
+            await asyncio.wait_for(
+                transport.process_frame(EndFrame(), FrameDirection.DOWNSTREAM), timeout=5
+            )
+            written = [call.args[0].audio for call in transport.write_audio_frame.call_args_list]
+            self.assertEqual(
+                written,
+                [partial + b"\x00" * (chunk - len(partial))],
+                f"{len(written)} frames written; buffer left: {len(sender._audio_buffer)} bytes",
+            )
+        finally:
+            await transport.cancel(CancelFrame())
+
+    async def test_a_full_chunk_is_written_before_the_end(self):
+        """Raw audio that fills a chunk is written as is, with nothing flushed after it."""
+        transport = await _make_transport(mixer=None, audio_out_end_silence_secs=0)
+        try:
+            sender = transport._media_senders[None]
+            chunk = sender.audio_chunk_size
+
+            full = b"\x03\x00" * (chunk // 2)
+            await transport.process_frame(
+                OutputAudioRawFrame(audio=full, sample_rate=sender.sample_rate, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+            await asyncio.wait_for(
+                transport.process_frame(EndFrame(), FrameDirection.DOWNSTREAM), timeout=5
+            )
+            written = [call.args[0].audio for call in transport.write_audio_frame.call_args_list]
+            self.assertEqual(written, [full])
         finally:
             await transport.cancel(CancelFrame())
 
