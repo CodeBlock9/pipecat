@@ -11,6 +11,7 @@ import unittest.mock
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    FunctionCallFromLLM,
     FunctionCallResultFrame,
     FunctionCallsStartedFrame,
     UserIdleTimeoutUpdateFrame,
@@ -210,8 +211,8 @@ class TestUserIdleController(unittest.IsolatedAsyncioTestCase):
         """Test race condition: FunctionCallsStarted arrives before BotStopped.
 
         A race condition can cause FunctionCallsStarted to arrive before
-        BotStoppedSpeaking. The counter guard prevents the timer from starting
-        while a function call is in progress.
+        BotStoppedSpeaking. The guard on outstanding call ids prevents the timer
+        from starting while a function call is in progress.
         """
         controller = UserIdleController(user_idle_timeout=USER_IDLE_TIMEOUT)
         await controller.setup(frame_processor_setup(self.task_manager))
@@ -225,7 +226,13 @@ class TestUserIdleController(unittest.IsolatedAsyncioTestCase):
 
         # LLM emits function call and "let me check" concurrently
         await controller.process_frame(
-            FunctionCallsStartedFrame(function_calls=[unittest.mock.Mock()])
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="test", tool_call_id="123", arguments={}, context=None
+                    )
+                ]
+            )
         )
         await controller.process_frame(BotStartedSpeakingFrame())
         await controller.process_frame(BotStoppedSpeakingFrame())
