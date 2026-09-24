@@ -1,0 +1,1 @@
+- Context summarization keeps a running async tool call out of the summarized range. `LLMContextSummarizationUtil` reads async-tool messages through `async_tool_messages.parse_message`, so a started message (status `running`) counts as pending and a final message resolves its call.

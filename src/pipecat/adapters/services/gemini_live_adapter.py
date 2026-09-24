@@ -54,7 +54,8 @@ class GeminiLiveLLMAdapter(GeminiLLMAdapter):
 
         Returns:
             The messages, with each tool call and result replaced by a text
-            message describing it.
+            message describing it. Text the model said beside its tool calls
+            leads their description.
         """
         tool_call_names: dict[str, str] = {}
         converted: list[LLMContextMessage] = []
@@ -68,6 +69,17 @@ class GeminiLiveLLMAdapter(GeminiLLMAdapter):
             # the dict-style key access used below; treat it as a plain dict.
             msg = cast(dict[str, Any], message)
             if msg.get("tool_calls"):
+                # Text the model said beside its calls leads their summaries;
+                # missing, empty or whitespace-only text adds nothing.
+                content = msg.get("content")
+                texts = (
+                    [content]
+                    if isinstance(content, str)
+                    else [
+                        part.get("text", "") for part in content or [] if part.get("type") == "text"
+                    ]
+                )
+                said = [text for text in texts if text.strip()]
                 summaries = []
                 for tool_call in msg["tool_calls"]:
                     function = tool_call["function"]
@@ -75,7 +87,7 @@ class GeminiLiveLLMAdapter(GeminiLLMAdapter):
                     summaries.append(
                         f"[Called function {function['name']} with args {function['arguments']}]"
                     )
-                converted.append({"role": "assistant", "content": " ".join(summaries)})
+                converted.append({"role": "assistant", "content": " ".join(said + summaries)})
             elif msg.get("role") == "tool":
                 # Same fallback name the Gemini adapter uses for a result whose
                 # call isn't in the context.

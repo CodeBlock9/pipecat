@@ -103,7 +103,7 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
         Returns:
             List of messages in a format ready for logging about AWS Bedrock.
         """
-        # Get messages in Anthropic's format
+        # Get messages in Bedrock's format
         messages = self._from_universal_context_messages(self.get_messages(context)).messages
 
         # Sanitize messages for logging
@@ -161,11 +161,9 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
             if current_message["role"] == next_message["role"]:
                 # Convert content to list of dictionaries if it's a string
                 if isinstance(current_message["content"], str):
-                    current_message["content"] = [
-                        {"type": "text", "text": current_message["content"]}
-                    ]
+                    current_message["content"] = [{"text": current_message["content"]}]
                 if isinstance(next_message["content"], str):
-                    next_message["content"] = [{"type": "text", "text": next_message["content"]}]
+                    next_message["content"] = [{"text": next_message["content"]}]
                 # Concatenate the content
                 current_message["content"].extend(next_message["content"])
                 # Remove the next message from the list
@@ -178,7 +176,7 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
             if isinstance(message["content"], str) and message["content"] == "":
                 message["content"] = "(empty)"
             elif isinstance(message["content"], list) and len(message["content"]) == 0:
-                message["content"] = [{"type": "text", "text": "(empty)"}]
+                message["content"] = [{"text": "(empty)"}]
 
         return self.ConvertedMessages(messages=messages, system=system)
 
@@ -210,7 +208,9 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
         """Convert standard format message to AWS Bedrock format.
 
         Handles conversion of text content, tool calls, and tool results.
-        Empty text content is converted to "(empty)".
+        Empty text content is converted to "(empty)". Text beside tool calls
+        becomes text blocks ahead of the ``toolUse`` blocks; blank text there
+        adds none.
 
         Args:
             message: Message in standard format.
@@ -223,6 +223,7 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
 
                 {
                     "role": "assistant",
+                    "content": "Let me search.",
                     "tool_calls": [
                         {
                             "id": "123",
@@ -236,6 +237,7 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
                 {
                     "role": "assistant",
                     "content": [
+                        {"text": "Let me search."},
                         {
                             "toolUse": {
                                 "toolUseId": "123",
@@ -275,7 +277,19 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
 
         if msg.get("tool_calls"):
             tc = msg["tool_calls"]
-            ret: dict[str, Any] = {"role": "assistant", "content": []}
+            # Text the model said beside its calls leads them in the same
+            # message, as Converse returns it. Bedrock rejects a blank text
+            # block, so missing, empty or whitespace-only text adds none.
+            content = msg.get("content")
+            texts = (
+                [content]
+                if isinstance(content, str)
+                else [item.get("text", "") for item in content or [] if item.get("type") == "text"]
+            )
+            ret: dict[str, Any] = {
+                "role": "assistant",
+                "content": [{"text": text} for text in texts if text.strip()],
+            }
             for tool_call in tc:
                 function = tool_call["function"]
                 arguments = json.loads(function["arguments"])

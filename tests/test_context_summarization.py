@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from pipecat.frames.frames import LLMContextSummaryRequestFrame
+from pipecat.processors.aggregators import async_tool_messages
 from pipecat.processors.aggregators.llm_context import LLMContext, LLMSpecificMessage
 from pipecat.services.llm_service import LLMService
 from pipecat.utils.context.llm_context_summarization import (
@@ -362,6 +363,29 @@ class TestLLMContextSummarizationConfigDeprecated(unittest.TestCase):
         self.assertEqual(new_config.summary_config.summarization_prompt, "Custom")
 
 
+def _async_tool_context(tool_call_id: str, *extra_messages: dict) -> LLMContext:
+    """A context with an async tool call whose started message is followed by eight user turns."""
+    return LLMContext(
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "before"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {"name": "slow", "arguments": "{}"},
+                    }
+                ],
+            },
+            async_tool_messages.build_started_message(tool_call_id),
+            *extra_messages,
+        ]
+        + [{"role": "user", "content": f"after{i}"} for i in range(8)]
+    )
+
+
 class TestFunctionCallHandling(unittest.TestCase):
     """Tests for function call handling in summarization."""
 
@@ -619,6 +643,33 @@ class TestFunctionCallHandling(unittest.TestCase):
         # Should get all messages except the last one
         self.assertEqual(len(result.messages), 4)
         self.assertEqual(result.last_summarized_index, 4)
+
+    def test_a_started_message_counts_as_pending(self):
+        """The started message of a running async tool marks its call as unresolved."""
+        content = async_tool_messages.build_started_message("pending-tool")["content"]
+        self.assertTrue(LLMContextSummarizationUtil._is_tool_message_pending(content), content)
+
+    def test_a_running_call_is_kept_out_of_the_summarized_range(self):
+        """The range stops before a running async call and its placeholder."""
+        result = LLMContextSummarizationUtil.get_messages_to_summarize(
+            _async_tool_context("pending-tool"), 4
+        )
+        roles = [m["role"] for m in result.messages]
+        self.assertEqual(
+            (result.last_summarized_index, roles),
+            (1, ["user"]),
+            f"summarized up to {result.last_summarized_index}: {roles}",
+        )
+
+    def test_control_a_finished_call_is_summarized(self):
+        """The finished developer message resolves the call, and the range includes it."""
+        context = _async_tool_context(
+            "done-tool", async_tool_messages.build_final_result_message("done-tool", "{}")
+        )
+        result = LLMContextSummarizationUtil.get_messages_to_summarize(context, 4)
+        roles = [m["role"] for m in result.messages]
+        self.assertIn("assistant", roles, f"summarized roles: {roles}")
+        self.assertEqual(result.last_summarized_index, len(context.messages) - 4 - 1)
 
 
 class TestSummaryGenerationExceptions(unittest.IsolatedAsyncioTestCase):

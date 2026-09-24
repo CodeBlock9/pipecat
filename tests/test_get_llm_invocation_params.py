@@ -893,8 +893,8 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
         self.assertEqual([m.role for m in result], ["model", "user", "model", "user"])
         self.assertEqual([len(m.parts) for m in result], [2, 2, 1, 1])
 
-    def test_merge_collects_interleaved_non_tool_message(self):
-        """A non-tool message inside a group is collected and re-emitted after it."""
+    def test_merge_stops_at_an_interleaved_non_tool_message(self):
+        """A non-tool message ends the group; a later unsigned call keeps its own turn."""
         text_message = Content(role="model", parts=[Part(text="thinking out loud")])
         messages = [
             self._tool_call_message("c1", signature="sig-c1"),
@@ -907,12 +907,55 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
             [self._thought_signature_dict("c1")], messages
         )
 
-        # Both calls still merge (and both responses), and the interleaved text
-        # is preserved after the merged group rather than stopping the merge.
-        self.assertEqual([m.role for m in result], ["model", "user", "model"])
-        self.assertEqual([p.function_call.id for p in result[0].parts], ["c1", "c2"])
-        self.assertEqual([p.function_response.id for p in result[1].parts], ["c1", "c2"])
+        # c1's group ends at the text, which stays where it was, and c2 follows
+        # it on its own rather than being pulled back into the earlier group.
+        self.assertEqual([m.role for m in result], ["model", "user", "model", "model", "user"])
+        self.assertEqual([p.function_call.id for p in result[0].parts], ["c1"])
+        self.assertEqual([p.function_response.id for p in result[1].parts], ["c1"])
         self.assertEqual(result[2].parts[0].text, "thinking out loud")
+        self.assertEqual([p.function_call.id for p in result[3].parts], ["c2"])
+        self.assertEqual([p.function_response.id for p in result[4].parts], ["c2"])
+
+    def test_merge_does_not_carry_a_call_back_across_a_user_turn(self):
+        """A call made after the user's next turn is not merged into the earlier group."""
+        messages = [
+            self._tool_call_message("c1", signature="sig-c1"),
+            self._tool_response_message("c1"),
+            Content(role="model", parts=[Part(text="First result")]),
+            Content(role="user", parts=[Part(text="Now do a separate task")]),
+            self._tool_call_message("c2"),
+            self._tool_response_message("c2"),
+        ]
+        result = self.adapter._merge_parallel_tool_calls_for_thinking(
+            [self._thought_signature_dict("c1")], messages
+        )
+
+        self.assertEqual(
+            [m.role for m in result], ["model", "user", "model", "user", "model", "user"]
+        )
+        self.assertEqual([p.function_call.id for p in result[0].parts], ["c1"])
+        self.assertEqual(result[3].parts[0].text, "Now do a separate task")
+        self.assertEqual([p.function_call.id for p in result[4].parts], ["c2"])
+
+    def test_merge_groups_a_signed_call_that_carries_text(self):
+        """Text beside a signed call still lets the call start its group, and stays first."""
+        signed_call_with_text = self._tool_call_message("c1", signature="sig-c1")
+        signed_call_with_text.parts.insert(0, Part(text="I WILL LOOK UP THE BOOKING"))
+        messages = [
+            signed_call_with_text,
+            self._tool_response_message("c1"),
+            self._tool_call_message("c2"),
+            self._tool_response_message("c2"),
+        ]
+        result = self.adapter._merge_parallel_tool_calls_for_thinking(
+            [self._thought_signature_dict("c1")], messages
+        )
+
+        self.assertEqual([m.role for m in result], ["model", "user"])
+        self.assertEqual(self._part_kinds(result[0]), ["text", "function_call", "function_call"])
+        self.assertEqual(result[0].parts[0].text, "I WILL LOOK UP THE BOOKING")
+        self.assertEqual([p.function_call.id for p in result[0].parts[1:]], ["c1", "c2"])
+        self.assertEqual([p.function_response.id for p in result[1].parts], ["c1", "c2"])
 
     def test_merge_no_thought_signatures_unchanged(self):
         """Without any function-call thought signatures, messages pass through unchanged."""
@@ -1027,6 +1070,61 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
         self.assertEqual(len(converted), 1)
         self.assertEqual(converted[0].parts[0].text, "Hello")
 
+    def _assistant_turn_with_a_call(self, content) -> LLMContext:
+        """A user turn, an assistant turn saying ``content`` beside one call, and its result."""
+        call = {
+            "id": "call_A",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        return LLMContext(
+            messages=[
+                {"role": "user", "content": "check"},
+                {"role": "assistant", "content": content, "tool_calls": [call]},
+                {"role": "tool", "content": '{"ok": true}', "tool_call_id": "call_A"},
+            ]
+        )
+
+    def test_assistant_text_precedes_its_tool_calls(self):
+        """Text the assistant said beside its tool calls leads them in the same model turn."""
+        for content in (
+            "I WILL LOOK UP THE BOOKING",
+            [{"type": "text", "text": "I WILL LOOK UP THE BOOKING"}],
+        ):
+            with self.subTest(content=content):
+                params = self.adapter.get_llm_invocation_params(
+                    self._assistant_turn_with_a_call(content)
+                )
+
+                self.assertEqual(
+                    params["messages"][1],
+                    Content(
+                        role="model",
+                        parts=[
+                            Part(text="I WILL LOOK UP THE BOOKING"),
+                            Part(function_call=FunctionCall(id="call_A", name="lookup", args={})),
+                        ],
+                    ),
+                )
+
+    def test_blank_text_beside_tool_calls_adds_no_text_part(self):
+        """Blank text beside a call adds no text part: the model turn is the call alone."""
+        for content in ("\n", "", [{"type": "text", "text": " \n"}]):
+            with self.subTest(content=content):
+                params = self.adapter.get_llm_invocation_params(
+                    self._assistant_turn_with_a_call(content)
+                )
+
+                self.assertEqual(
+                    params["messages"][1],
+                    Content(
+                        role="model",
+                        parts=[
+                            Part(function_call=FunctionCall(id="call_A", name="lookup", args={}))
+                        ],
+                    ),
+                )
+
 
 class TestGeminiLiveGetLLMInvocationParams(unittest.TestCase):
     def setUp(self) -> None:
@@ -1128,6 +1226,45 @@ class TestGeminiLiveGetLLMInvocationParams(unittest.TestCase):
         self.assertEqual(len(parts), 1)
         self.assertIn("get_weather", parts[0].text)
         self.assertIn("get_restaurant", parts[0].text)
+
+    def _assistant_turn_with_a_call(self, content) -> LLMContext:
+        """A user turn, an assistant turn saying ``content`` beside one call, and its result."""
+        call = {
+            "id": "call_A",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        return LLMContext(
+            messages=[
+                {"role": "user", "content": "check"},
+                {"role": "assistant", "content": content, "tool_calls": [call]},
+                {"role": "tool", "content": '{"ok": true}', "tool_call_id": "call_A"},
+            ]
+        )
+
+    def test_assistant_text_precedes_its_tool_call_summary(self):
+        """Text the assistant said beside its tool calls leads their summary in one turn."""
+        for content in (
+            "I WILL LOOK UP THE BOOKING",
+            [{"type": "text", "text": "I WILL LOOK UP THE BOOKING"}],
+        ):
+            with self.subTest(content=content):
+                params = self.adapter.get_llm_invocation_params(
+                    self._assistant_turn_with_a_call(content)
+                )
+
+                self.assertEqual(
+                    params["messages"][1],
+                    Content(
+                        role="model",
+                        parts=[
+                            Part(
+                                text="I WILL LOOK UP THE BOOKING"
+                                " [Called function lookup with args {}]"
+                            )
+                        ],
+                    ),
+                )
 
 
 class TestAnthropicGetLLMInvocationParams(unittest.TestCase):
@@ -1660,6 +1797,61 @@ class TestAnthropicGetLLMInvocationParams(unittest.TestCase):
         self.assertEqual(params["messages"][0]["content"], "What's the weather?")
         self.assertEqual(params["messages"][1]["content"], "It's sunny.")
 
+    def _assistant_turn_with_a_call(self, content) -> LLMContext:
+        """A user turn, an assistant turn saying ``content`` beside one call, and its result."""
+        call = {
+            "id": "call_A",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        return LLMContext(
+            messages=[
+                {"role": "user", "content": "check"},
+                {"role": "assistant", "content": content, "tool_calls": [call]},
+                {"role": "tool", "content": '{"ok": true}', "tool_call_id": "call_A"},
+            ]
+        )
+
+    def test_assistant_text_precedes_its_tool_calls(self):
+        """Text the assistant said beside its tool calls is a text block ahead of them."""
+        for content in (
+            "I WILL LOOK UP THE BOOKING",
+            [{"type": "text", "text": "I WILL LOOK UP THE BOOKING"}],
+        ):
+            with self.subTest(content=content):
+                params = self.adapter.get_llm_invocation_params(
+                    self._assistant_turn_with_a_call(content), enable_prompt_caching=False
+                )
+
+                self.assertEqual(
+                    params["messages"][1],
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "I WILL LOOK UP THE BOOKING"},
+                            {"type": "tool_use", "id": "call_A", "name": "lookup", "input": {}},
+                        ],
+                    },
+                )
+
+    def test_blank_text_beside_tool_calls_adds_no_text_block(self):
+        """Anthropic rejects a blank text block, so blank text beside a call adds none."""
+        for content in ("\n", "", [{"type": "text", "text": " \n"}]):
+            with self.subTest(content=content):
+                params = self.adapter.get_llm_invocation_params(
+                    self._assistant_turn_with_a_call(content), enable_prompt_caching=False
+                )
+
+                self.assertEqual(
+                    params["messages"][1],
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "call_A", "name": "lookup", "input": {}}
+                        ],
+                    },
+                )
+
 
 class TestAWSBedrockGetLLMInvocationParams(unittest.TestCase):
     def setUp(self) -> None:
@@ -1835,6 +2027,46 @@ class TestAWSBedrockGetLLMInvocationParams(unittest.TestCase):
         self.assertIsInstance(assistant_msg["content"], list)
         self.assertEqual(assistant_msg["content"][0]["text"], "(empty)")
         self.assertEqual(assistant_msg["content"][1]["text"], "Valid text")
+
+    def test_an_empty_content_list_falls_back_to_a_bedrock_text_block(self):
+        """An empty content list becomes a Converse text block, which has no "type" key."""
+        context = LLMContext(messages=[{"role": "user", "content": []}])
+
+        params = self.adapter.get_llm_invocation_params(context)
+
+        self.assertEqual(params["messages"][0]["content"], [{"text": "(empty)"}])
+
+    def test_merging_a_provider_specific_string_message_keeps_the_bedrock_shape(self):
+        """A string message merged with its same-role neighbour becomes a Converse text block."""
+        context = LLMContext(
+            messages=[
+                LLMSpecificMessage(llm="aws", message={"role": "user", "content": "hi"}),
+                {"role": "user", "content": "there"},
+            ]
+        )
+
+        params = self.adapter.get_llm_invocation_params(context)
+
+        self.assertEqual(params["messages"][0]["content"], [{"text": "hi"}, {"text": "there"}])
+
+    def test_botocore_accepts_the_empty_content_fallback(self):
+        """The empty-content fallback passes botocore's Converse request validation."""
+        try:
+            from botocore.session import Session
+            from botocore.validate import ParamValidator
+        except ImportError:
+            self.skipTest("botocore is not installed")
+        context = LLMContext(messages=[{"role": "user", "content": []}])
+        messages = self.adapter.get_llm_invocation_params(context)["messages"]
+
+        shape = (
+            Session().get_service_model("bedrock-runtime").operation_model("Converse").input_shape
+        )
+        report = ParamValidator().validate(
+            {"modelId": "offline-model", "messages": messages}, shape
+        )
+
+        self.assertFalse(report.has_errors(), report.generate_report())
 
     def test_complex_message_content_preserved(self):
         """Test that complex message structures (text + image) are properly converted to AWS Bedrock format."""
@@ -2130,6 +2362,61 @@ class TestAWSBedrockGetLLMInvocationParams(unittest.TestCase):
         # Adapter should have moved the image before the text.
         self.assertIn("image", content[0])
         self.assertEqual(content[1]["text"], "What do you see?")
+
+    def _assistant_turn_with_a_call(self, content) -> LLMContext:
+        """A user turn, an assistant turn saying ``content`` beside one call, and its result."""
+        call = {
+            "id": "call_A",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        return LLMContext(
+            messages=[
+                {"role": "user", "content": "check"},
+                {"role": "assistant", "content": content, "tool_calls": [call]},
+                {"role": "tool", "content": '{"ok": true}', "tool_call_id": "call_A"},
+            ]
+        )
+
+    def test_assistant_text_precedes_its_tool_calls(self):
+        """Text the assistant said beside its tool calls is a text block ahead of them."""
+        for content in (
+            "I WILL LOOK UP THE BOOKING",
+            [{"type": "text", "text": "I WILL LOOK UP THE BOOKING"}],
+        ):
+            with self.subTest(content=content):
+                params = self.adapter.get_llm_invocation_params(
+                    self._assistant_turn_with_a_call(content)
+                )
+
+                self.assertEqual(
+                    params["messages"][1],
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"text": "I WILL LOOK UP THE BOOKING"},
+                            {"toolUse": {"toolUseId": "call_A", "name": "lookup", "input": {}}},
+                        ],
+                    },
+                )
+
+    def test_blank_text_beside_tool_calls_adds_no_text_block(self):
+        """Bedrock rejects a blank text block, so blank text beside a call adds none."""
+        for content in ("\n", "", [{"type": "text", "text": " \n"}]):
+            with self.subTest(content=content):
+                params = self.adapter.get_llm_invocation_params(
+                    self._assistant_turn_with_a_call(content)
+                )
+
+                self.assertEqual(
+                    params["messages"][1],
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"toolUse": {"toolUseId": "call_A", "name": "lookup", "input": {}}}
+                        ],
+                    },
+                )
 
 
 class TestPerplexityGetLLMInvocationParams(unittest.TestCase):
@@ -2560,6 +2847,35 @@ class TestOpenAIResponsesGetLLMInvocationParams(unittest.TestCase):
         self.assertEqual(len(params["input"]), 2)
         self.assertEqual(params["input"][0]["name"], "get_weather")
         self.assertEqual(params["input"][1]["name"], "get_restaurant")
+
+    def test_assistant_text_precedes_its_tool_calls(self):
+        """Text the assistant said beside its tool calls is an assistant item ahead of them."""
+        call = {
+            "id": "call_A",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        context = LLMContext(
+            messages=[
+                {"role": "user", "content": "check"},
+                {
+                    "role": "assistant",
+                    "content": "I WILL LOOK UP THE BOOKING",
+                    "tool_calls": [call],
+                },
+                {"role": "tool", "content": '{"ok": true}', "tool_call_id": "call_A"},
+            ]
+        )
+
+        params = self.adapter.get_llm_invocation_params(context)
+
+        self.assertEqual(
+            params["input"][1:3],
+            [
+                {"role": "assistant", "content": "I WILL LOOK UP THE BOOKING"},
+                {"type": "function_call", "call_id": "call_A", "name": "lookup", "arguments": "{}"},
+            ],
+        )
 
     def test_tool_message_to_function_call_output(self):
         """Tool role messages produce function_call_output input items."""

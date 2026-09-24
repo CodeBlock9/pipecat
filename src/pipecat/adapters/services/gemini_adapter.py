@@ -418,7 +418,8 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
         Handles conversion of text, images, and function calls to Google's
         format. System and developer messages at this stage (i.e. non-initial
         ones, since the initial one is already extracted) are converted to
-        user role.
+        user role. Text beside function calls becomes parts ahead of the
+        ``function_call`` parts; blank text there adds none.
 
         Args:
             message: Message in standard universal context format.
@@ -446,6 +447,7 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
 
                 {
                     "role": "assistant",
+                    "content": "Let me search.",
                     "tool_calls": [
                         {
                             "function": {
@@ -459,8 +461,11 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
             Converts to Google Content with::
 
                 Content(
-                    role="user",
-                    parts=[Part(function_call=FunctionCall(name="search", args={"query": "test"}))]
+                    role="model",
+                    parts=[
+                        Part(text="Let me search."),
+                        Part(function_call=FunctionCall(name="search", args={"query": "test"})),
+                    ]
                 )
         """
         # ChatCompletionMessageParam (a union of TypedDicts) doesn't allow
@@ -479,21 +484,7 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
         parts = []
         tool_call_id_to_name_mapping = {}
 
-        if msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
-                id = tc["id"]
-                name = tc["function"]["name"]
-                tool_call_id_to_name_mapping[id] = name
-                parts.append(
-                    Part(
-                        function_call=FunctionCall(
-                            id=id,
-                            name=name,
-                            args=json.loads(tc["function"]["arguments"]),
-                        )
-                    )
-                )
-        elif role == "tool":
+        if role == "tool":
             role = "user"
             response_dict = self.to_function_response_dict(msg["content"])
 
@@ -548,6 +539,25 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
                         )
                     )
 
+        if msg.get("tool_calls"):
+            # Text the model said beside its calls leads them in the same model
+            # turn, as Gemini returns it; missing, empty or whitespace-only text
+            # adds nothing.
+            parts = [part for part in parts if part.text is None or part.text.strip()]
+            for tc in msg["tool_calls"]:
+                id = tc["id"]
+                name = tc["function"]["name"]
+                tool_call_id_to_name_mapping[id] = name
+                parts.append(
+                    Part(
+                        function_call=FunctionCall(
+                            id=id,
+                            name=name,
+                            args=json.loads(tc["function"]["arguments"]),
+                        )
+                    )
+                )
+
         return self.MessageConversionResult(
             content=Content(role=role, parts=parts),
             tool_call_id_to_name_mapping=tool_call_id_to_name_mapping,
@@ -583,11 +593,12 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
         Algorithm: A tool call message with a thought_signature starts a new
         parallel group. Scanning forward, subsequent unsigned tool call messages
         and their function response messages are merged into the group's single
-        model turn and single user turn respectively, and a fresh
-        thought_signature ends the group. Any other messages that happen to be
-        interleaved are collected and re-emitted after the group, so the
-        regrouping makes as few assumptions as possible about the surrounding
-        message structure.
+        model turn and single user turn respectively. A fresh thought_signature
+        ends the group, and so does any message that is neither a tool call nor
+        a tool response (text from either side, an async tool's developer
+        message included): a group never spans a conversation turn, so a call
+        made after the user's next turn is never moved ahead of it. The scan
+        then carries on from the message that ended the group.
 
         Args:
             thought_signature_dicts: A list of thought signature dicts, used
@@ -612,11 +623,16 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
             return messages
 
         def is_tool_call_message(msg: Content) -> bool:
-            """Check if message contains only function_call parts."""
+            """Check if message is a model turn of function_call parts, text beside them allowed."""
             return bool(
                 msg.role == "model"
                 and msg.parts
-                and all(getattr(part, "function_call", None) for part in msg.parts)
+                and any(getattr(part, "function_call", None) for part in msg.parts)
+                and all(
+                    getattr(part, "function_call", None)
+                    or (getattr(part, "text", None) is not None)
+                    for part in msg.parts
+                )
             )
 
         def is_tool_response_message(msg: Content) -> bool:
@@ -643,12 +659,11 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
             if is_tool_call_message(current) and message_has_thought_signature(current):
                 merged_parts = list(current.parts or [])
                 merged_response_parts = []
-                other_messages = []
                 j = i + 1
 
                 # Scan forward: merge unsigned tool calls and their responses
-                # into the group, collecting any other interleaved messages to
-                # re-emit afterward. A fresh thought signature ends the group.
+                # into the group. A fresh thought signature, or any message
+                # that is neither a tool call nor a tool response, ends it.
                 while j < len(messages):
                     next_msg = messages[j]
                     if is_tool_call_message(next_msg):
@@ -663,18 +678,15 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
                         merged_response_parts.extend(next_msg.parts or [])
                         j += 1
                     else:
-                        # Some other message is interleaved within the group;
-                        # collect it and keep scanning for this group's calls
-                        # and responses.
-                        other_messages.append(next_msg)
-                        j += 1
+                        # A conversation turn (text, or an async tool's
+                        # developer message) ends the group; a later call is
+                        # not pulled back across it.
+                        break
 
-                # Output the merged calls, then the merged responses, then any
-                # other messages that were interleaved within the group.
+                # Output the merged calls, then the merged responses.
                 merged_messages.append(Content(role="model", parts=merged_parts))
                 if merged_response_parts:
                     merged_messages.append(Content(role="user", parts=merged_response_parts))
-                merged_messages.extend(other_messages)
                 i = j
             else:
                 merged_messages.append(current)

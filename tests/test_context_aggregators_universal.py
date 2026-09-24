@@ -94,7 +94,9 @@ from pipecat.turns.user_turn_strategies import (
     FilterIncompleteUserTurnStrategies,
     UserTurnStrategies,
 )
+from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.utils.text.base_text_aggregator import AggregationType
+from tests.frame_processor_helpers import frame_processor_setup
 
 USER_TURN_STOP_TIMEOUT = 0.2
 TRANSCRIPTION_TIMEOUT = 0.1
@@ -1149,6 +1151,33 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["content"] for m in user_messages], ["I'm thinking", "about pizza"])
 
 
+def _lookup_in_progress(*, cancel_on_interruption: bool = True) -> FunctionCallInProgressFrame:
+    return FunctionCallInProgressFrame(
+        function_name="lookup",
+        tool_call_id="1",
+        arguments={},
+        cancel_on_interruption=cancel_on_interruption,
+    )
+
+
+def _lookup_result(result, *, properties=None) -> FunctionCallResultFrame:
+    return FunctionCallResultFrame(
+        function_name="lookup",
+        tool_call_id="1",
+        arguments={},
+        result=result,
+        properties=properties,
+    )
+
+
+async def _run_lookup(frames) -> tuple[LLMContext, list[str]]:
+    """Run the frames through a real assistant aggregator; return its context and upstream frames."""
+    context = LLMContext()
+    aggregator = LLMAssistantAggregator(context)
+    _, up = await run_test(aggregator, frames_to_send=frames, expected_down_frames=[])
+    return context, [type(f).__name__ for f in up]
+
+
 class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
     async def test_empty(self):
         context = LLMContext()
@@ -1787,6 +1816,75 @@ class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
         assert json.loads(context.messages[-1]["content"]) == {"conditions": "Sunny"}
         assert context_updated
 
+    async def test_a_falsey_final_result_is_stored_as_its_value_and_runs_inference(self):
+        """False, 0, "", [] and {} are answers: each is stored as its JSON value and runs inference."""
+        for value in (False, 0, "", [], {}):
+            with self.subTest(value=value):
+                context, up = await _run_lookup(
+                    [_lookup_in_progress(), SleepFrame(), _lookup_result(value)]
+                )
+                stored = context.messages[-1]["content"]
+                self.assertEqual(
+                    stored,
+                    json.dumps(value, ensure_ascii=False),
+                    f"{value!r} was stored as {stored!r}",
+                )
+                self.assertEqual(up, ["LLMContextFrame"], f"{value!r} ran no inference: {up}")
+
+    async def test_an_explicit_run_llm_is_honoured_for_a_falsey_result(self):
+        """run_llm=True on a falsey result runs inference."""
+        _, up = await _run_lookup(
+            [
+                _lookup_in_progress(),
+                SleepFrame(),
+                _lookup_result([], properties=FunctionCallResultProperties(run_llm=True)),
+            ]
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"explicit run_llm=True ran no inference: {up}")
+
+    async def test_a_falsey_intermediate_result_reaches_the_context(self):
+        """An intermediate [] is recorded, not dropped as if there were no result."""
+        context, _ = await _run_lookup(
+            [
+                _lookup_in_progress(cancel_on_interruption=False),
+                SleepFrame(),
+                _lookup_result([], properties=FunctionCallResultProperties(is_final=False)),
+            ]
+        )
+        payload = async_tool_messages.parse_message(context.messages[-1])
+        self.assertIsNotNone(payload, f"no async-tool message: {context.messages[-1]}")
+        self.assertEqual(
+            (payload.kind, payload.result),
+            ("intermediate", "[]"),
+            f"the intermediate [] was dropped; the last message is the {payload.kind} one",
+        )
+
+    async def test_control_a_missing_result_is_stored_as_completed(self):
+        """None is the documented absence of a result: stored as COMPLETED, no inference."""
+        context, up = await _run_lookup([_lookup_in_progress(), SleepFrame(), _lookup_result(None)])
+        self.assertEqual(context.messages[-1]["content"], "COMPLETED")
+        self.assertEqual(up, [])
+
+    async def test_an_explicit_run_llm_is_honoured_for_a_missing_result(self):
+        """run_llm=True runs inference even when the function returned nothing."""
+        context, up = await _run_lookup(
+            [
+                _lookup_in_progress(),
+                SleepFrame(),
+                _lookup_result(None, properties=FunctionCallResultProperties(run_llm=True)),
+            ]
+        )
+        self.assertEqual(context.messages[-1]["content"], "COMPLETED")
+        self.assertEqual(up, ["LLMContextFrame"], f"explicit run_llm=True ran no inference: {up}")
+
+    async def test_control_a_truthy_result_runs_inference(self):
+        """A non-empty result is stored and inference runs."""
+        context, up = await _run_lookup(
+            [_lookup_in_progress(), SleepFrame(), _lookup_result({"conditions": "Sunny"})]
+        )
+        self.assertEqual(json.loads(context.messages[-1]["content"]), {"conditions": "Sunny"})
+        self.assertEqual(up, ["LLMContextFrame"])
+
     async def test_thought(self):
         context = LLMContext()
 
@@ -2279,6 +2377,190 @@ class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
         names = await self._run_proposals_through_assistant(LLMAssistantAggregator(LLMContext()))
         self.assertIn("ProposedUserStartedSpeakingFrame", names)
         self.assertIn("ProposedUserStoppedSpeakingFrame", names)
+
+
+class UpstreamCollector(FrameProcessor):
+    """Direct-mode neighbour: forwards downstream frames, records upstream ones."""
+
+    def __init__(self):
+        super().__init__(enable_direct_mode=True)
+        self.upstream: list[Frame] = []
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if direction == FrameDirection.UPSTREAM:
+            self.upstream.append(frame)
+        else:
+            await self.push_frame(frame, direction)
+
+
+_QUEUED_RESULT_DEFERRAL = "More FunctionCallResultFrames queued"
+
+
+def _tool_in_progress(
+    tool_call_id: str, group_id: str | None = None
+) -> FunctionCallInProgressFrame:
+    return FunctionCallInProgressFrame(
+        function_name=f"tool_{tool_call_id}",
+        tool_call_id=tool_call_id,
+        arguments={},
+        cancel_on_interruption=True,
+        group_id=group_id,
+    )
+
+
+def _tool_result(
+    tool_call_id: str, *, run_llm: bool | None = None, properties=None
+) -> FunctionCallResultFrame:
+    return FunctionCallResultFrame(
+        function_name=f"tool_{tool_call_id}",
+        tool_call_id=tool_call_id,
+        arguments={},
+        result={tool_call_id: "ready"},
+        run_llm=run_llm,
+        properties=properties,
+    )
+
+
+async def _drive_queued_results(
+    in_progress: list[FunctionCallInProgressFrame], *batches: list[FunctionCallResultFrame]
+) -> tuple[list[str], list[str]]:
+    """Queue result frames on a real assistant aggregator, one batch at a time.
+
+    The aggregator runs on a task manager with a direct-mode collector linked
+    upstream (``run_test`` cannot guarantee that two frames are queued together).
+    Each batch is queued back to back, with no yield between the puts, so its
+    later results sit in the processing queue while the aggregator handles the
+    first. Returns the names of the frames pushed upstream and the queued-result
+    deferrals logged. The processors are torn down through their real ``cleanup()``.
+    """
+    messages: list[str] = []
+    sink = logger.add(lambda m: messages.append(m.record["message"]), level="DEBUG")
+    task_manager = TaskManager(loop=asyncio.get_running_loop())
+    aggregator = LLMAssistantAggregator(LLMContext())
+    collector = UpstreamCollector()
+    collector.link(aggregator)
+    setup = frame_processor_setup(task_manager)
+    await collector.setup(setup)
+    await aggregator.setup(setup)
+    try:
+        await collector.queue_frame(StartFrame())
+        await asyncio.sleep(0.05)
+        for frame in in_progress:
+            await aggregator.queue_frame(frame)
+        await asyncio.sleep(0.05)
+        for batch in batches:
+            for frame in batch:
+                await aggregator.queue_frame(frame)
+            await asyncio.sleep(0.3)
+        return [type(f).__name__ for f in collector.upstream], [
+            m for m in messages if _QUEUED_RESULT_DEFERRAL in m
+        ]
+    finally:
+        await aggregator.cleanup()
+        await collector.cleanup()
+        logger.remove(sink)
+
+
+class TestDeferredInferenceIntent(unittest.IsolatedAsyncioTestCase):
+    async def test_inference_owed_by_a_deferred_result_is_still_run(self):
+        """A (run_llm=True) defers behind queued B (run_llm=False); A's inference still runs."""
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a"), _tool_in_progress("b")],
+            [_tool_result("a", run_llm=True), _tool_result("b", run_llm=False)],
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"upstream frames: {up}")
+
+    async def test_inference_owed_by_a_deferred_result_survives_a_result_for_an_unknown_call(self):
+        """A defers behind a queued result for a call that is not running; A's inference runs."""
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a")],
+            [_tool_result("a", run_llm=True), _tool_result("unknown")],
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"upstream frames: {up}")
+
+    async def test_owed_inference_waits_for_the_group_of_the_call_that_settled(self):
+        """B settles while its group sibling C runs: the owed push waits, and C's result pushes once."""
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a"), _tool_in_progress("b", "g1"), _tool_in_progress("c", "g1")],
+            [_tool_result("a", run_llm=True), _tool_result("b")],
+            [_tool_result("c")],
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"upstream frames: {up}")
+
+    async def test_control_a_single_result_runs_inference(self):
+        """One result asking for inference pushes the context once."""
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a")], [_tool_result("a", run_llm=True)]
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"upstream frames: {up}")
+
+    async def test_control_two_queued_results_run_inference_once(self):
+        """Both ask, one bundled push results (and a harness check).
+
+        Two pushes here would mean B was not queued while A was handled, and the
+        tests above would be measuring the harness rather than the aggregator.
+        """
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a"), _tool_in_progress("b")],
+            [_tool_result("a", run_llm=True), _tool_result("b", run_llm=True)],
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"upstream frames: {up}")
+
+    async def test_a_shared_group_never_reaches_the_queued_deferral(self):
+        """With a group id, A computes run_llm=False while S runs, so nothing defers or pushes.
+
+        S settles last with an explicit run_llm=False (a stale-request result). The
+        group rule holds the inference, and the queued-result deferral never fires.
+        """
+        up, deferrals = await _drive_queued_results(
+            [_tool_in_progress("a", "g1"), _tool_in_progress("s", "g1")],
+            [
+                _tool_result("a"),
+                _tool_result("s", properties=FunctionCallResultProperties(run_llm=False)),
+            ],
+        )
+        self.assertEqual(deferrals, [], "A reached the queued-result deferral")
+        self.assertEqual(up, [], f"upstream frames: {up}")
+
+    async def test_a_cancel_that_settles_the_group_runs_the_owed_inference(self):
+        """B settles while C of its group runs; C is then cancelled: the owed push goes out once."""
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a"), _tool_in_progress("b", "g1"), _tool_in_progress("c", "g1")],
+            [_tool_result("a", run_llm=True), _tool_result("b")],
+            [FunctionCallCancelFrame(function_name="tool_c", tool_call_id="c")],
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"upstream frames: {up}")
+
+    async def test_an_interruption_drops_the_owed_inference(self):
+        """The owed push waits on B's group; an interruption then drops it."""
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a"), _tool_in_progress("b", "g1"), _tool_in_progress("c", "g1")],
+            [_tool_result("a", run_llm=True), _tool_result("b")],
+            [InterruptionFrame()],
+            [_tool_result("c", properties=FunctionCallResultProperties(run_llm=False))],
+        )
+        self.assertEqual(up, [], f"upstream frames: {up}")
+
+    async def test_the_owed_inference_is_dropped_while_the_user_speaks(self):
+        """C settles B's group while the user speaks: the owed push is dropped with C's own.
+
+        A later result that declines inference (X) must not run it.
+        """
+        up, _ = await _drive_queued_results(
+            [
+                _tool_in_progress("a"),
+                _tool_in_progress("b", "g1"),
+                _tool_in_progress("c", "g1"),
+                _tool_in_progress("x"),
+            ],
+            [_tool_result("a", run_llm=True), _tool_result("b")],
+            [UserStartedSpeakingFrame()],
+            [_tool_result("c")],
+            [UserStoppedSpeakingFrame()],
+            [_tool_result("x", properties=FunctionCallResultProperties(run_llm=False))],
+        )
+        self.assertEqual(up, [], f"upstream frames: {up}")
 
 
 def _function_schema(name: str) -> FunctionSchema:

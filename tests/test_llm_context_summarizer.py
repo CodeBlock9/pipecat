@@ -761,5 +761,76 @@ class TestLLMContextSummarizer(unittest.IsolatedAsyncioTestCase):
         await summarizer.cleanup()
 
 
+def _prefixed_messages(prefix: str) -> list[dict]:
+    return [{"role": "system", "content": "base"}] + [
+        {"role": "user", "content": f"{prefix}{i}"} for i in range(15)
+    ]
+
+
+class TestSummaryOfAReplacedContext(unittest.IsolatedAsyncioTestCase):
+    async def _summarizer_with_a_pending_request(self):
+        context = LLMContext(messages=_prefixed_messages("old"))
+        config = LLMAutoContextSummarizationConfig(
+            max_context_tokens=50,
+            summary_config=LLMContextSummaryConfig(min_messages_after_summary=2),
+        )
+        summarizer = LLMContextSummarizer(context=context, config=config)
+        await summarizer.setup(frame_processor_setup(TaskManager()))
+
+        request = None
+
+        @summarizer.event_handler("on_request_summarization")
+        async def on_request_summarization(summarizer, frame):
+            nonlocal request
+            request = frame
+
+        await summarizer.process_frame(LLMFullResponseStartFrame())
+        self.assertIsNotNone(request, "the harness did not trigger a summarization request")
+        return context, summarizer, request
+
+    async def test_a_summary_of_a_replaced_context_is_not_applied(self):
+        """A summary of messages that were replaced while it was made is discarded."""
+        context, summarizer, request = await self._summarizer_with_a_pending_request()
+        try:
+            context.set_messages(_prefixed_messages("NEW"))
+            await summarizer.process_frame(
+                LLMContextSummaryResultFrame(
+                    request_id=request.request_id,
+                    summary="SUMMARY OF OLD MESSAGES",
+                    last_summarized_index=5,
+                    error=None,
+                )
+            )
+            contents = [m["content"] for m in context.messages]
+            self.assertEqual(
+                contents,
+                [m["content"] for m in _prefixed_messages("NEW")],
+                f"context after the stale summary: {contents}",
+            )
+        finally:
+            await summarizer.cleanup()
+
+    async def test_control_a_summary_of_an_appended_to_context_is_applied(self):
+        """Messages appended while the summary ran are kept, and it applies."""
+        context, summarizer, request = await self._summarizer_with_a_pending_request()
+        try:
+            context.add_message({"role": "user", "content": "late0"})
+            context.add_message({"role": "assistant", "content": "late1"})
+            await summarizer.process_frame(
+                LLMContextSummaryResultFrame(
+                    request_id=request.request_id,
+                    summary="SUMMARY",
+                    last_summarized_index=5,
+                    error=None,
+                )
+            )
+            contents = [m["content"] for m in context.messages]
+            self.assertEqual(contents[0], "base")
+            self.assertIn("SUMMARY", contents[1])
+            self.assertEqual(contents[2:], [f"old{i}" for i in range(5, 15)] + ["late0", "late1"])
+        finally:
+            await summarizer.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()
