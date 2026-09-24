@@ -779,7 +779,12 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
             try:
                 evt = events.parse_server_event(message)
             except Exception as e:
-                logger.warning(f"Failed to parse server event: {e}")
+                # The error repeats the raw event, which can hold a transcript or
+                # audio, so only its first line is logged, with the event's type.
+                first_line = str(e).split("\n", 1)[0].strip()
+                logger.warning(
+                    f"{self} Failed to parse server event of type {event_type}: {first_line}"
+                )
                 continue
 
             # Unrecognized event type (e.g. newer realtime server events without a
