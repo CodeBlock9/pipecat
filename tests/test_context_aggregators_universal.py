@@ -94,7 +94,9 @@ from pipecat.turns.user_turn_strategies import (
     FilterIncompleteUserTurnStrategies,
     UserTurnStrategies,
 )
+from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.utils.text.base_text_aggregator import AggregationType
+from tests.frame_processor_helpers import frame_processor_setup
 
 USER_TURN_STOP_TIMEOUT = 0.2
 TRANSCRIPTION_TIMEOUT = 0.1
@@ -2375,6 +2377,151 @@ class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
         names = await self._run_proposals_through_assistant(LLMAssistantAggregator(LLMContext()))
         self.assertIn("ProposedUserStartedSpeakingFrame", names)
         self.assertIn("ProposedUserStoppedSpeakingFrame", names)
+
+
+class UpstreamCollector(FrameProcessor):
+    """Direct-mode neighbour: forwards downstream frames, records upstream ones."""
+
+    def __init__(self):
+        super().__init__(enable_direct_mode=True)
+        self.upstream: list[Frame] = []
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if direction == FrameDirection.UPSTREAM:
+            self.upstream.append(frame)
+        else:
+            await self.push_frame(frame, direction)
+
+
+_QUEUED_RESULT_DEFERRAL = "More FunctionCallResultFrames queued"
+
+
+def _tool_in_progress(
+    tool_call_id: str, group_id: str | None = None
+) -> FunctionCallInProgressFrame:
+    return FunctionCallInProgressFrame(
+        function_name=f"tool_{tool_call_id}",
+        tool_call_id=tool_call_id,
+        arguments={},
+        cancel_on_interruption=True,
+        group_id=group_id,
+    )
+
+
+def _tool_result(
+    tool_call_id: str, *, run_llm: bool | None = None, properties=None
+) -> FunctionCallResultFrame:
+    return FunctionCallResultFrame(
+        function_name=f"tool_{tool_call_id}",
+        tool_call_id=tool_call_id,
+        arguments={},
+        result={tool_call_id: "ready"},
+        run_llm=run_llm,
+        properties=properties,
+    )
+
+
+async def _drive_queued_results(
+    in_progress: list[FunctionCallInProgressFrame], *batches: list[FunctionCallResultFrame]
+) -> tuple[list[str], list[str]]:
+    """Queue result frames on a real assistant aggregator, one batch at a time.
+
+    The aggregator runs on a task manager with a direct-mode collector linked
+    upstream (``run_test`` cannot guarantee that two frames are queued together).
+    Each batch is queued back to back, with no yield between the puts, so its
+    later results sit in the processing queue while the aggregator handles the
+    first. Returns the names of the frames pushed upstream and the queued-result
+    deferrals logged. The processors are torn down through their real ``cleanup()``.
+    """
+    messages: list[str] = []
+    sink = logger.add(lambda m: messages.append(m.record["message"]), level="DEBUG")
+    task_manager = TaskManager(loop=asyncio.get_running_loop())
+    aggregator = LLMAssistantAggregator(LLMContext())
+    collector = UpstreamCollector()
+    collector.link(aggregator)
+    setup = frame_processor_setup(task_manager)
+    await collector.setup(setup)
+    await aggregator.setup(setup)
+    try:
+        await collector.queue_frame(StartFrame())
+        await asyncio.sleep(0.05)
+        for frame in in_progress:
+            await aggregator.queue_frame(frame)
+        await asyncio.sleep(0.05)
+        for batch in batches:
+            for frame in batch:
+                await aggregator.queue_frame(frame)
+            await asyncio.sleep(0.3)
+        return [type(f).__name__ for f in collector.upstream], [
+            m for m in messages if _QUEUED_RESULT_DEFERRAL in m
+        ]
+    finally:
+        await aggregator.cleanup()
+        await collector.cleanup()
+        logger.remove(sink)
+
+
+class TestDeferredInferenceIntent(unittest.IsolatedAsyncioTestCase):
+    async def test_inference_owed_by_a_deferred_result_is_still_run(self):
+        """A (run_llm=True) defers behind queued B (run_llm=False); A's inference still runs."""
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a"), _tool_in_progress("b")],
+            [_tool_result("a", run_llm=True), _tool_result("b", run_llm=False)],
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"upstream frames: {up}")
+
+    async def test_inference_owed_by_a_deferred_result_survives_a_result_for_an_unknown_call(self):
+        """A defers behind a queued result for a call that is not running; A's inference runs."""
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a")],
+            [_tool_result("a", run_llm=True), _tool_result("unknown")],
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"upstream frames: {up}")
+
+    async def test_owed_inference_waits_for_the_group_of_the_call_that_settled(self):
+        """B settles while its group sibling C runs: the owed push waits, and C's result pushes once."""
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a"), _tool_in_progress("b", "g1"), _tool_in_progress("c", "g1")],
+            [_tool_result("a", run_llm=True), _tool_result("b")],
+            [_tool_result("c")],
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"upstream frames: {up}")
+
+    async def test_control_a_single_result_runs_inference(self):
+        """One result asking for inference pushes the context once."""
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a")], [_tool_result("a", run_llm=True)]
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"upstream frames: {up}")
+
+    async def test_control_two_queued_results_run_inference_once(self):
+        """Both ask, one bundled push results (and a harness check).
+
+        Two pushes here would mean B was not queued while A was handled, and the
+        tests above would be measuring the harness rather than the aggregator.
+        """
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a"), _tool_in_progress("b")],
+            [_tool_result("a", run_llm=True), _tool_result("b", run_llm=True)],
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"upstream frames: {up}")
+
+    async def test_a_shared_group_never_reaches_the_queued_deferral(self):
+        """With a group id, A computes run_llm=False while S runs, so nothing defers or pushes.
+
+        S settles last with an explicit run_llm=False (a stale-request result). The
+        group rule holds the inference, and the queued-result deferral never fires.
+        """
+        up, deferrals = await _drive_queued_results(
+            [_tool_in_progress("a", "g1"), _tool_in_progress("s", "g1")],
+            [
+                _tool_result("a"),
+                _tool_result("s", properties=FunctionCallResultProperties(run_llm=False)),
+            ],
+        )
+        self.assertEqual(deferrals, [], "A reached the queued-result deferral")
+        self.assertEqual(up, [], f"upstream frames: {up}")
 
 
 def _function_schema(name: str) -> FunctionSchema:

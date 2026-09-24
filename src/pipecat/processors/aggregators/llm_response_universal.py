@@ -1544,6 +1544,13 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # arriving in the same speaking window are bundled into a single deferred push.
         self._push_context_on_bot_stopped_speaking: bool = False
 
+        # When a function call result asks for inference while another result is
+        # queued, the push is deferred so the queued results are bundled into a
+        # single LLM call. The queued results may not push it themselves (they can
+        # decline inference, or be dropped as not running), so this flag records
+        # that the inference is still owed until a context frame is pushed.
+        self._push_context_after_queued_results: bool = False
+
         self._assistant_turn_start_timestamp = ""
 
         # Whether the generation now in flight has produced anything at all.
@@ -1604,6 +1611,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
         await super().reset()
         await self._reset_thought_aggregation()  # Just to be safe
         self._push_context_on_bot_stopped_speaking = False
+        self._push_context_after_queued_results = False
 
     async def _reset_thought_aggregation(self):
         """Reset the thought aggregation state."""
@@ -1672,9 +1680,13 @@ class LLMAssistantAggregator(LLMContextAggregator):
         elif isinstance(frame, FunctionCallInProgressFrame):
             await self._handle_function_call_in_progress(frame)
         elif isinstance(frame, FunctionCallResultFrame):
+            call = self._function_calls_in_progress.get(frame.tool_call_id)
             await self._handle_function_call_result(frame)
+            await self._maybe_push_context_owed_after_queued_results(call)
         elif isinstance(frame, FunctionCallCancelFrame):
+            call = self._function_calls_in_progress.get(frame.tool_call_id)
             await self._handle_function_call_cancel(frame)
+            await self._maybe_push_context_owed_after_queued_results(call)
         elif isinstance(frame, UserImageRawFrame):
             await self._handle_user_image_frame(frame)
         elif isinstance(frame, AssistantImageRawFrame):
@@ -1797,6 +1809,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
         """
         await super().push_context_frame(direction)
         self._push_context_on_bot_stopped_speaking = False
+        self._push_context_after_queued_results = False
 
     async def _handle_llm_run(self, frame: LLMRunFrame):
         await self.push_context_frame(FrameDirection.UPSTREAM)
@@ -1969,11 +1982,13 @@ class LLMAssistantAggregator(LLMContextAggregator):
         if self.has_queued_frame(FunctionCallResultFrame):
             # Another FunctionCallResultFrame is already queued. Defer the context push
             # to bundle all results into a single LLM call instead of triggering one
-            # inference pass per result. The context will be pushed once the last
-            # function call in the queue is processed.
+            # inference pass per result. The push is owed until a context frame goes
+            # out: a queued result that asks for inference sends it, and otherwise
+            # _maybe_push_context_owed_after_queued_results does once the queue drains.
             logger.debug(
                 f"{self}: More FunctionCallResultFrames queued — deferring context frame push."
             )
+            self._push_context_after_queued_results = True
         elif self._bot_speaking:
             # Defer the context frame push until the bot finishes speaking. If multiple
             # function call results arrive while the bot is speaking, they all accumulate
@@ -1986,6 +2001,41 @@ class LLMAssistantAggregator(LLMContextAggregator):
         else:
             logger.debug(f"{self}: Pushing context frame!")
             await self.push_context_frame(FrameDirection.UPSTREAM)
+
+    async def _maybe_push_context_owed_after_queued_results(
+        self, call: FunctionCallInProgressFrame | None
+    ) -> None:
+        """Run the inference a result deferred behind a queued result is still owed.
+
+        Runs after every ``FunctionCallResultFrame`` and ``FunctionCallCancelFrame``,
+        including one dropped because its call is not running. Once no result is
+        queued, the owed push goes out through
+        ``_maybe_push_context_after_function_result``, unless the user is speaking
+        or another call of the settling call's group is still running: that group's
+        last result runs inference, and pushing here too would run it twice.
+
+        Args:
+            call: The settling call's in-progress frame, read before its handler
+                ran, or None if the call was not running.
+        """
+        if (
+            not self._push_context_after_queued_results
+            or self._user_speaking
+            or self.has_queued_frame(FunctionCallResultFrame)
+        ):
+            return
+        if (
+            call
+            and call.group_id
+            and any(
+                f is not None
+                and f.group_id == call.group_id
+                and f.tool_call_id != call.tool_call_id
+                for f in self._function_calls_in_progress.values()
+            )
+        ):
+            return
+        await self._maybe_push_context_after_function_result()
 
     async def _handle_function_call_intermediate_result(
         self, frame: FunctionCallResultFrame, in_progress_frame: FunctionCallInProgressFrame
