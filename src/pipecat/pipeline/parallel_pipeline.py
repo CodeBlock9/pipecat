@@ -22,9 +22,11 @@ from pipecat.pipeline.pipeline import Pipeline, PipelineSink, PipelineSource
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 
 # How many frame ids are remembered to recognise a frame's copy from another
-# branch. A copy trails its original by at most the time a branch holds a
-# frame; 1,024 ids is about 20 s of 20 ms input audio, longer than a
-# classifier generation.
+# branch: about 20 s of 20 ms input audio, longer than a healthy classifier
+# generation. A copy that trails its original by more frames than this is
+# pushed again: one held behind a generation stalled that long, or every frame
+# of a backlog that size reaching the pipeline at once, since the late copies'
+# own ids then push out the ids still waiting for their copies.
 SEEN_IDS_MAX = 1024
 
 
