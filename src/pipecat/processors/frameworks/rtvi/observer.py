@@ -230,10 +230,12 @@ _RTVI_OBSERVED_FRAME_TYPES: tuple[type[Frame], ...] = (
     TTSAudioRawFrame,
 )
 
-#: How many frame ids ``RTVIObserver`` keeps to skip a frame it has already
-#: handled, the oldest dropped first. A frame is observed again at each
-#: processor that pushes it, soon after the first time; 10,000 ids are more
-#: than a minute and a half of frames with both audio-level messages on.
+#: How many frame ids each of ``RTVIObserver``'s two dedups keeps to skip a
+#: frame it has already handled, the oldest dropped first. A frame is observed
+#: again at each processor that pushes it, and a frame the output transport
+#: holds behind the bot's audio only once that audio has played. Audio with a
+#: level message on, about 100 ids a second, has a dedup of its own, so it
+#: cannot push such a frame's id out before its copy arrives.
 _FRAMES_SEEN_MAX = 10_000
 
 
@@ -279,6 +281,7 @@ class RTVIObserver(BaseObserver):
 
         self._ignored_sources: set[FrameProcessor] = set(self._params.ignored_sources)
         self._frames_seen: OrderedDict[int, None] = OrderedDict()
+        self._audio_frames_seen: OrderedDict[int, None] = OrderedDict()
 
         self._bot_transcription = ""
         self._last_user_audio_level = 0
@@ -483,14 +486,20 @@ class RTVIObserver(BaseObserver):
             return
 
         # Audio whose level message is off has nothing to report, so it stays
-        # out of the dedup below: it is most of the frames the observer sees.
+        # out of the dedups below: it is most of the frames the observer sees.
         if isinstance(frame, InputAudioRawFrame) and not self._params.user_audio_level_enabled:
             return
         if isinstance(frame, TTSAudioRawFrame) and not self._params.bot_audio_level_enabled:
             return
 
-        # If we have already seen this frame, let's skip it.
-        if frame.id in self._frames_seen:
+        # If we have already seen this frame, let's skip it. Audio has its own
+        # dedup, so it cannot push out a frame whose copy is still to come.
+        frames_seen = (
+            self._audio_frames_seen
+            if isinstance(frame, (InputAudioRawFrame, TTSAudioRawFrame))
+            else self._frames_seen
+        )
+        if frame.id in frames_seen:
             return
 
         # This tells whether the frame is already processed. If false, we will try
@@ -655,9 +664,9 @@ class RTVIObserver(BaseObserver):
                 self._last_bot_audio_level = curr_time
 
         if mark_as_seen:
-            self._frames_seen[frame.id] = None
-            if len(self._frames_seen) > _FRAMES_SEEN_MAX:
-                self._frames_seen.popitem(last=False)
+            frames_seen[frame.id] = None
+            if len(frames_seen) > _FRAMES_SEEN_MAX:
+                frames_seen.popitem(last=False)
 
     async def _handle_interruptions(self, frame: Frame):
         """Handle user speaking interruption frames."""

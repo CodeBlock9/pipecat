@@ -22,6 +22,9 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     InputAudioRawFrame,
     InterruptionFrame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
 )
 from pipecat.observers.base_observer import FramePushed
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -63,28 +66,41 @@ def _bot_output(sent) -> list[str]:
     return [m.data.text for m in sent if isinstance(m, RTVI.BotOutputMessage)]
 
 
+def _user_audio() -> InputAudioRawFrame:
+    return InputAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1)
+
+
+def _bot_audio() -> TTSAudioRawFrame:
+    return TTSAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1)
+
+
 class TestFramesSeen(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_audio_levels_leave_no_trace(self):
-        """15,000 audio frames with the level messages off: no message, and no id kept."""
+        """15,000 frames of each audio kind with the level messages off: no message, no id kept."""
         observer, sent = _observer()  # user and bot audio levels are off by default
         for _ in range(15_000):
-            await _push(
-                observer,
-                InputAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1),
-                source=OTHER,
-            )
+            await _push(observer, _user_audio(), source=OTHER)
+            await _push(observer, _bot_audio(), source=OTHER)
         self.assertEqual(sent, [])
-        self.assertEqual(len(observer._frames_seen), 0)
+        self.assertEqual(len(observer._frames_seen) + len(observer._audio_frames_seen), 0)
 
-    async def test_the_dedup_is_bounded(self):
+    async def test_the_dedups_are_bounded(self):
         observer, sent = _observer(user_audio_level_enabled=True, audio_level_period_secs=3600)
         for _ in range(15_000):
-            await _push(
-                observer,
-                InputAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1),
-                source=OTHER,
-            )
+            await _push(observer, _user_audio(), source=OTHER)
+            await _push(observer, TTSStartedFrame(), source=OTHER)
+        self.assertLessEqual(len(observer._audio_frames_seen), 10_000)
         self.assertLessEqual(len(observer._frames_seen), 10_000)
+
+    async def test_audio_cannot_push_out_a_frame_whose_copy_is_still_to_come(self):
+        """The output transport pushes a TTSStoppedFrame again once the audio ahead of it has played."""
+        observer, sent = _observer(user_audio_level_enabled=True, audio_level_period_secs=3600)
+        stopped = TTSStoppedFrame()
+        await _push(observer, stopped, source=OTHER)
+        for _ in range(15_000):
+            await _push(observer, _user_audio(), source=OTHER)
+        await _push(observer, stopped)
+        self.assertEqual(sum(isinstance(m, RTVI.BotTTSStoppedMessage) for m in sent), 1)
 
     async def test_a_frame_seen_twice_is_handled_once(self):
         observer, sent = _observer()
