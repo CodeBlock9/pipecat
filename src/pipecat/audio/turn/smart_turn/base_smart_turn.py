@@ -70,6 +70,8 @@ class BaseSmartTurn(BaseTurnAnalyzer):
         self._stop_ms = self._params.stop_secs * 1000  # silence threshold in ms
         # Inference state
         self._audio_buffer = []
+        # Samples held in _audio_buffer, counted at every append and pop.
+        self._buffered_samples = 0
         self._speech_triggered = False
         self._silence_ms = 0
         self._speech_start_time = 0
@@ -116,6 +118,7 @@ class BaseSmartTurn(BaseTurnAnalyzer):
         # mutating the buffer this view points at.
         audio_int16 = np.frombuffer(buffer, dtype=np.int16)
         self._audio_buffer.append((time.monotonic(), audio_int16))
+        self._buffered_samples += len(audio_int16)
 
         state = EndOfTurnState.INCOMPLETE
 
@@ -147,7 +150,17 @@ class BaseSmartTurn(BaseTurnAnalyzer):
                     self._audio_buffer
                     and self._audio_buffer[0][0] < time.monotonic() - max_buffer_time
                 ):
-                    self._audio_buffer.pop(0)
+                    self._buffered_samples -= len(self._audio_buffer.pop(0)[1])
+
+        if self._speech_triggered:
+            # A prediction reads only the last max_duration_secs of audio, so
+            # during speech drop the oldest chunks that window no longer needs.
+            max_samples = int(self._params.max_duration_secs * self.sample_rate)
+            while (
+                len(self._audio_buffer) > 1
+                and self._buffered_samples - len(self._audio_buffer[0][1]) >= max_samples
+            ):
+                self._buffered_samples -= len(self._audio_buffer.pop(0)[1])
 
         return state
 
@@ -196,12 +209,14 @@ class BaseSmartTurn(BaseTurnAnalyzer):
                 self._executor.shutdown(wait=False)
                 self._executor = None
             self._audio_buffer = []
+            self._buffered_samples = 0
 
     def _clear(self, turn_state: EndOfTurnState):
         """Clear internal state based on turn completion status."""
         # If the state is still incomplete, keep the _speech_triggered as True
         self._speech_triggered = turn_state == EndOfTurnState.INCOMPLETE
         self._audio_buffer = []
+        self._buffered_samples = 0
         self._speech_start_time = 0
         self._silence_ms = 0
 
