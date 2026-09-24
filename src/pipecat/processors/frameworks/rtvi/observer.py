@@ -9,6 +9,7 @@
 import inspect
 import time
 import warnings
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -229,6 +230,14 @@ _RTVI_OBSERVED_FRAME_TYPES: tuple[type[Frame], ...] = (
     TTSAudioRawFrame,
 )
 
+#: How many frame ids each of ``RTVIObserver``'s two dedups keeps to skip a
+#: frame it has already handled, the oldest dropped first. A frame is observed
+#: again at each processor that pushes it, and a frame the output transport
+#: holds behind the bot's audio only once that audio has played. Audio with a
+#: level message on, about 100 ids a second, has a dedup of its own, so it
+#: cannot push such a frame's id out before its copy arrives.
+_FRAMES_SEEN_MAX = 10_000
+
 
 class RTVIObserver(BaseObserver):
     """Pipeline frame observer for RTVI server message handling.
@@ -271,7 +280,8 @@ class RTVIObserver(BaseObserver):
         self.observed_frame_types = _RTVI_OBSERVED_FRAME_TYPES
 
         self._ignored_sources: set[FrameProcessor] = set(self._params.ignored_sources)
-        self._frames_seen = set()
+        self._frames_seen: OrderedDict[int, None] = OrderedDict()
+        self._audio_frames_seen: OrderedDict[int, None] = OrderedDict()
 
         self._bot_transcription = ""
         self._last_user_audio_level = 0
@@ -475,8 +485,21 @@ class RTVIObserver(BaseObserver):
         if frame.broadcast_sibling_id is not None and direction != FrameDirection.DOWNSTREAM:
             return
 
-        # If we have already seen this frame, let's skip it.
-        if frame.id in self._frames_seen:
+        # Audio whose level message is off has nothing to report, so it stays
+        # out of the dedups below: it is most of the frames the observer sees.
+        if isinstance(frame, InputAudioRawFrame) and not self._params.user_audio_level_enabled:
+            return
+        if isinstance(frame, TTSAudioRawFrame) and not self._params.bot_audio_level_enabled:
+            return
+
+        # If we have already seen this frame, let's skip it. Audio has its own
+        # dedup, so it cannot push out a frame whose copy is still to come.
+        frames_seen = (
+            self._audio_frames_seen
+            if isinstance(frame, (InputAudioRawFrame, TTSAudioRawFrame))
+            else self._frames_seen
+        )
+        if frame.id in frames_seen:
             return
 
         # This tells whether the frame is already processed. If false, we will try
@@ -498,15 +521,15 @@ class RTVIObserver(BaseObserver):
             and self._params.user_mute_enabled
         ):
             await self._handle_user_mute(frame)
-        elif (
-            isinstance(frame, (BotStartedSpeakingFrame, BotStoppedSpeakingFrame))
-            and self._params.bot_speaking_enabled
-        ):
+        elif isinstance(frame, (BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
             await self._handle_bot_speaking(frame)
-        elif isinstance(frame, InterruptionFrame) and self._params.bot_speaking_enabled:
+        elif isinstance(frame, InterruptionFrame):
             # The bot's in-flight output was cut off (VAD barge-in or a programmatic
-            # run_immediately interrupt). Let clients drop what it was mid-saying.
-            await self.send_rtvi_message(RTVI.BotInterruptedMessage())
+            # run_immediately interrupt). The output queued for it will not be
+            # spoken, and clients can drop what it was mid-saying.
+            self._queued_aggregated_text_frames.clear()
+            if self._params.bot_speaking_enabled:
+                await self.send_rtvi_message(RTVI.BotInterruptedMessage())
         elif (
             isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame))
             and self._params.user_transcription_enabled
@@ -641,7 +664,9 @@ class RTVIObserver(BaseObserver):
                 self._last_bot_audio_level = curr_time
 
         if mark_as_seen:
-            self._frames_seen.add(frame.id)
+            frames_seen[frame.id] = None
+            if len(frames_seen) > _FRAMES_SEEN_MAX:
+                frames_seen.popitem(last=False)
 
     async def _handle_interruptions(self, frame: Frame):
         """Handle user speaking interruption frames."""
@@ -677,24 +702,32 @@ class RTVIObserver(BaseObserver):
             await self.send_rtvi_message(message)
 
     async def _handle_bot_speaking(self, frame: Frame):
-        """Handle bot speaking event frames."""
+        """Track the bot's speaking state, and report it when enabled.
+
+        The state is tracked whatever ``bot_speaking_enabled`` says, because
+        output that will be spoken is held until the bot starts speaking.
+        """
         if isinstance(frame, BotStartedSpeakingFrame):
-            message = RTVI.BotStartedSpeakingMessage()
-            await self.send_rtvi_message(message)
+            if self._params.bot_speaking_enabled:
+                await self.send_rtvi_message(RTVI.BotStartedSpeakingMessage())
             # Flush any queued aggregated text frames
             for queued_frame in self._queued_aggregated_text_frames:
                 await self._send_aggregated_llm_text(queued_frame)
             self._queued_aggregated_text_frames.clear()
             self._bot_is_speaking = True
         elif isinstance(frame, BotStoppedSpeakingFrame):
-            message = RTVI.BotStoppedSpeakingMessage()
-            await self.send_rtvi_message(message)
+            if self._params.bot_speaking_enabled:
+                await self.send_rtvi_message(RTVI.BotStoppedSpeakingMessage())
             self._bot_is_speaking = False
 
     async def _handle_aggregated_llm_text(self, frame: AggregatedTextFrame):
-        """Handle aggregated LLM text output frames."""
-        if self._bot_is_speaking:
-            # Bot has already started speaking, send directly
+        """Handle aggregated LLM text output frames.
+
+        Output that will be spoken waits for the bot to start speaking, so a
+        client shows it with its audio. Output that will not be spoken has no
+        audio to wait for and is sent at once.
+        """
+        if self._bot_is_speaking or not frame.will_be_spoken:
             await self._send_aggregated_llm_text(frame)
         else:
             # Bot hasn't started speaking yet, queue the frame
@@ -724,9 +757,12 @@ class RTVIObserver(BaseObserver):
                 if is_progress_aware:
                     result = await transform(text, agg_type, accumulated, remaining)
                     if isinstance(result, BotOutputTransformResult):
-                        accumulated = result.accumulated_text or accumulated
-                        remaining = result.remaining_text or remaining
-                        text = result.text or text
+                        # An empty string is a result; only None keeps the input.
+                        text = result.text
+                        if result.accumulated_text is not None:
+                            accumulated = result.accumulated_text
+                        if result.remaining_text is not None:
+                            remaining = result.remaining_text
                 else:
                     # The deprecated 2-parameter signature returns the text itself.
                     accumulated = cast(str, await transform(accumulated, agg_type))

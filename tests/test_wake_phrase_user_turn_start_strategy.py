@@ -36,6 +36,14 @@ class TestWakePhraseUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         return task_manager
 
+    async def _wake_and_finish_a_turn(self, strategy: WakePhraseUserTurnStartStrategy):
+        await strategy.process_frame(
+            TranscriptionFrame(text="hey pipecat what time is it", user_id="u", timestamp="")
+        )
+        self.assertEqual(strategy.state, _WakeState.AWAKE)
+        await strategy.handle_user_turn_started()
+        await strategy.handle_user_turn_stopped()
+
     async def test_wake_phrase_in_final_transcription(self):
         strategy = self._create_strategy()
         await self._setup_strategy(strategy)
@@ -92,7 +100,7 @@ class TestWakePhraseUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
 
         await strategy.cleanup()
 
-    async def test_vad_frame_returns_stop_in_listening(self):
+    async def test_vad_frame_returns_stop_when_idle(self):
         strategy = self._create_strategy()
         await self._setup_strategy(strategy)
 
@@ -102,7 +110,7 @@ class TestWakePhraseUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
 
         await strategy.cleanup()
 
-    async def test_inactive_returns_continue(self):
+    async def test_awake_returns_continue(self):
         strategy = self._create_strategy()
         await self._setup_strategy(strategy)
 
@@ -166,7 +174,7 @@ class TestWakePhraseUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
 
         await strategy.cleanup()
 
-    async def test_turn_start_preserves_inactive_state(self):
+    async def test_turn_start_preserves_awake_state(self):
         strategy = self._create_strategy()
         await self._setup_strategy(strategy)
 
@@ -180,7 +188,7 @@ class TestWakePhraseUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
 
         await strategy.cleanup()
 
-    async def test_timeout_returns_to_listening(self):
+    async def test_timeout_returns_to_idle(self):
         strategy = self._create_strategy(timeout=0.1)
         await self._setup_strategy(strategy)
 
@@ -265,8 +273,8 @@ class TestWakePhraseUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
 
         await strategy.cleanup()
 
-    async def test_single_activation_stays_inactive_after_turn_start(self):
-        """In single activation mode, the turn-start callback keeps INACTIVE so the current turn can finish."""
+    async def test_single_activation_stays_awake_after_turn_start(self):
+        """In single activation mode, the turn-start callback keeps AWAKE so the current turn can finish."""
         strategy = self._create_strategy(single_activation=True, timeout=0.5)
         await self._setup_strategy(strategy)
 
@@ -279,7 +287,7 @@ class TestWakePhraseUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
 
         # Simulate turn start (the controller notifies all start strategies).
         await strategy.handle_user_turn_started()
-        # State remains INACTIVE so frames continue to flow.
+        # State remains AWAKE so frames continue to flow.
         self.assertEqual(strategy.state, _WakeState.AWAKE)
 
         # Subsequent frames should pass through (CONTINUE).
@@ -293,8 +301,61 @@ class TestWakePhraseUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
 
         await strategy.cleanup()
 
-    async def test_single_activation_timeout_returns_to_listening(self):
-        """In single activation mode, the keepalive timeout returns to LISTENING."""
+    async def test_single_activation_returns_to_idle_at_turn_stop(self):
+        """In single activation mode, the next turn needs the wake phrase again."""
+        strategy = self._create_strategy(single_activation=True)
+        await self._setup_strategy(strategy)
+        await self._wake_and_finish_a_turn(strategy)
+
+        self.assertEqual(strategy.state, _WakeState.IDLE)
+        result = await strategy.process_frame(VADUserStartedSpeakingFrame())
+        self.assertEqual(result, ProcessFrameResult.STOP, "the next turn must need the phrase")
+        await strategy.cleanup()
+
+    async def test_timeout_mode_stays_awake_after_turn_stop(self):
+        strategy = self._create_strategy()
+        await self._setup_strategy(strategy)
+        await self._wake_and_finish_a_turn(strategy)
+
+        self.assertEqual(strategy.state, _WakeState.AWAKE)
+        result = await strategy.process_frame(VADUserStartedSpeakingFrame())
+        self.assertEqual(result, ProcessFrameResult.CONTINUE)
+        await strategy.cleanup()
+
+    async def test_single_activation_activity_keeps_a_long_turn_awake(self):
+        """A turn the user is still speaking past the keepalive is not cut off, nor its words dropped."""
+        strategy = self._create_strategy(single_activation=True, timeout=0.2)
+        await self._setup_strategy(strategy)
+        resets = []
+
+        @strategy.event_handler("on_reset_aggregation")
+        async def on_reset_aggregation(strategy):
+            resets.append(strategy)
+
+        await strategy.process_frame(
+            TranscriptionFrame(text="hey pipecat", user_id="user1", timestamp="")
+        )
+        await strategy.handle_user_turn_started()
+
+        # The user keeps speaking for longer than the keepalive.
+        for _ in range(4):
+            await asyncio.sleep(0.08)
+            await strategy.process_frame(UserSpeakingFrame())
+        result = await strategy.process_frame(
+            TranscriptionFrame(text="book a table for four", user_id="user1", timestamp="")
+        )
+        self.assertEqual(strategy.state, _WakeState.AWAKE)
+        self.assertEqual(result, ProcessFrameResult.CONTINUE)
+        self.assertEqual(resets, [])
+
+        # The turn stopping is what gates the next one.
+        await strategy.handle_user_turn_stopped()
+        self.assertEqual(strategy.state, _WakeState.IDLE)
+
+        await strategy.cleanup()
+
+    async def test_single_activation_timeout_returns_to_idle(self):
+        """In single activation mode, the keepalive returns to IDLE when the turn does not stop first."""
         strategy = self._create_strategy(single_activation=True, timeout=0.1)
         await self._setup_strategy(strategy)
 
@@ -319,7 +380,7 @@ class TestWakePhraseUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
         strategy = self._create_strategy(single_activation=True, timeout=0.1)
         await self._setup_strategy(strategy)
 
-        # First turn: wake phrase -> INACTIVE -> timeout -> LISTENING.
+        # First turn: wake phrase -> AWAKE -> keepalive timeout -> IDLE.
         await strategy.process_frame(
             TranscriptionFrame(text="hey pipecat", user_id="user1", timestamp="")
         )

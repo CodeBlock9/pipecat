@@ -16,6 +16,7 @@ Classes:
 """
 
 import asyncio
+import functools
 from pathlib import Path
 from threading import Lock
 
@@ -95,6 +96,20 @@ class AICModelManager:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: Model.from_file(model_path_str))
 
+    @classmethod
+    def _forget_load(cls, cache_key: str, task: asyncio.Task[Model]) -> None:
+        """Drop a finished load from ``_loading``, whatever its outcome.
+
+        Only the entry that is still this task is dropped. The task's exception
+        is retrieved so that a load every waiter stopped waiting for does not
+        log it as never retrieved.
+        """
+        with cls._lock:
+            if cls._loading.get(cache_key) is task:
+                del cls._loading[cache_key]
+        if not task.cancelled():
+            task.exception()
+
     @staticmethod
     def _get_cache_key(
         *,
@@ -169,12 +184,11 @@ class AICModelManager:
                     )
                 )
                 cls._loading[cache_key] = load_task
+                load_task.add_done_callback(functools.partial(cls._forget_load, cache_key))
 
-        try:
-            model = await load_task
-        finally:
-            with cls._lock:
-                cls._loading.pop(cache_key, None)
+        # Shielded, so that a waiter's cancellation is its own and leaves the
+        # load running for the other waiters.
+        model = await asyncio.shield(load_task)
 
         with cls._lock:
             entry = cls._cache.get(cache_key)

@@ -44,8 +44,9 @@ class WakePhraseUserTurnStartStrategy(BaseUserTurnStartStrategy):
     Event handlers available:
 
     - on_wake_phrase_detected: Called when a wake phrase is matched.
-    - on_wake_phrase_timeout: Called when the inactivity timeout expires
-      (timeout mode only).
+    - on_wake_phrase_timeout: Called when the timeout expires and returns the
+      strategy to IDLE (in single activation mode, only the keepalive
+      fallback).
 
     Example::
 
@@ -71,13 +72,13 @@ class WakePhraseUserTurnStartStrategy(BaseUserTurnStartStrategy):
 
     Args:
         phrases: List of wake phrases to detect.
-        timeout: Inactivity timeout in seconds before returning to IDLE.
-            In timeout mode, the timer resets on activity (user, bot speech).
-            In single activation mode, acts as a keepalive window — the strategy
-            stays AWAKE for this duration after wake phrase detection, allowing
-            the current turn to complete before returning to IDLE.
+        timeout: Inactivity timeout in seconds before returning to IDLE. The
+            timer resets on activity (user, bot speech) in both modes. In
+            single activation mode, it is only a keepalive fallback: the
+            strategy returns to IDLE when the turn stops, or after this long
+            without activity if the turn has not stopped.
         single_activation: If True, the wake phrase is required before every
-            turn. The strategy returns to IDLE after each turn completes.
+            turn. The strategy returns to IDLE when each turn stops.
         **kwargs: Additional keyword arguments passed to parent.
     """
 
@@ -94,10 +95,11 @@ class WakePhraseUserTurnStartStrategy(BaseUserTurnStartStrategy):
         Args:
             phrases: List of wake phrases to detect.
             timeout: Inactivity timeout in seconds before returning to IDLE.
-                In timeout mode, the timer resets on activity. In single activation
-                mode, acts as a keepalive window after wake phrase detection.
+                The timer resets on activity in both modes. In single activation
+                mode, it is a keepalive fallback for a turn that has not stopped
+                and has had no activity for this long.
             single_activation: If True, the wake phrase is required before every
-                turn. The strategy returns to IDLE after each turn completes.
+                turn. The strategy returns to IDLE when each turn stops.
             **kwargs: Additional keyword arguments passed to parent.
         """
         super().__init__(**kwargs)
@@ -152,12 +154,25 @@ class WakePhraseUserTurnStartStrategy(BaseUserTurnStartStrategy):
 
         In timeout mode, preserves state and refreshes the timeout — a turn
         starting is the activity that keeps the strategy awake. In single
-        activation mode, does nothing: the keepalive timeout (started when the
-        wake phrase was detected) handles the transition back to IDLE.
+        activation mode, does nothing: the strategy stays AWAKE for the turn
+        the wake phrase started and returns to IDLE when that turn stops.
         """
         if self._state == _WakeState.AWAKE:
             if not self._single_activation:
                 self._refresh_timeout()
+
+    async def handle_user_turn_stopped(self):
+        """Return to IDLE when a turn stops, in single activation mode.
+
+        Start strategies usually reset at turn start. Single activation resets
+        at turn stop instead, because the wake phrase admits exactly one turn
+        and the next one must be gated again. The accumulated text is cleared,
+        and no ``on_wake_phrase_timeout`` fires, since no timeout expired. In
+        timeout mode, does nothing: the inactivity timeout decides.
+        """
+        if self._single_activation:
+            self._state = _WakeState.IDLE
+            self._accumulated_text = ""
 
     async def process_frame(self, frame: Frame) -> ProcessFrameResult:
         """Process an incoming frame for wake phrase detection or passthrough.
@@ -197,16 +212,17 @@ class WakePhraseUserTurnStartStrategy(BaseUserTurnStartStrategy):
     async def _process_awake(self, frame: Frame) -> ProcessFrameResult:
         """Process a frame while in AWAKE state.
 
-        Refreshes the timeout on activity frames (timeout mode only). Returns
+        Refreshes the timeout on activity frames, in both modes: in single
+        activation mode the turn stopping returns the strategy to IDLE, so the
+        keepalive must not cut off a turn the user is still speaking. Returns
         CONTINUE so subsequent strategies can process the frame.
         """
-        if not self._single_activation:
-            if isinstance(frame, (UserSpeakingFrame, BotSpeakingFrame)):
-                self._refresh_timeout()
-            elif isinstance(frame, TranscriptionFrame):
-                self._refresh_timeout()
-            elif isinstance(frame, VADUserStartedSpeakingFrame):
-                self._refresh_timeout()
+        if isinstance(frame, (UserSpeakingFrame, BotSpeakingFrame)):
+            self._refresh_timeout()
+        elif isinstance(frame, TranscriptionFrame):
+            self._refresh_timeout()
+        elif isinstance(frame, VADUserStartedSpeakingFrame):
+            self._refresh_timeout()
 
         return ProcessFrameResult.CONTINUE
 

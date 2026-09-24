@@ -15,9 +15,9 @@ from pipecat.turns.user_stop.base_user_turn_stop_strategy import BaseUserTurnSto
 class DeferredUserTurnStopStrategy(BaseUserTurnStopStrategy):
     """Wraps a stop strategy and suppresses its ``on_user_turn_stopped`` event.
 
-    Event subscriptions added to the wrapper are forwarded directly to
-    the inner strategy, except for ``on_user_turn_stopped``, which is
-    dropped. The inner strategy's frame-side and inference-triggered
+    Event subscriptions added to or removed from the wrapper are forwarded
+    directly to the inner strategy, except for ``on_user_turn_stopped``,
+    which is dropped. The inner strategy's frame-side and inference-triggered
     events therefore reach external listeners (the controller, etc.)
     unchanged; finalization is left to another strategy in the chain
     such as ``LLMTurnCompletionUserTurnStopStrategy``.
@@ -67,6 +67,18 @@ class DeferredUserTurnStopStrategy(BaseUserTurnStopStrategy):
         if event_name == "on_user_turn_stopped":
             return
         self._inner.add_event_handler(event_name, handler)
+
+    def remove_event_handler(self, event_name: str, handler):
+        """Forward handler removals to the inner strategy.
+
+        Mirrors :meth:`add_event_handler`, so a listener that removes what it
+        added (the controller does, whenever its strategies are cleaned up or
+        replaced) leaves nothing behind on the inner strategy.
+        ``on_user_turn_stopped`` was never attached, so removing it is a no-op.
+        """
+        if event_name == "on_user_turn_stopped":
+            return
+        self._inner.remove_event_handler(event_name, handler)
 
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the inner strategy."""
