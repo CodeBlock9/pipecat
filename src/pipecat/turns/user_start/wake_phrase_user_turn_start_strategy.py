@@ -72,11 +72,11 @@ class WakePhraseUserTurnStartStrategy(BaseUserTurnStartStrategy):
 
     Args:
         phrases: List of wake phrases to detect.
-        timeout: Inactivity timeout in seconds before returning to IDLE.
-            In timeout mode, the timer resets on activity (user, bot speech).
-            In single activation mode, it is a keepalive fallback: the strategy
-            returns to IDLE this long after the wake phrase if the turn it
-            started has not stopped by then.
+        timeout: Inactivity timeout in seconds before returning to IDLE. The
+            timer resets on activity (user, bot speech) in both modes. In
+            single activation mode, it is only a keepalive fallback: the
+            strategy returns to IDLE when the turn stops, or after this long
+            without activity if the turn has not stopped.
         single_activation: If True, the wake phrase is required before every
             turn. The strategy returns to IDLE when each turn stops.
         **kwargs: Additional keyword arguments passed to parent.
@@ -95,9 +95,9 @@ class WakePhraseUserTurnStartStrategy(BaseUserTurnStartStrategy):
         Args:
             phrases: List of wake phrases to detect.
             timeout: Inactivity timeout in seconds before returning to IDLE.
-                In timeout mode, the timer resets on activity. In single activation
+                The timer resets on activity in both modes. In single activation
                 mode, it is a keepalive fallback for a turn that has not stopped
-                this long after the wake phrase.
+                and has had no activity for this long.
             single_activation: If True, the wake phrase is required before every
                 turn. The strategy returns to IDLE when each turn stops.
             **kwargs: Additional keyword arguments passed to parent.
@@ -212,16 +212,17 @@ class WakePhraseUserTurnStartStrategy(BaseUserTurnStartStrategy):
     async def _process_awake(self, frame: Frame) -> ProcessFrameResult:
         """Process a frame while in AWAKE state.
 
-        Refreshes the timeout on activity frames (timeout mode only). Returns
+        Refreshes the timeout on activity frames, in both modes: in single
+        activation mode the turn stopping returns the strategy to IDLE, so the
+        keepalive must not cut off a turn the user is still speaking. Returns
         CONTINUE so subsequent strategies can process the frame.
         """
-        if not self._single_activation:
-            if isinstance(frame, (UserSpeakingFrame, BotSpeakingFrame)):
-                self._refresh_timeout()
-            elif isinstance(frame, TranscriptionFrame):
-                self._refresh_timeout()
-            elif isinstance(frame, VADUserStartedSpeakingFrame):
-                self._refresh_timeout()
+        if isinstance(frame, (UserSpeakingFrame, BotSpeakingFrame)):
+            self._refresh_timeout()
+        elif isinstance(frame, TranscriptionFrame):
+            self._refresh_timeout()
+        elif isinstance(frame, VADUserStartedSpeakingFrame):
+            self._refresh_timeout()
 
         return ProcessFrameResult.CONTINUE
 

@@ -322,6 +322,38 @@ class TestWakePhraseUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, ProcessFrameResult.CONTINUE)
         await strategy.cleanup()
 
+    async def test_single_activation_activity_keeps_a_long_turn_awake(self):
+        """A turn the user is still speaking past the keepalive is not cut off, nor its words dropped."""
+        strategy = self._create_strategy(single_activation=True, timeout=0.2)
+        await self._setup_strategy(strategy)
+        resets = []
+
+        @strategy.event_handler("on_reset_aggregation")
+        async def on_reset_aggregation(strategy):
+            resets.append(strategy)
+
+        await strategy.process_frame(
+            TranscriptionFrame(text="hey pipecat", user_id="user1", timestamp="")
+        )
+        await strategy.handle_user_turn_started()
+
+        # The user keeps speaking for longer than the keepalive.
+        for _ in range(4):
+            await asyncio.sleep(0.08)
+            await strategy.process_frame(UserSpeakingFrame())
+        result = await strategy.process_frame(
+            TranscriptionFrame(text="book a table for four", user_id="user1", timestamp="")
+        )
+        self.assertEqual(strategy.state, _WakeState.AWAKE)
+        self.assertEqual(result, ProcessFrameResult.CONTINUE)
+        self.assertEqual(resets, [])
+
+        # The turn stopping is what gates the next one.
+        await strategy.handle_user_turn_stopped()
+        self.assertEqual(strategy.state, _WakeState.IDLE)
+
+        await strategy.cleanup()
+
     async def test_single_activation_timeout_returns_to_idle(self):
         """In single activation mode, the keepalive returns to IDLE when the turn does not stop first."""
         strategy = self._create_strategy(single_activation=True, timeout=0.1)
