@@ -10,19 +10,20 @@ This module provides reusable functionality for automatically compressing conver
 context when token limits are reached, enabling efficient long-running conversations.
 """
 
-import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 if TYPE_CHECKING:
     from pipecat.services.llm_service import LLMService
 
 from loguru import logger
 
+from pipecat.processors.aggregators import async_tool_messages
 from pipecat.processors.aggregators.llm_context import (
     LLMContext,
     LLMContextMessage,
     LLMSpecificMessage,
+    LLMStandardMessage,
 )
 from pipecat.utils.deprecation import deprecated
 
@@ -390,9 +391,9 @@ class LLMContextSummarizationUtil:
         """Return True if a tool message content represents an unresolved call.
 
         A tool message is considered pending (unresolved) when its content is
-        the synchronous ``"IN_PROGRESS"`` sentinel or the async
-        ``{"type": "async_tool", "status": "started"}`` marker — both indicate
-        that the actual result has not yet been written back to the context.
+        the synchronous ``"IN_PROGRESS"`` sentinel or an async-tool started
+        message, whose payload has ``status: "running"`` — both indicate that
+        the actual result has not yet been written back to the context.
 
         Args:
             content: The ``content`` field of a tool-role context message.
@@ -402,17 +403,9 @@ class LLMContextSummarizationUtil:
         """
         if content == "IN_PROGRESS":
             return True
-        try:
-            parsed = json.loads(content)
-            if (
-                isinstance(parsed, dict)
-                and parsed.get("type") == "async_tool"
-                and parsed.get("status") == "started"
-            ):
-                return True
-        except (json.JSONDecodeError, ValueError):
-            pass
-        return False
+        message = cast(LLMStandardMessage, {"role": "tool", "content": content})
+        payload = async_tool_messages.parse_message(message)
+        return payload is not None and payload.status == "running"
 
     @staticmethod
     def _get_earliest_function_call_not_resolved_in_range(
@@ -423,8 +416,8 @@ class LLMContextSummarizationUtil:
         Scans messages from ``start_idx`` up to (but not including)
         ``summary_end`` to identify tool calls whose responses either don't
         exist yet, fall in the kept portion of the context (>= summary_end),
-        or are still marked as ``IN_PROGRESS`` (async calls whose results have
-        not yet arrived).
+        or are still pending: a sync call's ``IN_PROGRESS`` placeholder, or an
+        async call's started message with no final result after it.
 
         This prevents summarizing tool call requests when their responses would
         remain in the kept context as orphans, which the OpenAI API rejects,
@@ -477,25 +470,13 @@ class LLMContextSummarizationUtil:
                     if not LLMContextSummarizationUtil._is_tool_message_pending(content):
                         pending_tool_calls.pop(tool_call_id)
 
-            # Check for async tool completion — a developer message with
-            # {"type": "async_tool", "status": "finished"} signals that the
-            # async result has arrived and the call is now resolved.
+            # Check for async tool completion — a developer message carrying
+            # an async-tool final payload signals that the async result has
+            # arrived and the call is now resolved.
             if role == "developer":
-                try:
-                    content = msg.get("content", "")
-                    if not isinstance(content, str):
-                        continue
-                    parsed = json.loads(content)
-                    if (
-                        isinstance(parsed, dict)
-                        and parsed.get("type") == "async_tool"
-                        and parsed.get("status") == "finished"
-                    ):
-                        tool_call_id = parsed.get("tool_call_id")
-                        if tool_call_id and tool_call_id in pending_tool_calls:
-                            pending_tool_calls.pop(tool_call_id)
-                except (json.JSONDecodeError, ValueError):
-                    pass
+                payload = async_tool_messages.parse_message(msg)
+                if payload is not None and payload.kind == "final":
+                    pending_tool_calls.pop(payload.tool_call_id, None)
 
         # If we have pending tool calls, return the earliest index
         if pending_tool_calls:
