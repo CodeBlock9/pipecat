@@ -219,12 +219,12 @@ class BaseLLMAdapter(ABC, Generic[TLLMInvocationParams]):
         those are converted to ``"user"`` by the adapter's subsequent message
         loop, like any other non-system role the provider doesn't support.
 
-        Checks ``messages[0]``. If the role is ``"system"``, pops and returns
-        its content. If extracting would leave the messages list empty
-        (``len(messages) == 1``), the message is converted to ``"user"``
-        role instead of being extracted, to prevent sending an empty
-        conversation history to providers that require at least one
-        non-system message.
+        Checks ``messages[0]``. If the role is ``"system"``, pops it and returns
+        its text, as :meth:`_system_text` reads it. If extracting would leave
+        the messages list empty (``len(messages) == 1``), the message is
+        converted to ``"user"`` role instead of being extracted, to prevent
+        sending an empty conversation history to providers that require at
+        least one non-system message.
 
         Args:
             messages: Message list in standard format. The list is mutated
@@ -261,14 +261,35 @@ class BaseLLMAdapter(ABC, Generic[TLLMInvocationParams]):
             return None
 
         # Extract
-        content = messages[0].get("content", "")
-        if isinstance(content, list):
-            # Join text parts for providers that expect a string system instruction
-            content = " ".join(
-                part.get("text", "") for part in content if part.get("type") == "text"
-            )
+        content = self._system_text(messages[0].get("content", ""))
         messages.pop(0)
         return content
+
+    @staticmethod
+    def _system_text(content: Any) -> str | None:
+        """Return the text of a system message's content, for a string system instruction.
+
+        A string is returned as it is. A list of content parts gives the text of
+        every ``"text"`` part, joined with a space, so a system message split
+        into several text blocks keeps all of them; a list with no text part
+        gives an empty string. Anything else gives ``None``, so a message with
+        no content still yields no instruction.
+
+        Used by :meth:`_extract_initial_system` and by the realtime adapters,
+        which read their session instructions from the first system message.
+
+        Args:
+            content: The ``"content"`` of a system message.
+
+        Returns:
+            The system message's text, or ``None`` when its content is neither
+            a string nor a list.
+        """
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(part.get("text", "") for part in content if part.get("type") == "text")
+        return None
 
     def _resolve_system_instruction(
         self,

@@ -147,11 +147,7 @@ class AWSNovaSonicLLMAdapter(BaseLLMAdapter[AWSNovaSonicLLMInvocationParams]):
         # pull that out into "instruction"
         if ucm and ucm[0].get("role") == "system":
             system = ucm.pop(0)
-            content = system.get("content")
-            if isinstance(content, str):
-                system_instruction = content
-            elif isinstance(content, list):
-                system_instruction = content[0].get("text")
+            system_instruction = self._system_text(system.get("content"))
             if system_instruction:
                 self._system_instruction = system_instruction
 
