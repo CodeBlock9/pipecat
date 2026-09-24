@@ -2006,6 +2006,46 @@ class TestAWSBedrockGetLLMInvocationParams(unittest.TestCase):
         self.assertEqual(assistant_msg["content"][0]["text"], "(empty)")
         self.assertEqual(assistant_msg["content"][1]["text"], "Valid text")
 
+    def test_an_empty_content_list_falls_back_to_a_bedrock_text_block(self):
+        """An empty content list becomes a Converse text block, which has no "type" key."""
+        context = LLMContext(messages=[{"role": "user", "content": []}])
+
+        params = self.adapter.get_llm_invocation_params(context)
+
+        self.assertEqual(params["messages"][0]["content"], [{"text": "(empty)"}])
+
+    def test_merging_a_provider_specific_string_message_keeps_the_bedrock_shape(self):
+        """A string message merged with its same-role neighbour becomes a Converse text block."""
+        context = LLMContext(
+            messages=[
+                LLMSpecificMessage(llm="aws", message={"role": "user", "content": "hi"}),
+                {"role": "user", "content": "there"},
+            ]
+        )
+
+        params = self.adapter.get_llm_invocation_params(context)
+
+        self.assertEqual(params["messages"][0]["content"], [{"text": "hi"}, {"text": "there"}])
+
+    def test_botocore_accepts_the_empty_content_fallback(self):
+        """The empty-content fallback passes botocore's Converse request validation."""
+        try:
+            from botocore.session import Session
+            from botocore.validate import ParamValidator
+        except ImportError:
+            self.skipTest("botocore is not installed")
+        context = LLMContext(messages=[{"role": "user", "content": []}])
+        messages = self.adapter.get_llm_invocation_params(context)["messages"]
+
+        shape = (
+            Session().get_service_model("bedrock-runtime").operation_model("Converse").input_shape
+        )
+        report = ParamValidator().validate(
+            {"modelId": "offline-model", "messages": messages}, shape
+        )
+
+        self.assertFalse(report.has_errors(), report.generate_report())
+
     def test_complex_message_content_preserved(self):
         """Test that complex message structures (text + image) are properly converted to AWS Bedrock format."""
         # Create a complex message with both text and image content

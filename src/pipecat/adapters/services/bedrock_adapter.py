@@ -103,7 +103,7 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
         Returns:
             List of messages in a format ready for logging about AWS Bedrock.
         """
-        # Get messages in Anthropic's format
+        # Get messages in Bedrock's format
         messages = self._from_universal_context_messages(self.get_messages(context)).messages
 
         # Sanitize messages for logging
@@ -161,11 +161,9 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
             if current_message["role"] == next_message["role"]:
                 # Convert content to list of dictionaries if it's a string
                 if isinstance(current_message["content"], str):
-                    current_message["content"] = [
-                        {"type": "text", "text": current_message["content"]}
-                    ]
+                    current_message["content"] = [{"text": current_message["content"]}]
                 if isinstance(next_message["content"], str):
-                    next_message["content"] = [{"type": "text", "text": next_message["content"]}]
+                    next_message["content"] = [{"text": next_message["content"]}]
                 # Concatenate the content
                 current_message["content"].extend(next_message["content"])
                 # Remove the next message from the list
@@ -178,7 +176,7 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
             if isinstance(message["content"], str) and message["content"] == "":
                 message["content"] = "(empty)"
             elif isinstance(message["content"], list) and len(message["content"]) == 0:
-                message["content"] = [{"type": "text", "text": "(empty)"}]
+                message["content"] = [{"text": "(empty)"}]
 
         return self.ConvertedMessages(messages=messages, system=system)
 
