@@ -338,3 +338,38 @@ def test_gemini_thinking_config_in_settings_extra_beats_the_low_latency_default(
     params = service._build_generation_params()
 
     assert params["thinking_config"] == {"thinking_budget": 1024}
+
+
+def test_applied_option_wins_over_a_later_settings_extra_update():
+    """``apply_provider_options`` mirrors an undeclared option into
+    ``settings.extra``, so the two differ only after a runtime settings update.
+    The applied option still merges last and wins."""
+    from pipecat.services.openai.llm import OpenAILLMService
+
+    service = _openai_service({"reasoning_effort": "minimal", "verbosity": "low"})
+    service.apply_provider_options({"verbosity": "medium"})
+    service._settings.apply_update(OpenAILLMService.Settings(extra={"verbosity": "high"}))
+
+    params = service.build_chat_completion_params({"messages": []})
+
+    assert params["verbosity"] == "medium"
+
+
+def test_gemini_applied_nested_option_keeps_the_settings_thinking_config():
+    """R2's nested case in the Gemini builder: an applied ``thinking_config`` is
+    mirrored into ``settings.extra``; merged there wholesale, it would drop the
+    budget the settings' ``thinking`` built."""
+    from pipecat.services.google.llm import GoogleLLMService
+
+    service = GoogleLLMService(
+        api_key="test-key",
+        settings=GoogleLLMService.Settings(
+            model="gemini-2.5-flash",
+            thinking=GoogleLLMService.ThinkingConfig(thinking_budget=256),
+        ),
+    )
+    service.apply_provider_options({"thinking_config": {"include_thoughts": True}})
+
+    params = service._build_generation_params()
+
+    assert params["thinking_config"] == {"thinking_budget": 256, "include_thoughts": True}
