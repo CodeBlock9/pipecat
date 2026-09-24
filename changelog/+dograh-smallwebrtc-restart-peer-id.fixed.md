@@ -1,0 +1,1 @@
+- `SmallWebRTCRequestHandler` maps a connection restarted through `restart_pc` under its new peer id alone. The restart mints a new id, and the old one stayed mapped to the same connection and outlived its close.

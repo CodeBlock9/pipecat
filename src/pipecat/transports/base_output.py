@@ -533,6 +533,10 @@ class BaseOutputTransport(FrameProcessor):
             Args:
                 frame: The end frame signaling sender shutdown.
             """
+            # Raw and speech-stream audio has no TTSStoppedFrame to flush its
+            # trailing partial chunk, so it is queued here, ahead of the EndFrame.
+            await self._enqueue_flushed_audio_buffer()
+
             # Let the sink tasks process the queue until they reach this EndFrame.
             await self._clock_queue.put((float("inf"), next(self._clock_queue_counter), frame))
             await self._audio_queue.put(frame)
@@ -593,6 +597,11 @@ class BaseOutputTransport(FrameProcessor):
                 _: The start interruption frame (unused).
             """
             await self.handle_audio_resume(BotOutputAudioResumeFrame())
+
+            # Audio the interrupted response never filled a chunk with. It is
+            # dropped whether or not the bot has started speaking, so it can't
+            # prefix the next response.
+            self._audio_buffer = bytearray()
 
             # Cancel tasks.
             await self._cancel_clock_task()
@@ -709,8 +718,8 @@ class BaseOutputTransport(FrameProcessor):
             `handle_audio_frame` only queues complete `audio_chunk_size` chunks,
             so up to one chunk's worth of trailing audio can still be sitting in
             `_audio_buffer`. Queue it now (padded to a full chunk with silence)
-            so it plays before the stop frame is handled, instead of being
-            discarded when the buffer is cleared in `_bot_stopped_speaking`.
+            so it plays before the stop frame is handled, instead of being left
+            in the buffer ahead of the next response's audio.
 
             Args:
                 frame: The TTS stopped frame to queue.
@@ -790,17 +799,25 @@ class BaseOutputTransport(FrameProcessor):
 
             await self._audio_queue.put(frame)
 
-        async def _bot_stopped_speaking(self):
-            """Handle bot stopped speaking event."""
+        async def _bot_stopped_speaking(self, *, discard_audio_buffer: bool = False):
+            """Handle bot stopped speaking event.
+
+            Args:
+                discard_audio_buffer: Also drop the partial chunk left in
+                    `_audio_buffer`. Only the queue-empty timeouts pass it: no
+                    audio has arrived for a while, so the leftover is stale.
+                    Elsewhere the producer runs ahead of playback, so the
+                    buffer can hold the next response's audio (an
+                    interruption clears it in `handle_interruptions`).
+            """
             if not self._bot_speaking:
                 return
 
             self._bot_speaking = False
             self._tts_audio_received = False
 
-            # Any remaining leftover here (e.g. from an interruption) is
-            # discarded rather than flushed, since it's no longer wanted.
-            self._audio_buffer = bytearray()
+            if discard_audio_buffer:
+                self._audio_buffer = bytearray()
 
             logger.debug(
                 f"Bot{f' [{self._destination}]' if self._destination else ''} stopped speaking"
@@ -903,7 +920,7 @@ class BaseOutputTransport(FrameProcessor):
                         if self._audio_paused:
                             continue
                         # Fallback: notify the bot stopped speaking upstream if necessary based on timeout.
-                        await self._bot_stopped_speaking()
+                        await self._bot_stopped_speaking(discard_audio_buffer=True)
 
             async def with_mixer(vad_stop_secs: float) -> AsyncGenerator[Frame, None]:
                 # Caller below only invokes this when `self._mixer` is set.
@@ -933,7 +950,7 @@ class BaseOutputTransport(FrameProcessor):
                         # Fallback: notify the bot stopped speaking upstream if necessary based on timeout.
                         diff_time = time.time() - last_frame_time
                         if diff_time > vad_stop_secs:
-                            await self._bot_stopped_speaking()
+                            await self._bot_stopped_speaking(discard_audio_buffer=True)
                         # Generate an audio frame with only the mixer's part.
                         frame = OutputAudioRawFrame(
                             audio=await mixer.mix(silence),

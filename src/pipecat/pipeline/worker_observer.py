@@ -235,7 +235,11 @@ class WorkerObserver(BaseObserver):
 
         async def run_proxy():
             if setup_observer:
-                await observer.setup(self.task_manager)
+                # A late observer's failed setup must not cost its queue either.
+                try:
+                    await observer.setup(self.task_manager)
+                except Exception as e:
+                    logger.exception(f"{observer} raised setting up: {e}")
             await self._proxy_task_handler(queue, observer)
 
         task = self.create_task(run_proxy())
@@ -247,14 +251,6 @@ class WorkerObserver(BaseObserver):
             push_types=_declared_push_types(observer),
             push_decisions={},
         )
-
-    def _create_proxies(self, observers: list[BaseObserver]) -> dict[BaseObserver, Proxy]:
-        """Create proxies for all observers."""
-        proxies = {}
-        for observer in observers:
-            proxy = self._create_proxy(observer)
-            proxies[observer] = proxy
-        return proxies
 
     async def _send_to_proxy(self, data: Any, handler: str | None = None):
         if not self._proxies:
@@ -270,16 +266,23 @@ class WorkerObserver(BaseObserver):
 
     async def _proxy_task_handler(self, queue: asyncio.Queue, observer: BaseObserver):
         """Handle frame processing for a single observer."""
+        # A raising callback costs its one event, never the queue. Only the first
+        # failure carries a traceback: an observer raising on every frame would flood the log.
+        failed = False
         while True:
             data = await queue.get()
-
-            if isinstance(data, _PipelineStartedSignal):
-                await observer.on_pipeline_started()
-            elif isinstance(data, FramePushed):
-                await observer.on_push_frame(data)
-            elif isinstance(data, FrameProcessed):
-                await observer.on_process_frame(data)
-            elif isinstance(data, ProcessorSetUp):
-                await observer.on_processor_setup(data)
-
-            queue.task_done()
+            try:
+                if isinstance(data, _PipelineStartedSignal):
+                    await observer.on_pipeline_started()
+                elif isinstance(data, FramePushed):
+                    await observer.on_push_frame(data)
+                elif isinstance(data, FrameProcessed):
+                    await observer.on_process_frame(data)
+                elif isinstance(data, ProcessorSetUp):
+                    await observer.on_processor_setup(data)
+            except Exception as e:
+                log = logger.debug if failed else logger.exception
+                log(f"{observer} raised handling {type(data).__name__}: {e}")
+                failed = True
+            finally:
+                queue.task_done()

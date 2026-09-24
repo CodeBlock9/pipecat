@@ -1,0 +1,1 @@
+- `WebsocketClientOutputTransport` reports a send that failed on the socket as not written, so the output transport's consecutive-failure handling sees it. It reported every such send as written.

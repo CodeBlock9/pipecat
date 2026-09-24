@@ -1,0 +1,1 @@
+- `FrameProcessor.pause_processing_all_frames_until` resumes both queues when the readiness callback raises, and logs the failure. Only a timeout lifted the pause before, so a failing callback left the processor holding every later frame, the `CancelFrame` that would tear it down included.
