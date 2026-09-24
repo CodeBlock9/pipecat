@@ -540,9 +540,10 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
 
             response = await self._create_message_stream(self._client.beta.messages.create, params)
 
-            # Function calling
-            tool_use_block = None
-            json_accumulator = ""
+            # Function calling. A message can carry several tool_use blocks,
+            # each streaming its own JSON, so every block is kept by its
+            # content-block index as [block, the JSON gathered so far].
+            tool_blocks: dict[int, list] = {}
 
             function_calls = []
             async for event in response:
@@ -557,8 +558,8 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
                     if hasattr(event.delta, "text"):
                         await self._push_llm_text(event.delta.text)
                         completion_tokens_estimate += self._estimate_tokens(event.delta.text)
-                    elif hasattr(event.delta, "partial_json") and tool_use_block:
-                        json_accumulator += event.delta.partial_json
+                    elif hasattr(event.delta, "partial_json") and event.index in tool_blocks:
+                        tool_blocks[event.index][1] += event.delta.partial_json
                         completion_tokens_estimate += self._estimate_tokens(
                             event.delta.partial_json
                         )
@@ -572,8 +573,7 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
                         # the call itself is what the caller gets and TTFAT ends
                         # here rather than going unmeasured.
                         await self.stop_ttfat_metrics()
-                        tool_use_block = event.content_block
-                        json_accumulator = ""
+                        tool_blocks[event.index] = [event.content_block, ""]
                     elif event.content_block.type == "thinking":
                         await self.push_frame(
                             LLMThoughtStartFrame(
@@ -586,55 +586,46 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
                     and hasattr(event.delta, "stop_reason")
                     and event.delta.stop_reason == "tool_use"
                 ):
-                    if tool_use_block:
-                        args = json.loads(json_accumulator) if json_accumulator else {}
+                    # Every block becomes a call, in index order. One whose
+                    # JSON does not parse is skipped, and the others still run.
+                    for index in sorted(tool_blocks):
+                        block, arguments = tool_blocks[index]
+                        try:
+                            args = json.loads(arguments) if arguments else {}
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                f"{self}: Failed to parse function call arguments: {arguments}"
+                            )
+                            continue
                         function_calls.append(
                             FunctionCallFromLLM(
                                 context=context,
-                                tool_call_id=tool_use_block.id,
-                                function_name=tool_use_block.name,
+                                tool_call_id=block.id,
+                                function_name=block.name,
                                 arguments=args,
                             )
                         )
 
                 # Calculate usage. Do this here in its own if statement, because there may be usage
                 # data embedded in messages that we do other processing for, above.
+                # Anthropic's counters are cumulative: message_start reports them
+                # and each message_delta reports the running totals, any of which
+                # may be None. Each counter keeps the latest value reported.
                 if hasattr(event, "usage"):
-                    prompt_tokens += (
-                        event.usage.input_tokens if hasattr(event.usage, "input_tokens") else 0
-                    )
-                    completion_tokens += (
-                        event.usage.output_tokens if hasattr(event.usage, "output_tokens") else 0
-                    )
+                    usage = event.usage
                 elif hasattr(event, "message") and hasattr(event.message, "usage"):
-                    prompt_tokens += (
-                        event.message.usage.input_tokens
-                        if hasattr(event.message.usage, "input_tokens")
-                        else 0
-                    )
-                    completion_tokens += (
-                        event.message.usage.output_tokens
-                        if hasattr(event.message.usage, "output_tokens")
-                        else 0
-                    )
-                    cache_creation_input_tokens += (
-                        event.message.usage.cache_creation_input_tokens
-                        if (
-                            hasattr(event.message.usage, "cache_creation_input_tokens")
-                            and event.message.usage.cache_creation_input_tokens is not None
-                        )
-                        else 0
-                    )
-                    logger.debug(f"Cache creation input tokens: {cache_creation_input_tokens}")
-                    cache_read_input_tokens += (
-                        event.message.usage.cache_read_input_tokens
-                        if (
-                            hasattr(event.message.usage, "cache_read_input_tokens")
-                            and event.message.usage.cache_read_input_tokens is not None
-                        )
-                        else 0
-                    )
-                    logger.debug(f"Cache read input tokens: {cache_read_input_tokens}")
+                    usage = event.message.usage
+                else:
+                    usage = None
+                if usage is not None:
+                    if getattr(usage, "input_tokens", None) is not None:
+                        prompt_tokens = usage.input_tokens
+                    if getattr(usage, "output_tokens", None) is not None:
+                        completion_tokens = usage.output_tokens
+                    if getattr(usage, "cache_creation_input_tokens", None) is not None:
+                        cache_creation_input_tokens = usage.cache_creation_input_tokens
+                    if getattr(usage, "cache_read_input_tokens", None) is not None:
+                        cache_read_input_tokens = usage.cache_read_input_tokens
 
             await self.run_function_calls(function_calls)
 
