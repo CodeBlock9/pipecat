@@ -253,7 +253,7 @@ def test_sarvam_llm_build_chat_completion_params_filters_unsupported_fields():
     assert built_params["reasoning_effort"] == "medium"
 
 
-def test_sarvam_llm_build_params_forward_core_fields():
+def test_sarvam_llm_build_params_forward_core_and_extra_fields():
     with patch.object(SarvamLLMService, "create_client"):
         settings = SarvamLLMService.Settings(
             model="sarvam-105b",
@@ -283,55 +283,9 @@ def test_sarvam_llm_build_params_forward_core_fields():
     assert built_params["presence_penalty"] == 0.2
     assert built_params["seed"] == 11
     assert built_params["max_tokens"] == 222
-
-
-@pytest.mark.xfail(
-    strict=True,
-    raises=KeyError,
-    reason=(
-        "PT4-13 (T5): settings.extra never reaches the request. "
-        "merge_provider_options merges only _provider_options, which "
-        "apply_provider_options populates, so a service built with "
-        "Settings(extra=...) sends nothing."
-    ),
-)
-def test_sarvam_llm_build_params_forward_extra_fields():
-    with patch.object(SarvamLLMService, "create_client"):
-        settings = SarvamLLMService.Settings(
-            model="sarvam-105b",
-            temperature=0.9,
-            top_p=0.8,
-            frequency_penalty=0.1,
-            presence_penalty=0.2,
-            seed=11,
-            max_tokens=222,
-            extra={"n": 2},
-        )
-        service = SarvamLLMService(
-            api_key="test-key",
-            settings=settings,
-        )
-
-    invocation = OpenAILLMInvocationParams(
-        messages=[{"role": "user", "content": "Hello"}],
-        tools=OPENAI_NOT_GIVEN,
-        tool_choice=OPENAI_NOT_GIVEN,
-    )
-    built_params = service.build_chat_completion_params(invocation)
-
     assert built_params["n"] == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=KeyError,
-    reason=(
-        "PT4-13 (T5): settings.extra never reaches the request. "
-        "merge_provider_options merges only _provider_options, which "
-        "apply_provider_options populates, so a service built with "
-        "Settings(extra=...) sends nothing."
-    ),
-)
 def test_sarvam_llm_extra_body_merges_with_user_extra():
     with patch.object(SarvamLLMService, "create_client"):
         settings = SarvamLLMService.Settings(

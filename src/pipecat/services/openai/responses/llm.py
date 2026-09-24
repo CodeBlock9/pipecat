@@ -348,6 +348,12 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
     def _build_response_params(self, invocation_params: OpenAIResponsesLLMInvocationParams) -> dict:
         """Build parameters for a Responses API call.
 
+        ``settings.extra`` is deep-merged over the built parameters, and the
+        applied provider options are deep-merged over that, so an applied
+        option wins and a partial nested one keeps the builder's sibling keys.
+        Keys the SDK method has no parameter for are then moved into
+        ``extra_body``.
+
         Args:
             invocation_params: Parameters derived from the LLM context.
 
@@ -402,6 +408,7 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
             self._maybe_disable_reasoning(params)
 
         # Extra settings
+        params = self.merge_provider_options(params, include_declared=False)
         params = self.merge_provider_options(params)
         params = self._route_unsupported_options_to_extra_body(params)
 

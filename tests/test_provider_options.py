@@ -195,3 +195,146 @@ def test_sarvam_explicit_advanced_options_survive_compatibility_cleanup():
     assert params["stream_options"] == {"include_usage": False}
     assert params["max_completion_tokens"] == 321
     assert params["service_tier"] == "priority"
+
+
+# ---------------------------------------------------------------------------
+# settings.extra reaches the wire: the chat completion, Responses and Gemini
+# builders deep-merge it first, and the applied provider options merge over it.
+# Each service is built the way an application configures one, through
+# ``Settings(extra=...)``, never through ``apply_provider_options`` alone.
+# ---------------------------------------------------------------------------
+
+
+def _openai_service(extra, model="gpt-5-mini"):
+    from pipecat.services.openai.llm import OpenAILLMService
+
+    return OpenAILLMService(
+        api_key="test-key",
+        settings=OpenAILLMService.Settings(model=model, extra=extra),
+    )
+
+
+def test_settings_extra_reaches_the_chat_completion_request():
+    service = _openai_service({"reasoning_effort": "minimal", "verbosity": "low"})
+
+    params = service.build_chat_completion_params({"messages": []})
+
+    assert params.get("reasoning_effort") == "minimal"
+    assert params.get("verbosity") == "low"
+
+
+def test_settings_extra_the_sdk_cannot_take_rides_extra_body():
+    """DeepSeek's ``thinking`` is no parameter of the SDK method, so it is routed."""
+    from pipecat.services.openai.llm import OpenAILLMService
+
+    service = OpenAILLMService(
+        api_key="test-key",
+        base_url="https://api.deepseek.com",
+        settings=OpenAILLMService.Settings(
+            model="deepseek-chat", temperature=0.1, extra={"thinking": {"type": "disabled"}}
+        ),
+    )
+
+    params = service.build_chat_completion_params({"messages": []})
+
+    assert "thinking" not in params
+    assert params.get("extra_body", {}).get("thinking") == {"type": "disabled"}
+
+
+def test_applied_option_wins_over_settings_extra():
+    service = _openai_service({"reasoning_effort": "minimal", "verbosity": "low"})
+    service.apply_provider_options({"verbosity": "medium"})
+
+    params = service.build_chat_completion_params({"messages": []})
+
+    assert (params.get("verbosity"), params.get("reasoning_effort")) == ("medium", "minimal")
+
+
+def test_applied_nested_option_keeps_the_builders_sibling_keys():
+    """``apply_provider_options`` also mirrors an undeclared option into
+    ``settings.extra``. Applied there wholesale, a partial nested option would
+    replace the builder's own value: here ``include_usage``, and with it the
+    usage chunk the call's token count comes from."""
+    service = _openai_service({})
+    service.apply_provider_options({"stream_options": {"include_obfuscation": False}})
+
+    params = service.build_chat_completion_params({"messages": []})
+
+    assert params["stream_options"] == {"include_usage": True, "include_obfuscation": False}
+
+
+def test_a_nested_settings_extra_value_is_not_shared_with_the_request():
+    """A later edit of the request, as Sarvam's and Dograh's builders make in
+    place, must not rewrite the stored settings."""
+    service = _openai_service({"metadata": {"source": "profile"}})
+
+    params = service.build_chat_completion_params({"messages": []})
+    assert params.get("metadata") == {"source": "profile"}
+    params["metadata"]["source"] = "mutated"
+
+    assert service._settings.extra["metadata"] == {"source": "profile"}
+
+
+def test_deepseek_service_sends_settings_extra():
+    from pipecat.services.deepseek.llm import DeepSeekLLMService
+
+    service = DeepSeekLLMService(
+        api_key="test-key",
+        settings=DeepSeekLLMService.Settings(model="deepseek-chat", extra={"logprobs": True}),
+    )
+
+    params = service.build_chat_completion_params({"messages": []})
+
+    assert params.get("logprobs") is True
+
+
+def test_deepseek_service_routes_applied_options_through_the_base_builder():
+    from pipecat.services.deepseek.llm import DeepSeekLLMService
+
+    service = DeepSeekLLMService(api_key="test-key")
+    service.apply_provider_options({"thinking": {"type": "enabled"}})
+
+    params = service.build_chat_completion_params({"messages": []})
+
+    assert "thinking" not in params
+    assert params["extra_body"] == {"thinking": {"type": "enabled"}}
+
+
+def test_responses_builder_sends_settings_extra():
+    from pipecat.services.openai.responses.llm import OpenAIResponsesHttpLLMService
+
+    service = OpenAIResponsesHttpLLMService(
+        api_key="test-key",
+        settings=OpenAIResponsesHttpLLMService.Settings(
+            model="gpt-4.1", extra={"truncation": "auto"}
+        ),
+    )
+
+    params = service._build_response_params({"input": []})
+
+    assert params.get("truncation") == "auto"
+
+
+def _gemini_service(extra):
+    from pipecat.services.google.llm import GoogleLLMService
+
+    return GoogleLLMService(
+        api_key="test-key",
+        settings=GoogleLLMService.Settings(model="gemini-2.5-flash", extra=extra),
+    )
+
+
+def test_gemini_builder_sends_settings_extra():
+    service = _gemini_service({"response_mime_type": "text/plain"})
+
+    params = service._build_generation_params()
+
+    assert params.get("response_mime_type") == "text/plain"
+
+
+def test_gemini_thinking_config_in_settings_extra_beats_the_low_latency_default():
+    service = _gemini_service({"thinking_config": {"thinking_budget": 1024}})
+
+    params = service._build_generation_params()
+
+    assert params["thinking_config"] == {"thinking_budget": 1024}

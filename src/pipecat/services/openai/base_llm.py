@@ -444,6 +444,12 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
         Subclasses can override this to customize parameters for different providers.
 
+        ``settings.extra`` is deep-merged over the built parameters, and the
+        applied provider options are deep-merged over that, so an applied
+        option wins and a partial nested one keeps the builder's sibling keys.
+        Keys the SDK method has no parameter for are then moved into
+        ``extra_body``.
+
         Args:
             params_from_context: Parameters, derived from the LLM context, to
                 use for the chat completion. Contains messages, tools, and tool
@@ -471,6 +477,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # Messages, tools, tool_choice
         params.update(params_from_context)
 
+        params = self.merge_provider_options(params, include_declared=False)
         params = self.merge_provider_options(params)
         params = self._route_unsupported_options_to_extra_body(params)
 

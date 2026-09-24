@@ -72,16 +72,6 @@ def test_unset_params_are_omitted(service_factory):
     assert isinstance(params["frequency_penalty"], NotGiven)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=KeyError,
-    reason=(
-        "PT2-04 (T5): settings.extra never reaches the request. "
-        "merge_provider_options merges only _provider_options, which "
-        "apply_provider_options populates, so a service built with "
-        "Settings(extra=...) sends nothing."
-    ),
-)
 def test_extra_passes_provider_specific_params(service_factory):
     """``extra`` carries Cerebras-only params such as ``reasoning_effort``."""
     service = service_factory(model="gpt-oss-120b", extra={"reasoning_effort": "low"})
