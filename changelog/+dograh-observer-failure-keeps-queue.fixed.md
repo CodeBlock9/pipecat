@@ -1,0 +1,1 @@
+- An observer callback that raises costs `WorkerObserver` that one event instead of the observer's whole queue. The failure ended the observer's delivery task, so its later events were lost and `wait_until_idle` never returned. The first failure of each observer is logged with its traceback, and later ones at debug.

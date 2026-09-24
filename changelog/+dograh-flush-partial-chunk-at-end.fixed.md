@@ -1,0 +1,1 @@
+- `BaseOutputTransport` plays the trailing partial chunk of raw and speech-stream audio, padded with silence, before it stops on an `EndFrame`. Only a `TTSStoppedFrame` flushed it before, so audio with no TTS framing, such as a realtime speech stream, lost up to one chunk at the end.
