@@ -522,18 +522,27 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # LLM completion
         response = await self._client.chat.completions.create(**params)
 
-        self.record_inference_usage(self._inference_token_usage(response))
+        self.record_inference_usage(self._token_usage(response))
 
         return response.choices[0].message.content
 
-    def _inference_token_usage(self, response) -> LLMTokenUsage | None:
-        """Build token usage from a non-streaming chat completion.
+    def _token_usage(self, completion) -> LLMTokenUsage | None:
+        """Build token usage from a chat completion or one streamed chunk.
 
-        Mirrors the accounting `_stream_chat_completions` reports for streamed
-        turns, so an out-of-band inference is metered on the same basis as one
-        that ran in the pipeline.
+        A streamed ``ChatCompletionChunk`` carries the same ``usage`` attribute
+        as a whole ``ChatCompletion``, so the streaming loop and
+        ``run_inference`` meter on one basis. A count the provider leaves out
+        is reported as 0: ``LLMTokenUsage`` requires integers, and a usage
+        block that failed to build would lose the whole turn, tool calls
+        included.
+
+        Args:
+            completion: The completion, or the streamed chunk, to read.
+
+        Returns:
+            The usage, or None when the completion carries none.
         """
-        usage = getattr(response, "usage", None)
+        usage = getattr(completion, "usage", None)
         if not usage:
             return None
         prompt_details = getattr(usage, "prompt_tokens_details", None)
@@ -552,15 +561,81 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
             ),
         )
 
+    @staticmethod
+    def _accumulate_tool_call_deltas(calls: dict[int | str, dict[str, str]], tool_calls) -> None:
+        """Fold every tool-call entry of one streamed delta into the turn's calls.
+
+        A provider may send several calls in one delta, or interleave the
+        fragments of several calls, so every entry is read, not only the first.
+        An entry belongs to the call its ``index`` names. A provider that sends
+        no index (SambaNova) is keyed by the call's ``id`` instead, and an entry
+        with neither continues the call started last. Name and argument
+        fragments are appended, and the id is recorded when the entry has one.
+
+        Args:
+            calls: The turn's accumulator, in the order the calls started. Each
+                value holds the ``name``, ``id`` and ``arguments`` gathered so far.
+            tool_calls: The ``tool_calls`` of one streamed delta.
+        """
+        for tool_call in tool_calls:
+            if tool_call.index is not None:
+                key = tool_call.index
+            elif tool_call.id:
+                key = tool_call.id
+            else:
+                key = next(reversed(calls), 0)
+            call = calls.setdefault(key, {"name": "", "id": "", "arguments": ""})
+            if tool_call.id:
+                call["id"] = tool_call.id
+            if tool_call.function and tool_call.function.name:
+                call["name"] += tool_call.function.name
+            if tool_call.function and tool_call.function.arguments:
+                call["arguments"] += tool_call.function.arguments
+
+    def _function_calls_from_stream(
+        self, context: LLMContext, calls: dict[int | str, dict[str, str]]
+    ) -> list[FunctionCallFromLLM]:
+        """Build the function calls a streamed turn asked for.
+
+        Calls are built in the order they started. A call that never received
+        a name cannot be dispatched, so it is skipped with a warning. Arguments
+        default to ``{}``, and a call whose arguments do not parse is skipped
+        with a warning. Either way, the other calls of the turn still run.
+
+        Args:
+            context: The context the turn ran on.
+            calls: The accumulator ``_accumulate_tool_call_deltas`` filled.
+
+        Returns:
+            The function calls to run, possibly none.
+        """
+        function_calls = []
+        for call in calls.values():
+            if not call["name"]:
+                logger.warning(f"{self}: Skipping a streamed tool call with no name: {call}")
+                continue
+            try:
+                arguments = json.loads(call["arguments"] or "{}")
+            except json.JSONDecodeError:
+                logger.warning(
+                    f"{self}: Failed to parse function call arguments: {call['arguments']}"
+                )
+                continue
+            function_calls.append(
+                FunctionCallFromLLM(
+                    context=context,
+                    tool_call_id=call["id"],
+                    function_name=call["name"],
+                    arguments=arguments,
+                )
+            )
+        return function_calls
+
     @traced_llm
     async def _process_context(self, context: LLMContext):
-        functions_list = []
-        arguments_list = []
-        tool_id_list = []
-        func_idx = 0
-        function_name = ""
-        arguments = ""
-        tool_call_id = ""
+        # The turn's tool calls, gathered from every delta of the stream and
+        # dispatched together once it ends.
+        calls: dict[int | str, dict[str, str]] = {}
 
         # Reset pending node-transition calls when processing a new context.
         self._pending_node_transition_function_calls = []
@@ -602,24 +677,10 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         try:
             async with _closing(chunk_stream) as chunk_iter:
                 async for chunk in chunk_iter:
+                    # Guarded, so a chunk without usage after the one that
+                    # carried it does not clear the turn's usage.
                     if chunk.usage:
-                        cached_tokens = (
-                            chunk.usage.prompt_tokens_details.cached_tokens
-                            if chunk.usage.prompt_tokens_details
-                            else None
-                        )
-                        reasoning_tokens = (
-                            chunk.usage.completion_tokens_details.reasoning_tokens
-                            if chunk.usage.completion_tokens_details
-                            else None
-                        )
-                        token_usage = LLMTokenUsage(
-                            prompt_tokens=chunk.usage.prompt_tokens,
-                            completion_tokens=chunk.usage.completion_tokens,
-                            total_tokens=chunk.usage.total_tokens,
-                            cache_read_input_tokens=cached_tokens,
-                            reasoning_tokens=reasoning_tokens,
-                        )
+                        token_usage = self._token_usage(chunk)
 
                     if chunk.model and self.get_full_model_name() != chunk.model:
                         self.set_full_model_name(chunk.model)
@@ -638,32 +699,10 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                         # here rather than going unmeasured.
                         await self.stop_ttfat_metrics()
 
-                        # We're streaming the LLM response to enable the fastest response times.
-                        # For text, we just yield each chunk as we receive it and count on consumers
-                        # to do whatever coalescing they need (eg. to pass full sentences to TTS)
-                        #
-                        # If the LLM is a function call, we'll do some coalescing here.
-                        # If the response contains a function name, we'll yield a frame to tell consumers
-                        # that they can start preparing to call the function with that name.
-                        # We accumulate all the arguments for the rest of the streamed response, then when
-                        # the response is done, we package up all the arguments and the function name and
-                        # yield a frame containing the function name and the arguments.
-
-                        tool_call = chunk.choices[0].delta.tool_calls[0]
-                        if tool_call.index != func_idx:
-                            functions_list.append(function_name)
-                            arguments_list.append(arguments or "{}")
-                            tool_id_list.append(tool_call_id)
-                            function_name = ""
-                            arguments = ""
-                            tool_call_id = ""
-                            func_idx += 1
-                        if tool_call.function and tool_call.function.name:
-                            function_name += tool_call.function.name
-                            tool_call_id = tool_call.id
-                        if tool_call.function and tool_call.function.arguments:
-                            # Keep iterating through the response to collect all the argument fragments
-                            arguments += tool_call.function.arguments
+                        # Text is pushed chunk by chunk, but a tool call is
+                        # only usable whole: its fragments are gathered here and
+                        # the calls are built once the stream ends.
+                        self._accumulate_tool_call_deltas(calls, chunk.choices[0].delta.tool_calls)
                     elif chunk.choices[0].delta.content:
                         text_generated_signal = True
                         await self._push_llm_text(chunk.choices[0].delta.content)
@@ -683,34 +722,10 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
             if token_usage:
                 await self.start_llm_usage_metrics(token_usage)
 
-        # if we got a function name and arguments, check to see if it's a function with
-        # a registered handler. If so, run the registered callback, save the result to
-        # the context, and re-prompt to get a chat answer. If we don't have a registered
-        # handler, raise an exception.
-        if function_name:
-            # added to the list as last function name and arguments not added to the list
-            functions_list.append(function_name)
-            arguments_list.append(arguments or "{}")
-            tool_id_list.append(tool_call_id)
-
-            function_calls = []
-
-            for function_name, arguments, tool_id in zip(
-                functions_list, arguments_list, tool_id_list
-            ):
-                try:
-                    arguments = json.loads(arguments)
-                except json.JSONDecodeError:
-                    logger.warning(f"{self}: Failed to parse function call arguments: {arguments}")
-                    continue
-                function_calls.append(
-                    FunctionCallFromLLM(
-                        context=context,
-                        tool_call_id=tool_id,
-                        function_name=function_name,
-                        arguments=arguments,
-                    )
-                )
+        # Run every call the turn asked for. A call with no registered handler
+        # gets the missing-function result from run_function_calls.
+        if calls:
+            function_calls = self._function_calls_from_stream(context, calls)
 
             # Send the info frame with function calls so that it can be traced by service_decorators
             await self.push_frame(

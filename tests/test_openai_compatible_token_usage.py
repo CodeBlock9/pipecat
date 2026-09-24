@@ -9,7 +9,8 @@
 Providers differ in how often they send usage: some once at the end, others a
 cumulative snapshot on every streamed chunk. The base streaming loop holds the
 latest snapshot and reports it when the completion finishes, so a single turn
-produces a single usage metric either way.
+produces a single usage metric either way. A completion cancelled mid-stream
+still reports its usage and closes its stream.
 """
 
 import asyncio
@@ -28,8 +29,9 @@ from pipecat.services.perplexity.llm import PerplexityLLMService
 from pipecat.services.sambanova.llm import SambaNovaLLMService
 from pipecat.services.xai.llm import GrokLLMService
 
-# SambaNova keeps its own copy of the streaming loop, so it is covered here
-# alongside the services that inherit the base one.
+# Every service here runs the base streaming loop. SambaNova used to keep its
+# own copy of the loop; it stays listed so that a copy brought back must pass
+# the same cases.
 SERVICES = [
     pytest.param(OpenAILLMService, {"api_key": "test-key"}, id="openai"),
     pytest.param(BasetenLLMService, {"api_key": "test-key"}, id="baseten"),
@@ -59,14 +61,14 @@ def _usage_chunk(prompt_tokens: int, completion_tokens: int, reasoning_tokens: i
 class _FakeStream:
     """Stands in for the provider's chat completion stream.
 
-    Satisfies the base streaming loop, which iterates and then closes the
-    stream, as well as SambaNova's copy, which enters it as an async context
-    manager.
+    The base streaming loop only iterates the stream and then closes it, so the
+    fake records the close.
     """
 
     def __init__(self, chunks, raise_at_end=None):
         self._chunks = list(chunks)
         self._raise_at_end = raise_at_end
+        self.closed = False
 
     def __aiter__(self):
         return self._iterate()
@@ -77,14 +79,8 @@ class _FakeStream:
         if self._raise_at_end:
             raise self._raise_at_end
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc_info):
-        return False
-
     async def close(self):
-        pass
+        self.closed = True
 
 
 def _service(service_class, init_kwargs, chunks, raise_at_end=None):
@@ -139,6 +135,21 @@ async def test_usage_is_reported_when_the_response_is_interrupted(service_class,
 
     reported.assert_called_once()
     assert reported.call_args.args[0].completion_tokens == 12
+
+
+@pytest.mark.parametrize(("service_class", "init_kwargs"), SERVICES)
+@pytest.mark.asyncio
+async def test_the_stream_is_closed_when_the_response_is_cancelled(service_class, init_kwargs):
+    """A completion cancelled mid-stream still closes its stream, so no socket leaks (#3639)."""
+    service = _service(
+        service_class, init_kwargs, [_usage_chunk(20, 5)], raise_at_end=asyncio.CancelledError()
+    )
+    stream = service.get_chat_completions.return_value
+
+    with pytest.raises(asyncio.CancelledError):
+        await service._process_context(_context())
+
+    assert stream.closed
 
 
 @pytest.mark.parametrize(("service_class", "init_kwargs"), SERVICES)

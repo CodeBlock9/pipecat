@@ -6,22 +6,14 @@
 
 """SambaNova LLM service implementation using OpenAI-compatible interface."""
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
 
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMInvocationParams
-from pipecat.frames.frames import (
-    LLMTextFrame,
-)
-from pipecat.metrics.metrics import LLMTokenUsage
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.services.llm_service import FunctionCallFromLLM
 from pipecat.services.openai.base_llm import BaseOpenAILLMService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.utils.tracing.service_decorators import traced_llm
 
 
 @dataclass
@@ -134,141 +126,3 @@ class SambaNovaLLMService(OpenAILLMService):
         params.update(self._settings.extra)
 
         return params
-
-    @traced_llm
-    async def _process_context(self, context: LLMContext):
-        """Process OpenAI LLM context and stream chat completion chunks.
-
-        This method handles the streaming response from SambaNova API, including
-        function call processing and text frame generation. It includes special
-        handling for SambaNova's API limitations with tool call indexing.
-
-        Args:
-            context: OpenAI LLM context containing conversation state and tools.
-        """
-        functions_list = []
-        arguments_list = []
-        tool_id_list = []
-        func_idx = 0
-        function_name = ""
-        arguments = ""
-        tool_call_id = ""
-
-        await self.start_ttfb_metrics()
-
-        chunk_stream = await self.get_chat_completions(context)
-
-        # Providers differ in how often they send usage: some once at the end,
-        # others a cumulative snapshot on every chunk. Holding the latest and
-        # reporting it after the stream keeps that to one report per completion.
-        token_usage: LLMTokenUsage | None = None
-
-        try:
-            # Use context manager to ensure stream is closed on cancellation/exception.
-            # Without this, CancelledError during iteration leaves the underlying socket open.
-            async with chunk_stream:
-                async for chunk in chunk_stream:
-                    if chunk.usage:
-                        prompt_tokens_details = getattr(chunk.usage, "prompt_tokens_details", None)
-                        cached_tokens = (
-                            prompt_tokens_details.cached_tokens if prompt_tokens_details else None
-                        )
-                        completion_tokens_details = getattr(
-                            chunk.usage, "completion_tokens_details", None
-                        )
-                        reasoning_tokens = (
-                            completion_tokens_details.reasoning_tokens
-                            if completion_tokens_details
-                            else None
-                        )
-                        token_usage = LLMTokenUsage(
-                            prompt_tokens=chunk.usage.prompt_tokens,
-                            completion_tokens=chunk.usage.completion_tokens,
-                            total_tokens=chunk.usage.total_tokens,
-                            cache_read_input_tokens=cached_tokens,
-                            reasoning_tokens=reasoning_tokens,
-                        )
-
-                    if chunk.choices is None or len(chunk.choices) == 0:
-                        continue
-
-                    await self.stop_ttfb_metrics()
-
-                    if not chunk.choices[0].delta:
-                        continue
-
-                    if chunk.choices[0].delta.tool_calls:
-                        # We're streaming the LLM response to enable the fastest response times.
-                        # For text, we just yield each chunk as we receive it and count on consumers
-                        # to do whatever coalescing they need (eg. to pass full sentences to TTS)
-                        #
-                        # If the LLM is a function call, we'll do some coalescing here.
-                        # If the response contains a function name, we'll yield a frame to tell consumers
-                        # that they can start preparing to call the function with that name.
-                        # We accumulate all the arguments for the rest of the streamed response, then when
-                        # the response is done, we package up all the arguments and the function name and
-                        # yield a frame containing the function name and the arguments.
-
-                        tool_call = chunk.choices[0].delta.tool_calls[0]
-                        if tool_call.index != func_idx:
-                            functions_list.append(function_name)
-                            arguments_list.append(arguments)
-                            tool_id_list.append(tool_call_id)
-                            function_name = ""
-                            arguments = ""
-                            tool_call_id = ""
-                            func_idx += 1
-                        if tool_call.function and tool_call.function.name:
-                            function_name += tool_call.function.name
-                            tool_call_id = tool_call.id
-                        if tool_call.function and tool_call.function.arguments:
-                            # Keep iterating through the response to collect all the argument fragments
-                            arguments += tool_call.function.arguments
-                    elif chunk.choices[0].delta.content:
-                        await self.push_frame(LLMTextFrame(chunk.choices[0].delta.content))
-
-                    # When gpt-4o-audio / gpt-4o-mini-audio is used for llm or stt+llm
-                    # we need to get LLMTextFrame for the transcript
-                    elif (audio := getattr(chunk.choices[0].delta, "audio", None)) and audio.get(
-                        "transcript"
-                    ):
-                        await self.push_frame(LLMTextFrame(audio["transcript"]))
-        finally:
-            # Report even if the response is interrupted or cancelled mid-stream.
-            if token_usage:
-                await self.start_llm_usage_metrics(token_usage)
-
-        # if we got a function name and arguments, check to see if it's a function with
-        # a registered handler. If so, run the registered callback, save the result to
-        # the context, and re-prompt to get a chat answer. If we don't have a registered
-        # handler, raise an exception.
-        if function_name and arguments:
-            # added to the list as last function name and arguments not added to the list
-            functions_list.append(function_name)
-            arguments_list.append(arguments)
-            tool_id_list.append(tool_call_id)
-
-            function_calls = []
-
-            for function_name, arguments, tool_id in zip(
-                functions_list, arguments_list, tool_id_list
-            ):
-                # This allows compatibility until SambaNova API introduces indexing in tool calls.
-                if len(arguments) < 1:
-                    continue
-
-                try:
-                    arguments = json.loads(arguments)
-                except json.JSONDecodeError:
-                    logger.warning(f"{self}: Failed to parse function call arguments: {arguments}")
-                    continue
-                function_calls.append(
-                    FunctionCallFromLLM(
-                        context=context,
-                        tool_call_id=tool_id,
-                        function_name=function_name,
-                        arguments=arguments,
-                    )
-                )
-
-            await self.run_function_calls(function_calls)
