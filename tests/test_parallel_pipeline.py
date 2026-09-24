@@ -31,6 +31,17 @@ class TestSeenIdsAreBounded(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(parallel.push_frame.await_count, 15000)
 
+    async def test_a_copy_within_the_bound_is_dropped(self):
+        """A copy that trails its original by one frame less than the bound is still dropped."""
+        parallel = ParallelPipeline([IdentityFilter()], [IdentityFilter()])
+        parallel.push_frame = AsyncMock()
+        first = TextFrame("x")
+        await parallel._parallel_push_frame(first, FrameDirection.DOWNSTREAM)
+        for _ in range(SEEN_IDS_BOUND - 1):
+            await parallel._parallel_push_frame(TextFrame("x"), FrameDirection.DOWNSTREAM)
+        await parallel._parallel_push_frame(first, FrameDirection.DOWNSTREAM)
+        self.assertEqual(parallel.push_frame.await_count, SEEN_IDS_BOUND)
+
     async def test_a_duplicate_from_the_other_branch_is_dropped(self):
         """The same frame arriving twice is pushed once."""
         parallel = ParallelPipeline([IdentityFilter()], [IdentityFilter()])
