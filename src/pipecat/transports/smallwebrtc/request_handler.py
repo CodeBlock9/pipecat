@@ -203,6 +203,10 @@ class SmallWebRTCRequestHandler:
                     type=request.type,
                     restart_pc=request.restart_pc or False,
                 )
+                # A restart re-initializes the connection under a new peer id,
+                # which the answer maps below; the old id must not stay mapped.
+                if pipecat_connection.pc_id != pc_id:
+                    self._pcs_map.pop(pc_id, None)
             else:
                 pipecat_connection = SmallWebRTCConnection(ice_servers=self._ice_servers)
                 await pipecat_connection.initialize(sdp=request.sdp, type=request.type)
