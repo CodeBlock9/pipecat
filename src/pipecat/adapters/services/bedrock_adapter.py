@@ -210,7 +210,9 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
         """Convert standard format message to AWS Bedrock format.
 
         Handles conversion of text content, tool calls, and tool results.
-        Empty text content is converted to "(empty)".
+        Empty text content is converted to "(empty)". Text beside tool calls
+        becomes text blocks ahead of the ``toolUse`` blocks; blank text there
+        adds none.
 
         Args:
             message: Message in standard format.
@@ -223,6 +225,7 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
 
                 {
                     "role": "assistant",
+                    "content": "Let me search.",
                     "tool_calls": [
                         {
                             "id": "123",
@@ -236,6 +239,7 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
                 {
                     "role": "assistant",
                     "content": [
+                        {"text": "Let me search."},
                         {
                             "toolUse": {
                                 "toolUseId": "123",
@@ -275,7 +279,19 @@ class AWSBedrockLLMAdapter(BaseLLMAdapter[AWSBedrockLLMInvocationParams]):
 
         if msg.get("tool_calls"):
             tc = msg["tool_calls"]
-            ret: dict[str, Any] = {"role": "assistant", "content": []}
+            # Text the model said beside its calls leads them in the same
+            # message, as Converse returns it. Bedrock rejects a blank text
+            # block, so missing, empty or whitespace-only text adds none.
+            content = msg.get("content")
+            texts = (
+                [content]
+                if isinstance(content, str)
+                else [item.get("text", "") for item in content or [] if item.get("type") == "text"]
+            )
+            ret: dict[str, Any] = {
+                "role": "assistant",
+                "content": [{"text": text} for text in texts if text.strip()],
+            }
             for tool_call in tc:
                 function = tool_call["function"]
                 arguments = json.loads(function["arguments"])

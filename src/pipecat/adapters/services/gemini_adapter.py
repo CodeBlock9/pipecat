@@ -418,7 +418,8 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
         Handles conversion of text, images, and function calls to Google's
         format. System and developer messages at this stage (i.e. non-initial
         ones, since the initial one is already extracted) are converted to
-        user role.
+        user role. Text beside function calls becomes parts ahead of the
+        ``function_call`` parts; blank text there adds none.
 
         Args:
             message: Message in standard universal context format.
@@ -446,6 +447,7 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
 
                 {
                     "role": "assistant",
+                    "content": "Let me search.",
                     "tool_calls": [
                         {
                             "function": {
@@ -459,8 +461,11 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
             Converts to Google Content with::
 
                 Content(
-                    role="user",
-                    parts=[Part(function_call=FunctionCall(name="search", args={"query": "test"}))]
+                    role="model",
+                    parts=[
+                        Part(text="Let me search."),
+                        Part(function_call=FunctionCall(name="search", args={"query": "test"})),
+                    ]
                 )
         """
         # ChatCompletionMessageParam (a union of TypedDicts) doesn't allow
@@ -479,21 +484,7 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
         parts = []
         tool_call_id_to_name_mapping = {}
 
-        if msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
-                id = tc["id"]
-                name = tc["function"]["name"]
-                tool_call_id_to_name_mapping[id] = name
-                parts.append(
-                    Part(
-                        function_call=FunctionCall(
-                            id=id,
-                            name=name,
-                            args=json.loads(tc["function"]["arguments"]),
-                        )
-                    )
-                )
-        elif role == "tool":
+        if role == "tool":
             role = "user"
             response_dict = self.to_function_response_dict(msg["content"])
 
@@ -547,6 +538,25 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
                             )
                         )
                     )
+
+        if msg.get("tool_calls"):
+            # Text the model said beside its calls leads them in the same model
+            # turn, as Gemini returns it; missing, empty or whitespace-only text
+            # adds nothing.
+            parts = [part for part in parts if part.text is None or part.text.strip()]
+            for tc in msg["tool_calls"]:
+                id = tc["id"]
+                name = tc["function"]["name"]
+                tool_call_id_to_name_mapping[id] = name
+                parts.append(
+                    Part(
+                        function_call=FunctionCall(
+                            id=id,
+                            name=name,
+                            args=json.loads(tc["function"]["arguments"]),
+                        )
+                    )
+                )
 
         return self.MessageConversionResult(
             content=Content(role=role, parts=parts),
@@ -612,11 +622,16 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
             return messages
 
         def is_tool_call_message(msg: Content) -> bool:
-            """Check if message contains only function_call parts."""
+            """Check if message is a model turn of function_call parts, text beside them allowed."""
             return bool(
                 msg.role == "model"
                 and msg.parts
-                and all(getattr(part, "function_call", None) for part in msg.parts)
+                and any(getattr(part, "function_call", None) for part in msg.parts)
+                and all(
+                    getattr(part, "function_call", None)
+                    or (getattr(part, "text", None) is not None)
+                    for part in msg.parts
+                )
             )
 
         def is_tool_response_message(msg: Content) -> bool:
