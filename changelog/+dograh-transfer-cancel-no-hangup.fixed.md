@@ -1,0 +1,1 @@
+- `FastAPIWebsocketOutputTransport` no longer writes a `CancelFrame` while a transfer is in progress. A cancel that cut an `EndFrame(TRANSFER_CALL)` short reached the serializer, which took it as a hangup of the call being transferred.

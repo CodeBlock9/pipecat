@@ -15,18 +15,32 @@ the idle monitor, not by an outer cancellation, not by anyone.
 A processor holds the EndFrame the way a farewell still playing, or a carrier
 request that never returns, does. Every await is bounded, so a regression is a
 red assertion and never a stuck run.
+
+The r10 tests hold the rule that a cancel preempting an EndFrame(TRANSFER_CALL)
+hangs nothing up: the redirect's outcome is unknown, and a hangup would turn
+the transfer into a disconnect. They use the real FastAPI websocket output
+transport and Twilio serializer, with a redirect that never returns and a
+hangup strategy that records every call.
 """
 
 import asyncio
+from unittest.mock import AsyncMock, PropertyMock
 
 import pytest
+from starlette.websockets import WebSocketState
 
 from pipecat.frames.frames import BotSpeakingFrame, CancelFrame, EndFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineWorker, WorkerParams
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.serializers.call_strategies import HangupStrategy, TransferStrategy
+from pipecat.serializers.twilio import TwilioFrameSerializer
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 from pipecat.utils.asyncio.task_manager import TaskManager
+from pipecat.utils.enums import EndTaskReason
 from pipecat.workers.runner import WorkerRunner
+
+TRANSFER = EndTaskReason.TRANSFER_CALL.value
 
 
 class _HoldsEnd(FrameProcessor):
@@ -104,6 +118,59 @@ class _Stuck(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class _StalledTransfer(TransferStrategy):
+    """A conference redirect whose HTTP response never comes back.
+
+    With ``ws_state`` given, the carrier is taken to have acted on the redirect
+    and closed the media stream before the response went missing.
+    """
+
+    def __init__(self, ws_state: dict | None = None, completes: bool = False):
+        self.entered = asyncio.Event()
+        self.calls = 0
+        self._ws_state = ws_state
+        self._completes = completes
+
+    async def execute_transfer(self, context):
+        self.calls += 1
+        self.entered.set()
+        if self._completes:
+            return True
+        if self._ws_state is not None:
+            self._ws_state["client"] = WebSocketState.DISCONNECTED
+        await asyncio.Event().wait()
+        return True
+
+
+class _RecordingHangup(HangupStrategy):
+    def __init__(self):
+        self.calls: list = []
+
+    async def execute_hangup(self, context):
+        self.calls.append(context.get("call_sid"))
+        return True
+
+
+def _transport(ws_state: dict, transfer: TransferStrategy, hangup: HangupStrategy):
+    ws = AsyncMock()
+    type(ws).client_state = PropertyMock(side_effect=lambda: ws_state["client"])
+    type(ws).application_state = PropertyMock(side_effect=lambda: ws_state["app"])
+    serializer = TwilioFrameSerializer(
+        stream_sid="MZ-probe",
+        call_sid="CA-probe",
+        account_sid="AC-probe",
+        auth_token="probe-token",
+        transfer_strategy=transfer,
+        hangup_strategy=hangup,
+    )
+    params = FastAPIWebsocketParams(serializer=serializer, allowed_origins=[])
+    return FastAPIWebsocketTransport(websocket=ws, params=params)
+
+
+def _open_socket() -> dict:
+    return {"client": WebSocketState.CONNECTED, "app": WebSocketState.CONNECTED}
+
+
 def _worker(holder: FrameProcessor, **kwargs) -> tuple[PipelineWorker, list, list]:
     kwargs.setdefault("idle_timeout_secs", None)
     kwargs.setdefault("cancel_timeout_secs", 0.5)
@@ -147,13 +214,13 @@ async def _force_down(run: asyncio.Task, worker: PipelineWorker):
         worker._pipeline_end_event.set()
         run.cancel()
         await asyncio.wait({run}, timeout=1)
-    await asyncio.gather(run, return_exceptions=True)
+    await asyncio.wait({run}, timeout=5)
 
 
 @pytest.mark.asyncio
 async def test_a_cancel_preempts_a_graceful_end_that_never_lands():
     holder = _HoldsEnd()
-    worker, finished, _ = _worker(holder)
+    worker, finished, timeouts = _worker(holder)
     run = asyncio.create_task(worker.run(WorkerParams(task_manager=TaskManager())))
     try:
         await _started(worker, run)
@@ -167,6 +234,7 @@ async def test_a_cancel_preempts_a_graceful_end_that_never_lands():
             "run() was still waiting on its EndFrame 3 s after a cancel bounded at 0.2 s"
         )
         assert len(finished) == 1, f"on_pipeline_finished fired {finished}"
+        assert timeouts == [], f"on_pipeline_timeout fired {timeouts}"
         assert finished == ["CancelFrame"], (
             "a preempted end finishes as the cancel that preempted it"
         )
@@ -177,7 +245,7 @@ async def test_a_cancel_preempts_a_graceful_end_that_never_lands():
 @pytest.mark.asyncio
 async def test_the_idle_timeout_ends_a_worker_stalled_on_its_graceful_end():
     holder = _HoldsEnd()
-    worker, finished, _ = _worker(holder, idle_timeout_secs=0.3)
+    worker, finished, timeouts = _worker(holder, idle_timeout_secs=0.3)
     run = asyncio.create_task(_run_like_mesa(worker))
     try:
         await _started(worker, run)
@@ -190,6 +258,7 @@ async def test_the_idle_timeout_ends_a_worker_stalled_on_its_graceful_end():
             "EndFrame within 4 s (idle timeout 0.3 s, cancel timeout 0.5 s)"
         )
         assert len(finished) == 1, f"on_pipeline_finished fired {finished}"
+        assert timeouts == [], f"on_pipeline_timeout fired {timeouts}"
     finally:
         await _force_down(run, worker)
 
@@ -197,7 +266,7 @@ async def test_the_idle_timeout_ends_a_worker_stalled_on_its_graceful_end():
 @pytest.mark.asyncio
 async def test_an_outer_cancellation_ends_a_worker_stalled_on_its_graceful_end():
     holder = _HoldsEnd()
-    worker, finished, _ = _worker(holder)
+    worker, finished, timeouts = _worker(holder)
     run = asyncio.create_task(_run_like_mesa(worker))
     try:
         await _started(worker, run)
@@ -212,6 +281,7 @@ async def test_an_outer_cancellation_ends_a_worker_stalled_on_its_graceful_end()
             "during a graceful end"
         )
         assert len(finished) == 1, f"on_pipeline_finished fired {finished}"
+        assert timeouts == [], f"on_pipeline_timeout fired {timeouts}"
     finally:
         await _force_down(run, worker)
 
@@ -292,5 +362,93 @@ async def test_the_cancel_that_preempts_an_end_is_waited_for_once():
         assert run in done
         assert timeouts == ["CancelFrame"], f"on_pipeline_timeout fired {timeouts}"
         assert finished == ["CancelFrame"], f"on_pipeline_finished fired {finished}"
+    finally:
+        await _force_down(run, worker)
+
+
+@pytest.mark.asyncio
+async def test_r10_a_cancel_preempting_a_stalled_transfer_hangs_nothing_up():
+    """The media socket is still open when the cancel preempts the transfer."""
+    transfer, hangup = _StalledTransfer(), _RecordingHangup()
+    transport = _transport(_open_socket(), transfer, hangup)
+    worker, finished, _ = _worker(transport.output())
+    run = asyncio.create_task(worker.run(WorkerParams(task_manager=TaskManager())))
+    try:
+        await _started(worker, run)
+        await worker.queue_frame(EndFrame(reason=TRANSFER))
+        await asyncio.wait_for(transfer.entered.wait(), 5)
+
+        await worker.cancel(reason="idle timeout")
+
+        done, _ = await asyncio.wait({run}, timeout=4)
+        assert run in done, "run() was still waiting on its transfer 4 s after a cancel"
+        assert hangup.calls == [], (
+            f"a preempted transfer was followed by a carrier hangup of {hangup.calls}"
+        )
+        assert finished == ["CancelFrame"], f"on_pipeline_finished fired {finished}"
+    finally:
+        await _force_down(run, worker)
+
+
+@pytest.mark.asyncio
+async def test_r10_the_idle_cancel_preempting_a_stalled_transfer_hangs_nothing_up():
+    """Pipecat's own idle cancel, run the way Mesa runs a worker."""
+    transfer, hangup = _StalledTransfer(), _RecordingHangup()
+    transport = _transport(_open_socket(), transfer, hangup)
+    worker, finished, _ = _worker(transport.output(), idle_timeout_secs=0.5)
+    run = asyncio.create_task(_run_like_mesa(worker))
+    try:
+        await _started(worker, run)
+        await worker.queue_frame(EndFrame(reason=TRANSFER))
+        await asyncio.wait_for(transfer.entered.wait(), 5)
+
+        done, _ = await asyncio.wait({run}, timeout=5)
+        assert run in done, (
+            "the idle cancel could not end a worker stalled on its transfer within 5 s"
+        )
+        assert hangup.calls == [], (
+            f"a preempted transfer was followed by a carrier hangup of {hangup.calls}"
+        )
+        assert finished == ["CancelFrame"], f"on_pipeline_finished fired {finished}"
+    finally:
+        await _force_down(run, worker)
+
+
+@pytest.mark.asyncio
+async def test_r10_control_the_redirect_took_and_closed_the_socket():
+    """The carrier acted on the redirect and closed the stream; only the
+    response is missing. Nothing can be written, so nothing is hung up."""
+    ws_state = _open_socket()
+    transfer, hangup = _StalledTransfer(ws_state=ws_state), _RecordingHangup()
+    transport = _transport(ws_state, transfer, hangup)
+    worker, _, _ = _worker(transport.output())
+    run = asyncio.create_task(worker.run(WorkerParams(task_manager=TaskManager())))
+    try:
+        await _started(worker, run)
+        await worker.queue_frame(EndFrame(reason=TRANSFER))
+        await asyncio.wait_for(transfer.entered.wait(), 5)
+
+        await worker.cancel(reason="idle timeout")
+
+        await asyncio.wait({run}, timeout=4)
+        assert hangup.calls == []
+    finally:
+        await _force_down(run, worker)
+
+
+@pytest.mark.asyncio
+async def test_r10_control_a_transfer_that_completes_hangs_nothing_up():
+    transfer, hangup = _StalledTransfer(completes=True), _RecordingHangup()
+    transport = _transport(_open_socket(), transfer, hangup)
+    worker, finished, _ = _worker(transport.output())
+    run = asyncio.create_task(worker.run(WorkerParams(task_manager=TaskManager())))
+    try:
+        await _started(worker, run)
+        await worker.queue_frame(EndFrame(reason=TRANSFER))
+
+        done, _ = await asyncio.wait({run}, timeout=4)
+        assert run in done
+        assert hangup.calls == []
+        assert finished == ["EndFrame"]
     finally:
         await _force_down(run, worker)
