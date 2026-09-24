@@ -1,0 +1,1 @@
+- `ParallelPipeline`, and so `ServiceSwitcher` and `VoicemailDetector`, remembers only its most recent 1,024 frame ids to drop a frame's copy from another branch, where it used to keep every id it ever pushed for the life of the pipeline.

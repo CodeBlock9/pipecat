@@ -1,0 +1,1 @@
+- `SyncParallelPipeline` pushes its `EndFrame` once, after every branch's output, where a branch that flushed output on `EndFrame` used to have it dropped; and it pushes each system frame once, where the branches' copies of a `StartFrame` or `InterruptionFrame` used to be released again at the next synchronization.
