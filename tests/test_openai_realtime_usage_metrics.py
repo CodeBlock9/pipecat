@@ -10,14 +10,18 @@ Covers:
 - ``response.done`` usage details (audio/cached breakdown) land on the
   ``LLMTokenUsage`` passed to ``start_llm_usage_metrics``.
 - Missing detail objects degrade to ``None`` fields rather than errors.
+- A ``response.done`` with ``"usage": null`` reports no usage and still
+  closes the turn.
 - ``_add_token_usage_to_span`` emits the audio token span attributes for
   both ``LLMTokenUsage`` objects and plain dicts.
 """
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
 
+from pipecat.frames.frames import LLMFullResponseEndFrame, TTSStoppedFrame
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.services.openai.realtime import events
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
@@ -107,6 +111,43 @@ async def test_response_done_without_cached_details_reports_none():
     assert tokens.cache_read_input_audio_tokens is None
     assert tokens.input_audio_tokens == 0
     assert tokens.output_audio_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_null_usage_response_done_closes_the_turn_and_reports_no_usage():
+    """A response cancelled by a barge-in arrives with ``"usage": null``.
+
+    The event is wire JSON, parsed as the receive loop parses it.
+    """
+    service = _service_for_usage_capture()
+    # The cancelled response was playing audio.
+    service._current_audio_response = object()
+    evt = events.parse_server_event(
+        json.dumps(
+            {
+                "event_id": "ev_2",
+                "type": "response.done",
+                "response": {
+                    "id": "resp_2",
+                    "object": "realtime.response",
+                    "status": "cancelled",
+                    "status_details": {"type": "cancelled", "reason": "turn_detected"},
+                    "output": [],
+                    "usage": None,
+                },
+            }
+        )
+    )
+    assert evt.response.usage is None
+
+    await service._handle_evt_response_done(evt)
+
+    service.start_llm_usage_metrics.assert_not_called()
+    service.stop_processing_metrics.assert_awaited_once()
+    assert [type(call.args[0]) for call in service.push_frame.await_args_list] == [
+        TTSStoppedFrame,
+        LLMFullResponseEndFrame,
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -78,6 +78,14 @@ AUTOSIZED_USER_AUDIO_PREROLL_MARGIN_SECS = 0.3
 DEFAULT_USER_AUDIO_PREROLL_SECS = 0.5
 
 
+def _server_event_type(message) -> str:
+    """Return the ``type`` of a raw server event, to log one that failed to parse."""
+    try:
+        return str(json.loads(message)["type"])
+    except Exception:
+        return "unknown"
+
+
 @dataclass
 class CurrentAudioResponse:
     """Tracks the current audio response from the assistant.
@@ -908,7 +916,19 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
         assert self._websocket is not None
 
         async for message in self._websocket:
-            evt = events.parse_server_event(message)
+            try:
+                evt = events.parse_server_event(message)
+            except Exception as e:
+                # Skip what cannot be parsed, as Grok's loop does: an event the
+                # fork does not model must not end the session. The error
+                # repeats the raw event, which can hold a transcript or audio,
+                # so only its first line is logged, with the event's type.
+                first_line = str(e).split("\n", 1)[0].strip()
+                logger.warning(
+                    f"{self} Failed to parse server event of type "
+                    f"{_server_event_type(message)}: {first_line}"
+                )
+                continue
             if evt.type == "session.created":
                 await self._handle_evt_session_created(evt)
             elif evt.type == "session.updated":
@@ -1089,28 +1109,29 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
     @traced_openai_realtime(operation="llm_response")
     async def _handle_evt_response_done(self, evt):
         # todo: figure out whether there's anything we need to do for "cancelled" events
-        # usage metrics
-        input_details = (
-            evt.response.usage.input_token_details
-            if hasattr(evt.response.usage, "input_token_details")
-            else None
-        )
-        output_details = (
-            evt.response.usage.output_token_details
-            if hasattr(evt.response.usage, "output_token_details")
-            else None
-        )
-        cached_details = input_details.cached_tokens_details if input_details else None
-        tokens = LLMTokenUsage(
-            prompt_tokens=evt.response.usage.input_tokens,
-            completion_tokens=evt.response.usage.output_tokens,
-            total_tokens=evt.response.usage.total_tokens,
-            cache_read_input_tokens=input_details.cached_tokens if input_details else None,
-            input_audio_tokens=input_details.audio_tokens if input_details else None,
-            output_audio_tokens=output_details.audio_tokens if output_details else None,
-            cache_read_input_audio_tokens=cached_details.audio_tokens if cached_details else None,
-        )
-        await self.start_llm_usage_metrics(tokens)
+        # usage metrics. A response can come without usage (a cancelled one
+        # carries "usage": null), and the turn must still close below.
+        usage = evt.response.usage
+        if usage:
+            input_details = (
+                usage.input_token_details if hasattr(usage, "input_token_details") else None
+            )
+            output_details = (
+                usage.output_token_details if hasattr(usage, "output_token_details") else None
+            )
+            cached_details = input_details.cached_tokens_details if input_details else None
+            tokens = LLMTokenUsage(
+                prompt_tokens=usage.input_tokens,
+                completion_tokens=usage.output_tokens,
+                total_tokens=usage.total_tokens,
+                cache_read_input_tokens=input_details.cached_tokens if input_details else None,
+                input_audio_tokens=input_details.audio_tokens if input_details else None,
+                output_audio_tokens=output_details.audio_tokens if output_details else None,
+                cache_read_input_audio_tokens=(
+                    cached_details.audio_tokens if cached_details else None
+                ),
+            )
+            await self.start_llm_usage_metrics(tokens)
         await self.stop_processing_metrics()
         # Push TTSStoppedFrame here (rather than on each per-item
         # response.output_audio.done) so that a response containing multiple
