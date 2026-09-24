@@ -1,0 +1,1 @@
+- `VADController` raises `on_speech_activity` at most once per `speech_activity_period` (0.2 s by default), timed on the monotonic clock. It raised the event for every chunk analysed as speaking, so a 20 ms audio stream broadcast a `UserSpeakingFrame` fifty times a second instead of five.
