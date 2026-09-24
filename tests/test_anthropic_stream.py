@@ -249,6 +249,43 @@ async def test_control_one_tool_use_block_runs():
     assert dispatched == [CHECK]
 
 
+@pytest.mark.asyncio
+async def test_a_server_tool_input_is_not_joined_to_a_tool_use_block():
+    """A server_tool_use block streams its own input_json_delta; only tool_use blocks are kept."""
+    service, dispatched = await _run(
+        [
+            _message_start(),
+            *_tool_block(0, "toolu_a", "check_availability", ['{"party": 2}']),
+            _ev(
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {},
+                    },
+                }
+            ),
+            _ev(
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "input_json_delta", "partial_json": '{"query": "hours"}'},
+                }
+            ),
+            _ev({"type": "content_block_stop", "index": 1}),
+            *_tool_block(2, "toolu_b", "send_sms", ['{"to": "+61400000000"}']),
+            _message_delta(FULL_DELTA_USAGE),
+            MESSAGE_STOP,
+        ]
+    )
+
+    service.push_error.assert_not_called()
+    assert dispatched == [CHECK, SMS]
+
+
 def test_the_fixture_is_the_sdk_decoding():
     delta = _message_delta({"output_tokens": 42})
     assert type(delta).__name__ == "BetaRawMessageDeltaEvent"

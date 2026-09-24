@@ -272,6 +272,37 @@ async def test_limit_an_id_only_start_then_index_only_fragments_split(service_cl
     assert await _dispatched(service_class, chunks) == [("check_availability", "call_a", {})]
 
 
+@pytest.mark.parametrize("service_class", SERVICES)
+@pytest.mark.asyncio
+async def test_the_id_is_kept_when_it_arrives_apart_from_the_name(service_class):
+    """The id is recorded from whichever fragment carries it, not only the one with the name."""
+    chunks = [
+        _calls(_tc(0, id="call_a")),
+        _calls(_tc(0, name="check_availability")),
+        _calls(_tc(0, arguments='{"party": 2}')),
+        FINISH,
+    ]
+    assert await _dispatched(service_class, chunks) == [CHECK]
+
+
+@pytest.mark.parametrize("service_class", SERVICES)
+@pytest.mark.asyncio
+async def test_limit_two_calls_sharing_an_index_merge_and_are_skipped(service_class):
+    """A documented limit: calls are keyed by index first, so two calls given one index merge.
+
+    Their joined arguments do not parse, and both are skipped. No provider is
+    known to stream this shape; change the rule deliberately.
+    """
+    chunks = [
+        _calls(
+            _tc(0, id="call_a", name="check_availability", arguments='{"party": 2}'),
+            _tc(0, id="call_b", name="send_sms", arguments='{"to": "+61400000000"}'),
+        ),
+        FINISH,
+    ]
+    assert await _dispatched(service_class, chunks) == []
+
+
 @pytest.mark.parametrize("service_class", USAGE_SERVICES)
 @pytest.mark.asyncio
 async def test_partial_usage_keeps_the_turn(service_class):
