@@ -422,6 +422,11 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
     ) -> dict[str, Any]:
         """Build generation parameters for Google AI API.
 
+        ``settings.extra`` is deep-merged over the built parameters, and the
+        applied provider options are deep-merged over that. The low-latency
+        thinking default applies last, and only when neither they nor the
+        settings set a thinking config.
+
         Args:
             system_instruction: Optional system instruction to use.
             tools: Optional list of tools to include.
@@ -453,6 +458,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         if thinking:
             generation_params["thinking_config"] = thinking.model_dump(exclude_unset=True)
 
+        generation_params = self.merge_provider_options(generation_params, include_declared=False)
         generation_params = self.merge_provider_options(generation_params)
 
         # Applied last, so an explicit thinking config from the settings or from

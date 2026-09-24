@@ -233,6 +233,9 @@ class FunctionCallRunnerItem:
             final result, a timeout, or a cancellation. Results reported after
             that are rejected, since the rest of the pipeline has stopped
             tracking the call.
+        reported: Whether the call's final result was broadcast. A call that
+            is cancelled after that, while its handler unwinds, has already
+            settled downstream, so it is not settled a second time.
     """
 
     registry_item: FunctionCallRegistryItem
@@ -243,6 +246,7 @@ class FunctionCallRunnerItem:
     run_llm: bool | None = None
     group_id: str | None = None
     settled: bool = False
+    reported: bool = False
 
 
 # `default=BaseLLMAdapter` (PEP 696) so that unparameterized subclasses
@@ -617,12 +621,8 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
                 current.cache_creation_input_tokens, tokens.cache_creation_input_tokens
             ),
             reasoning_tokens=_add(current.reasoning_tokens, tokens.reasoning_tokens),
-            input_audio_tokens=_add(
-                current.input_audio_tokens, tokens.input_audio_tokens
-            ),
-            output_audio_tokens=_add(
-                current.output_audio_tokens, tokens.output_audio_tokens
-            ),
+            input_audio_tokens=_add(current.input_audio_tokens, tokens.input_audio_tokens),
+            output_audio_tokens=_add(current.output_audio_tokens, tokens.output_audio_tokens),
             cache_read_input_audio_tokens=_add(
                 current.cache_read_input_audio_tokens,
                 tokens.cache_read_input_audio_tokens,
@@ -1843,10 +1843,10 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
 
             if is_final:
                 runner_item.settled = True
-
-            # Cancel timeout task if it exists
-            if timeout_task and not timeout_task.done():
-                await self.cancel_task(timeout_task)
+                # Only the final result ends the deadline: a progress update
+                # leaves the call running, and still bounded.
+                if timeout_task and not timeout_task.done():
+                    await self.cancel_task(timeout_task)
 
             await self.broadcast_frame(
                 FunctionCallResultFrame,
@@ -1857,6 +1857,10 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
                 run_llm=runner_item.run_llm,
                 properties=properties,
             )
+            # Marked only once the broadcast has returned: an interruption that
+            # cancels this callback before then must still settle the call.
+            if is_final:
+                runner_item.reported = True
 
         # Start a timeout task for deferred function calls
         async def timeout_handler():
@@ -2128,6 +2132,8 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         cancel-aware handlers run their cleanup, broadcasts a
         ``FunctionCallCancelFrame`` so the rest of the pipeline can settle the
         call, and notifies application code via ``on_function_calls_cancelled``.
+        A call whose final result was already broadcast has settled, so only
+        its handler is cancelled: it gets no cancel frame and is not reported.
 
         Args:
             predicate: Selects which in-flight calls to cancel.
@@ -2137,7 +2143,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
                 settled in the context.
 
         Returns:
-            The function calls that were cancelled.
+            The function calls that were cancelled before they reported.
         """
         cancelled_tasks = set()
         cancelled_items = []
@@ -2164,6 +2170,13 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
                 task.remove_done_callback(self._function_call_task_finished)
                 await self.cancel_task(task)
                 cancelled_tasks.add(task)
+
+            if runner_item.reported:
+                logger.debug(
+                    f"{self} Function call [{name}:{tool_call_id}] had already reported its"
+                    " result; not settling it again"
+                )
+                continue
 
             cancelled_items.append(
                 await self._broadcast_function_call_cancelled(runner_item, run_llm=run_llm)
