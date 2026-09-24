@@ -21,7 +21,11 @@ from pipecat.frames.frames import (
     LLMFullResponseStartFrame,
     LLMSummarizeContextFrame,
 )
-from pipecat.processors.aggregators.llm_context import LLMContext, LLMSpecificMessage
+from pipecat.processors.aggregators.llm_context import (
+    LLMContext,
+    LLMContextMessage,
+    LLMSpecificMessage,
+)
 from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.utils.base_object import BaseObject
 from pipecat.utils.context.llm_context_summarization import (
@@ -124,6 +128,10 @@ class LLMContextSummarizer(BaseObject):
 
         self._summarization_in_progress = False
         self._pending_summary_request_id: str | None = None
+        # The context's messages when the pending summary was requested, held as
+        # references: the summary applies only if the prefix it summarized is
+        # still made of those same messages.
+        self._pending_summary_snapshot: tuple[LLMContextMessage, ...] | None = None
 
         self._register_event_handler("on_request_summarization", sync=True)
         self._register_event_handler("on_summary_applied")
@@ -192,6 +200,7 @@ class LLMContextSummarizer(BaseObject):
 
     async def _clear_summarization_state(self):
         """Cancel pending summarization."""
+        self._pending_summary_snapshot = None
         if self._summarization_in_progress:
             logger.debug(f"{self}: Clearing pending summarization")
             self._summarization_in_progress = False
@@ -278,6 +287,7 @@ class LLMContextSummarizer(BaseObject):
         # Mark summarization in progress
         self._summarization_in_progress = True
         self._pending_summary_request_id = request_id
+        self._pending_summary_snapshot = tuple(self._context.messages)
 
         logger.debug(f"{self}: Sending summarization request (request_id={request_id})")
 
@@ -364,7 +374,8 @@ class LLMContextSummarizer(BaseObject):
             logger.debug(f"{self}: Ignoring stale summary result (request_id={frame.request_id})")
             return
 
-        # Clear pending state
+        # Take the snapshot, then clear pending state (which drops it)
+        snapshot = self._pending_summary_snapshot or ()
         await self._clear_summarization_state()
 
         # Check for errors
@@ -373,18 +384,21 @@ class LLMContextSummarizer(BaseObject):
             return
 
         # Validate context state
-        if not self._validate_summary_context(frame.last_summarized_index):
+        if not self._validate_summary_context(frame.last_summarized_index, snapshot):
             logger.warning(f"{self}: Context state changed, skipping summary application")
             return
 
         # Apply summary
         await self._apply_summary(frame.summary, frame.last_summarized_index)
 
-    def _validate_summary_context(self, last_summarized_index: int) -> bool:
+    def _validate_summary_context(
+        self, last_summarized_index: int, snapshot: tuple[LLMContextMessage, ...]
+    ) -> bool:
         """Validate that context state is still valid for applying summary.
 
         Args:
             last_summarized_index: The index of the last summarized message.
+            snapshot: The context's messages when the summary was requested.
 
         Returns:
             True if the context state is still consistent with the summary.
@@ -392,12 +406,20 @@ class LLMContextSummarizer(BaseObject):
         if last_summarized_index < 0:
             return False
 
+        messages = self._context.messages
+
         # Check if we still have enough messages
-        if last_summarized_index >= len(self._context.messages):
+        if last_summarized_index >= len(messages) or last_summarized_index >= len(snapshot):
+            return False
+
+        # The summarized messages must be the ones the summary was made of. Messages
+        # appended meanwhile keep them; a replacement of the context (set_messages,
+        # a transform) does not, and its summary would delete what replaced them.
+        if any(messages[i] is not snapshot[i] for i in range(last_summarized_index + 1)):
             return False
 
         min_keep = self._auto_config.summary_config.min_messages_after_summary
-        remaining = len(self._context.messages) - 1 - last_summarized_index
+        remaining = len(messages) - 1 - last_summarized_index
         if remaining < min_keep:
             return False
 
