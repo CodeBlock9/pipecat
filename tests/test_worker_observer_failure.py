@@ -9,7 +9,8 @@
 ``WorkerObserver`` delivers each observer's events from its own queue and task.
 A callback that raises must not end that task: the observer's later events
 would be lost, and ``wait_until_idle`` (the drain a pipeline runs at its end)
-would never resolve.
+would never resolve. The same holds for an observer added to a running pipeline
+whose own setup raises: its task runs that setup first.
 """
 
 import asyncio
@@ -49,6 +50,11 @@ class HealthyObserver(BaseObserver):
 
     async def on_push_frame(self, data: FramePushed):
         self.pushed.append(data.frame)
+
+
+class SetupRaisingObserver(HealthyObserver):
+    async def setup(self, task_manager):
+        raise RuntimeError("setup failed")
 
 
 def _pushed(frame: Frame) -> FramePushed:
@@ -121,3 +127,22 @@ class TestObserverFailure(unittest.IsolatedAsyncioTestCase):
         self.assertIn("raised handling FramePushed: bad observer", failures[0]["message"])
         self.assertIsNotNone(failures[0]["exception"], "the first failure has no traceback")
         self.assertIsNone(failures[1]["exception"])
+
+    async def test_a_late_observer_whose_setup_raises_still_drains(self):
+        """An observer added to a running pipeline costs nothing at the drain when its setup raises."""
+        proxy = WorkerObserver(observers=[])
+        await proxy.setup(TaskManager(loop=asyncio.get_running_loop()))
+        late = SetupRaisingObserver()
+        proxy.add_observer(late)
+        try:
+            await proxy.on_push_frame(_pushed(TextFrame("first")))
+            try:
+                await asyncio.wait_for(proxy.wait_until_idle(), timeout=1.0)
+            except TimeoutError:
+                self.fail("wait_until_idle never resolved after a late observer's setup raised")
+            self.assertFalse(
+                proxy._proxies[late].task.done(), "the late observer's proxy task exited"
+            )
+            self.assertEqual([f.text for f in late.pushed], ["first"])
+        finally:
+            await proxy.cleanup()

@@ -235,7 +235,11 @@ class WorkerObserver(BaseObserver):
 
         async def run_proxy():
             if setup_observer:
-                await observer.setup(self.task_manager)
+                # A late observer's failed setup must not cost its queue either.
+                try:
+                    await observer.setup(self.task_manager)
+                except Exception as e:
+                    logger.exception(f"{observer} raised setting up: {e}")
             await self._proxy_task_handler(queue, observer)
 
         task = self.create_task(run_proxy())
