@@ -169,27 +169,34 @@ class SoundfileMixer(BaseAudioMixer):
             logger.error(f"Unable to open file {file_name}: {e}")
 
     def _mix_with_sound(self, audio: bytes):
-        """Mix raw audio frames with chunks of the same length from the sound file."""
+        """Mix raw audio frames with chunks of the same length from the sound file.
+
+        A looping sound wraps around its end inside the chunk, so it plays
+        without a seam whatever its length. A sound that does not loop mixes
+        its last partial chunk padded with silence, and after its end the audio
+        passes through unmixed.
+        """
         if not self._mixing or not self._current_sound in self._sounds:
             return audio
 
         audio_np = np.frombuffer(audio, dtype=np.int16)
         chunk_size = len(audio_np)
 
-        # Sound currently playing.
+        # Sound currently playing; an empty one has nothing to mix.
         sound = self._sounds[self._current_sound]
+        if len(sound) == 0:
+            return audio
 
-        # Go back to the beginning if we don't have enough data.
-        if self._sound_pos + chunk_size > len(sound):
-            if not self._loop:
+        if self._loop:
+            positions = np.arange(self._sound_pos, self._sound_pos + chunk_size)
+            sound_np = np.take(sound, positions, mode="wrap")
+            self._sound_pos = (self._sound_pos + chunk_size) % len(sound)
+        else:
+            if self._sound_pos >= len(sound):
                 return audio
-            self._sound_pos = 0
-
-        start_pos = self._sound_pos
-        end_pos = self._sound_pos + chunk_size
-        self._sound_pos = end_pos
-
-        sound_np = sound[start_pos:end_pos]
+            sound_np = sound[self._sound_pos : self._sound_pos + chunk_size]
+            self._sound_pos += len(sound_np)
+            sound_np = np.pad(sound_np, (0, chunk_size - len(sound_np)))
 
         mixed_audio = np.clip(audio_np + sound_np * self._volume, -32768, 32767).astype(np.int16)
 
