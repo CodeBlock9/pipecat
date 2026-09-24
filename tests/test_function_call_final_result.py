@@ -29,6 +29,8 @@ from pipecat.frames.frames import (
     FunctionCallResultProperties,
     FunctionCallsStartedFrame,
     InterruptionFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.llm_service import FunctionCallParams, LLMService
@@ -375,6 +377,32 @@ class TestIdleTracksOutstandingCallsById(unittest.IsolatedAsyncioTestCase):
             ]
         )
         self.assertTrue(fired)
+
+    async def test_a_cancel_settles_its_call(self):
+        """An interrupted or timed-out call is settled by its cancel frame."""
+        fired = await self._idle_fires(
+            [
+                FunctionCallsStartedFrame(function_calls=[_call("1")]),
+                FunctionCallCancelFrame(function_name="lookup", tool_call_id="1"),
+                BotStartedSpeakingFrame(),
+                BotStoppedSpeakingFrame(),
+            ]
+        )
+        self.assertTrue(fired, "idle never fired after call 1 was cancelled")
+
+    async def test_a_barge_in_while_a_call_runs_keeps_idle_off(self):
+        fired = await self._idle_fires(
+            [
+                FunctionCallsStartedFrame(function_calls=[_call("1")]),
+                BotStartedSpeakingFrame(),
+                UserStartedSpeakingFrame(),
+                BotStoppedSpeakingFrame(),
+                UserStoppedSpeakingFrame(),
+                BotStartedSpeakingFrame(),
+                BotStoppedSpeakingFrame(),
+            ]
+        )
+        self.assertFalse(fired, "idle fired while call 1 was still running")
 
 
 if __name__ == "__main__":
