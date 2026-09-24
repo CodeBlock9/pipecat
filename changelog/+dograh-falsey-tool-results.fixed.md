@@ -1,0 +1,1 @@
+- `LLMAssistantAggregator` treats only `None` as a function call with no result. A falsey result such as `False`, `0`, `""`, `[]` or `{}` is stored as its JSON value and runs inference like any other result, a falsey intermediate result reaches the context, and an explicit `run_llm` on the result frame or its properties is honoured whatever the result is.

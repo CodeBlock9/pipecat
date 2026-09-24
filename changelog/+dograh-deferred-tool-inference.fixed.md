@@ -1,0 +1,1 @@
+- A function call result that asks for inference while another result is queued still gets it. `LLMAssistantAggregator` records the deferred push and runs it once the queue drains, even when the queued results decline inference or are dropped because their call is not running; it still waits for the last running call of the settling call's group, so a group runs inference once.

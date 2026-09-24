@@ -1,0 +1,1 @@
+- `LLMContextSummarizer` applies a summary only while the messages it summarized are still the context's. Messages appended while the summary is made are kept; if the context was replaced meanwhile (by `set_messages`, a transform, or another summarizer), the summary is discarded instead of deleting the messages that replaced it.

@@ -1,0 +1,1 @@
+- `GatedLLMContextAggregator` forwards a `StartFrame` once instead of twice.
