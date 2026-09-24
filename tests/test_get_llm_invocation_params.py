@@ -909,8 +909,10 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
         # it on its own rather than being pulled back into the earlier group.
         self.assertEqual([m.role for m in result], ["model", "user", "model", "model", "user"])
         self.assertEqual([p.function_call.id for p in result[0].parts], ["c1"])
+        self.assertEqual([p.function_response.id for p in result[1].parts], ["c1"])
         self.assertEqual(result[2].parts[0].text, "thinking out loud")
         self.assertEqual([p.function_call.id for p in result[3].parts], ["c2"])
+        self.assertEqual([p.function_response.id for p in result[4].parts], ["c2"])
 
     def test_merge_does_not_carry_a_call_back_across_a_user_turn(self):
         """A call made after the user's next turn is not merged into the earlier group."""
@@ -1099,6 +1101,24 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
                         parts=[
                             Part(text="I WILL LOOK UP THE BOOKING"),
                             Part(function_call=FunctionCall(id="call_A", name="lookup", args={})),
+                        ],
+                    ),
+                )
+
+    def test_blank_text_beside_tool_calls_adds_no_text_part(self):
+        """Blank text beside a call adds no text part: the model turn is the call alone."""
+        for content in ("\n", "", [{"type": "text", "text": " \n"}]):
+            with self.subTest(content=content):
+                params = self.adapter.get_llm_invocation_params(
+                    self._assistant_turn_with_a_call(content)
+                )
+
+                self.assertEqual(
+                    params["messages"][1],
+                    Content(
+                        role="model",
+                        parts=[
+                            Part(function_call=FunctionCall(id="call_A", name="lookup", args={}))
                         ],
                     ),
                 )
