@@ -1,0 +1,1 @@
+- `DeepgramTTSService` reports TTS usage (the characters of each `Speak` it sends successfully), so calls on Aura voices carry a TTS usage metric as the HTTP and Flux services already did.

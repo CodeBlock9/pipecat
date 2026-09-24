@@ -1,0 +1,1 @@
+- `OpenAITTSService` and `SpeachesTTSService` yield each network chunk of a synthesis as it arrives, through `_stream_audio_frames_from_iterator`, instead of reading the response with httpx's `iter_bytes(chunk_size)`, which held every sentence's first frame until half a second of audio had downloaded.
