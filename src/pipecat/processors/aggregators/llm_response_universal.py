@@ -1548,7 +1548,8 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # queued, the push is deferred so the queued results are bundled into a
         # single LLM call. The queued results may not push it themselves (they can
         # decline inference, or be dropped as not running), so this flag records
-        # that the inference is still owed until a context frame is pushed.
+        # that the inference is still owed until a context frame is pushed, or the
+        # user speaks and their turn takes it over.
         self._push_context_after_queued_results: bool = False
 
         self._assistant_turn_start_timestamp = ""
@@ -2010,19 +2011,24 @@ class LLMAssistantAggregator(LLMContextAggregator):
         Runs after every ``FunctionCallResultFrame`` and ``FunctionCallCancelFrame``,
         including one dropped because its call is not running. Once no result is
         queued, the owed push goes out through
-        ``_maybe_push_context_after_function_result``, unless the user is speaking
-        or another call of the settling call's group is still running: that group's
-        last result runs inference, and pushing here too would run it twice.
+        ``_maybe_push_context_after_function_result``, unless another call of the
+        settling call's group is still running: that group's last result runs
+        inference, and pushing here too would run it twice. If the user is speaking
+        by then, the owed push is dropped, as a result's own push is: their turn
+        runs inference with the result already in the context.
 
         Args:
             call: The settling call's in-progress frame, read before its handler
                 ran, or None if the call was not running.
         """
-        if (
-            not self._push_context_after_queued_results
-            or self._user_speaking
-            or self.has_queued_frame(FunctionCallResultFrame)
+        if not self._push_context_after_queued_results or self.has_queued_frame(
+            FunctionCallResultFrame
         ):
+            return
+        if self._user_speaking:
+            # Dropped, not kept: a push still owed after the user's turn would fire
+            # on some later result, even one that declines inference.
+            self._push_context_after_queued_results = False
             return
         if (
             call

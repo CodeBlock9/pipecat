@@ -2523,6 +2523,45 @@ class TestDeferredInferenceIntent(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deferrals, [], "A reached the queued-result deferral")
         self.assertEqual(up, [], f"upstream frames: {up}")
 
+    async def test_a_cancel_that_settles_the_group_runs_the_owed_inference(self):
+        """B settles while C of its group runs; C is then cancelled: the owed push goes out once."""
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a"), _tool_in_progress("b", "g1"), _tool_in_progress("c", "g1")],
+            [_tool_result("a", run_llm=True), _tool_result("b")],
+            [FunctionCallCancelFrame(function_name="tool_c", tool_call_id="c")],
+        )
+        self.assertEqual(up, ["LLMContextFrame"], f"upstream frames: {up}")
+
+    async def test_an_interruption_drops_the_owed_inference(self):
+        """The owed push waits on B's group; an interruption then drops it."""
+        up, _ = await _drive_queued_results(
+            [_tool_in_progress("a"), _tool_in_progress("b", "g1"), _tool_in_progress("c", "g1")],
+            [_tool_result("a", run_llm=True), _tool_result("b")],
+            [InterruptionFrame()],
+            [_tool_result("c", properties=FunctionCallResultProperties(run_llm=False))],
+        )
+        self.assertEqual(up, [], f"upstream frames: {up}")
+
+    async def test_the_owed_inference_is_dropped_while_the_user_speaks(self):
+        """C settles B's group while the user speaks: the owed push is dropped with C's own.
+
+        A later result that declines inference (X) must not run it.
+        """
+        up, _ = await _drive_queued_results(
+            [
+                _tool_in_progress("a"),
+                _tool_in_progress("b", "g1"),
+                _tool_in_progress("c", "g1"),
+                _tool_in_progress("x"),
+            ],
+            [_tool_result("a", run_llm=True), _tool_result("b")],
+            [UserStartedSpeakingFrame()],
+            [_tool_result("c")],
+            [UserStoppedSpeakingFrame()],
+            [_tool_result("x", properties=FunctionCallResultProperties(run_llm=False))],
+        )
+        self.assertEqual(up, [], f"upstream frames: {up}")
+
 
 def _function_schema(name: str) -> FunctionSchema:
     return FunctionSchema(name=name, description="", properties={}, required=[])
