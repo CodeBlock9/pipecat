@@ -82,6 +82,8 @@ async def _service_with_socket(socket: _Socket) -> tuple[DeepgramTTSService, lis
         sample_rate=24000,
         settings=DeepgramTTSSettings(voice="aura-2-helena-en", extra={}),
     )
+    # setup() connects to Deepgram; the fake socket stands in for that connection.
+    service._connect = AsyncMock()
     await service.setup(frame_processor_setup(TaskManager(), enable_usage_metrics=True))
     service._websocket = socket
     pushed: list = []
