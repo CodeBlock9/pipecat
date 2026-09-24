@@ -90,12 +90,6 @@ except ModuleNotFoundError as e:
     raise ImportError(f"Missing module: {e}") from e
 
 
-class AWSNovaSonicUnhandledFunctionException(Exception):
-    """Exception raised when the LLM attempts to call an unregistered function."""
-
-    pass
-
-
 class ContentType(Enum):
     """Content types supported by AWS Nova Sonic.
 
@@ -1477,25 +1471,28 @@ class AWSNovaSonicLLMService(LLMService[AWSNovaSonicLLMAdapter]):
         tool_use = event_json["toolUse"]
         function_name = tool_use["toolName"]
         tool_call_id = tool_use["toolUseId"]
-        arguments = json.loads(tool_use["content"])
-
-        # Call tool function
-        if self.has_function(function_name):
-            if function_name in self._functions.keys() or None in self._functions.keys():
-                function_calls_llm = [
-                    FunctionCallFromLLM(
-                        context=self._context,
-                        tool_call_id=tool_call_id,
-                        function_name=function_name,
-                        arguments=arguments,
-                    )
-                ]
-
-                await self.run_function_calls(function_calls_llm)
-        else:
-            raise AWSNovaSonicUnhandledFunctionException(
-                f"The LLM tried to call a function named '{function_name}', but there isn't a callback registered for that function."
+        try:
+            arguments = json.loads(tool_use["content"])
+        except json.JSONDecodeError:
+            # Skip the call, as the chat loop does, rather than raise into the
+            # receive loop, which would reset the whole session.
+            logger.warning(
+                f"{self}: Failed to parse function call arguments: {tool_use['content']}"
             )
+            return
+
+        # Call tool function. A name with no registered handler goes the same
+        # way: run_function_calls answers it with its missing-function result.
+        await self.run_function_calls(
+            [
+                FunctionCallFromLLM(
+                    context=self._context,
+                    tool_call_id=tool_call_id,
+                    function_name=function_name,
+                    arguments=arguments,
+                )
+            ]
+        )
 
     async def _handle_content_end_event(self, event_json):
         if not self._content_being_received:  # should never happen
