@@ -27,6 +27,7 @@ from pipecat.frames.frames import (
     OutputAudioRawFrame,
     StartFrame,
     TTSAudioRawFrame,
+    TTSStartedFrame,
     TTSStoppedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
@@ -341,6 +342,62 @@ class TestBaseOutputTransportInterruptions(unittest.IsolatedAsyncioTestCase):
             if not stopped:
                 await transport.cancel(CancelFrame())
 
+    async def test_an_interruption_before_the_bot_speaks_discards_the_buffered_audio(self):
+        """Audio that never filled a chunk must not prefix the next response."""
+        transport = await self._make_transport(mixer=None, audio_out_end_silence_secs=0)
+        try:
+            sender = transport._media_senders[None]
+            chunk = sender.audio_chunk_size
+
+            old = b"\x01\x00" * (chunk // 8)  # a quarter of a chunk: never queued
+            await transport.process_frame(
+                TTSAudioRawFrame(audio=old, sample_rate=sender.sample_rate, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+            self.assertEqual(len(sender._audio_buffer), len(old))
+            self.assertFalse(sender._bot_speaking, "the harness wrote a chunk it should not have")
+
+            await transport.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0.05)
+            self.assertEqual(
+                bytes(sender._audio_buffer),
+                b"",
+                "the interrupted response's audio is still buffered",
+            )
+
+            new = b"\x02\x00" * (chunk // 2)  # exactly one chunk of the next response
+            await transport.process_frame(
+                TTSAudioRawFrame(audio=new, sample_rate=sender.sample_rate, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+            await asyncio.sleep(0.1)
+            written = [call.args[0].audio for call in transport.write_audio_frame.call_args_list]
+            self.assertEqual(written, [new], "the next response starts with the old audio")
+        finally:
+            await transport.cancel(CancelFrame())
+
+    async def test_an_interruption_while_speaking_discards_the_buffered_audio(self):
+        """Once a chunk has played, the interruption clears the leftover too."""
+        transport = await self._make_transport(mixer=None, audio_out_end_silence_secs=0)
+        try:
+            sender = transport._media_senders[None]
+            chunk = sender.audio_chunk_size
+
+            audio = b"\x01\x00" * (chunk // 2) + b"\x03\x00" * (chunk // 8)
+            await transport.process_frame(
+                TTSAudioRawFrame(audio=audio, sample_rate=sender.sample_rate, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+            await asyncio.sleep(0.1)
+            self.assertTrue(sender._bot_speaking)
+            self.assertEqual(len(sender._audio_buffer), chunk // 4)
+
+            await transport.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0.05)
+            self.assertEqual(bytes(sender._audio_buffer), b"")
+        finally:
+            await transport.cancel(CancelFrame())
+
 
 class TestBaseOutputTransportAudioBuffering(unittest.IsolatedAsyncioTestCase):
     """Test for the trailing-partial-chunk audio buffer.
@@ -455,6 +512,54 @@ class TestBaseOutputTransportAudioBuffering(unittest.IsolatedAsyncioTestCase):
             pushed_types = [call.args[0].__class__ for call in transport.push_frame.call_args_list]
             self.assertIn(BotStartedSpeakingFrame, pushed_types)
             self.assertIn(BotStoppedSpeakingFrame, pushed_types)
+        finally:
+            await transport.cancel(CancelFrame())
+
+    async def test_the_next_responses_partial_chunk_survives_the_previous_tts_stop(self):
+        """Playing one response's TTSStoppedFrame must not clear the next one's audio.
+
+        ``handle_tts_stopped`` flushes the buffer before it queues the frame, so
+        by the time the audio task plays that frame the buffer can only hold
+        audio that arrived after it: the next response's. Each write takes
+        20 ms, so playback runs behind the producer as on a real-time transport.
+        """
+        transport = await _make_transport(mixer=None, audio_out_end_silence_secs=0)
+        try:
+
+            async def slow_write(frame):
+                await asyncio.sleep(0.02)
+                return True
+
+            async def send(frame):
+                await transport.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+            transport.write_audio_frame = AsyncMock(side_effect=slow_write)
+            sender = transport._media_senders[None]
+            chunk = sender.audio_chunk_size
+            rate = sender.sample_rate
+
+            first = b"\x01\x00" * (chunk // 2) * 5  # five whole chunks: 100 ms of playback
+            second_head = b"\x02\x00" * (chunk // 8)  # a quarter chunk
+            second_rest = b"\x03\x00" * (3 * chunk // 8)  # three quarters: completes one chunk
+
+            await send(TTSStartedFrame())
+            await send(TTSAudioRawFrame(audio=first, sample_rate=rate, num_channels=1))
+            await send(TTSStoppedFrame())
+            await send(TTSStartedFrame())
+            await send(TTSAudioRawFrame(audio=second_head, sample_rate=rate, num_channels=1))
+            await asyncio.sleep(0.3)  # response 1 plays out; its TTSStoppedFrame is handled
+            await send(TTSAudioRawFrame(audio=second_rest, sample_rate=rate, num_channels=1))
+            await send(TTSStoppedFrame())
+            await asyncio.sleep(0.2)
+
+            written = [call.args[0].audio for call in transport.write_audio_frame.call_args_list]
+            self.assertEqual(len(written), 6, f"{len(written)} chunks written")
+            self.assertEqual(
+                written[5][: len(second_head)],
+                second_head,
+                "response 2 lost its first quarter chunk: the chunk starts with "
+                f"{written[5][:8]!r} and ends with {written[5][-8:]!r}",
+            )
         finally:
             await transport.cancel(CancelFrame())
 
