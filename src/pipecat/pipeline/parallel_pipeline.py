@@ -11,6 +11,7 @@ sub-pipelines concurrently, with coordination for system frames and proper
 handling of pipeline lifecycle events.
 """
 
+from collections import OrderedDict
 from itertools import chain
 
 from loguru import logger
@@ -19,6 +20,40 @@ from pipecat.frames.frames import CancelFrame, EndFrame, Frame, StartFrame
 from pipecat.pipeline.base_pipeline import BasePipeline
 from pipecat.pipeline.pipeline import Pipeline, PipelineSink, PipelineSource
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
+
+# How many frame ids are remembered to recognise a frame's copy from another
+# branch. A copy trails its original by at most the time a branch holds a
+# frame; 1,024 ids is about 20 s of 20 ms input audio, longer than a
+# classifier generation.
+SEEN_IDS_MAX = 1024
+
+
+class RecentFrameIds:
+    """The most recently added frame ids, the oldest forgotten past ``SEEN_IDS_MAX``.
+
+    Nothing says when a frame's last copy has passed, since a branch may drop
+    its copy, so a set of every id would grow for the life of the pipeline.
+    """
+
+    def __init__(self):
+        """Initialize an empty set of frame ids."""
+        self._ids: OrderedDict[int, None] = OrderedDict()
+
+    def add(self, frame_id: int):
+        """Remember a frame id, forgetting the oldest one when the set is full.
+
+        Args:
+            frame_id: The id of the frame to remember.
+        """
+        self._ids[frame_id] = None
+        if len(self._ids) > SEEN_IDS_MAX:
+            self._ids.popitem(last=False)
+
+    def __contains__(self, frame_id: object) -> bool:
+        return frame_id in self._ids
+
+    def __len__(self) -> int:
+        return len(self._ids)
 
 
 class ParallelPipeline(BasePipeline):
@@ -49,7 +84,7 @@ class ParallelPipeline(BasePipeline):
 
         self._pipelines = []
 
-        self._seen_ids = set()
+        self._seen_ids = RecentFrameIds()
         self._frame_counter: dict[int, int] = {}
         self._synchronizing: bool = False
         self._buffered_frames: list[tuple[Frame, FrameDirection]] = []
