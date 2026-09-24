@@ -891,8 +891,8 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
         self.assertEqual([m.role for m in result], ["model", "user", "model", "user"])
         self.assertEqual([len(m.parts) for m in result], [2, 2, 1, 1])
 
-    def test_merge_collects_interleaved_non_tool_message(self):
-        """A non-tool message inside a group is collected and re-emitted after it."""
+    def test_merge_stops_at_an_interleaved_non_tool_message(self):
+        """A non-tool message ends the group; a later unsigned call keeps its own turn."""
         text_message = Content(role="model", parts=[Part(text="thinking out loud")])
         messages = [
             self._tool_call_message("c1", signature="sig-c1"),
@@ -905,12 +905,53 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
             [self._thought_signature_dict("c1")], messages
         )
 
-        # Both calls still merge (and both responses), and the interleaved text
-        # is preserved after the merged group rather than stopping the merge.
-        self.assertEqual([m.role for m in result], ["model", "user", "model"])
-        self.assertEqual([p.function_call.id for p in result[0].parts], ["c1", "c2"])
-        self.assertEqual([p.function_response.id for p in result[1].parts], ["c1", "c2"])
+        # c1's group ends at the text, which stays where it was, and c2 follows
+        # it on its own rather than being pulled back into the earlier group.
+        self.assertEqual([m.role for m in result], ["model", "user", "model", "model", "user"])
+        self.assertEqual([p.function_call.id for p in result[0].parts], ["c1"])
         self.assertEqual(result[2].parts[0].text, "thinking out loud")
+        self.assertEqual([p.function_call.id for p in result[3].parts], ["c2"])
+
+    def test_merge_does_not_carry_a_call_back_across_a_user_turn(self):
+        """A call made after the user's next turn is not merged into the earlier group."""
+        messages = [
+            self._tool_call_message("c1", signature="sig-c1"),
+            self._tool_response_message("c1"),
+            Content(role="model", parts=[Part(text="First result")]),
+            Content(role="user", parts=[Part(text="Now do a separate task")]),
+            self._tool_call_message("c2"),
+            self._tool_response_message("c2"),
+        ]
+        result = self.adapter._merge_parallel_tool_calls_for_thinking(
+            [self._thought_signature_dict("c1")], messages
+        )
+
+        self.assertEqual(
+            [m.role for m in result], ["model", "user", "model", "user", "model", "user"]
+        )
+        self.assertEqual([p.function_call.id for p in result[0].parts], ["c1"])
+        self.assertEqual(result[3].parts[0].text, "Now do a separate task")
+        self.assertEqual([p.function_call.id for p in result[4].parts], ["c2"])
+
+    def test_merge_groups_a_signed_call_that_carries_text(self):
+        """Text beside a signed call still lets the call start its group, and stays first."""
+        signed_call_with_text = self._tool_call_message("c1", signature="sig-c1")
+        signed_call_with_text.parts.insert(0, Part(text="I WILL LOOK UP THE BOOKING"))
+        messages = [
+            signed_call_with_text,
+            self._tool_response_message("c1"),
+            self._tool_call_message("c2"),
+            self._tool_response_message("c2"),
+        ]
+        result = self.adapter._merge_parallel_tool_calls_for_thinking(
+            [self._thought_signature_dict("c1")], messages
+        )
+
+        self.assertEqual([m.role for m in result], ["model", "user"])
+        self.assertEqual(self._part_kinds(result[0]), ["text", "function_call", "function_call"])
+        self.assertEqual(result[0].parts[0].text, "I WILL LOOK UP THE BOOKING")
+        self.assertEqual([p.function_call.id for p in result[0].parts[1:]], ["c1", "c2"])
+        self.assertEqual([p.function_response.id for p in result[1].parts], ["c1", "c2"])
 
     def test_merge_no_thought_signatures_unchanged(self):
         """Without any function-call thought signatures, messages pass through unchanged."""

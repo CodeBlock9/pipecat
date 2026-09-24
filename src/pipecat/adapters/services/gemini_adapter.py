@@ -593,11 +593,12 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
         Algorithm: A tool call message with a thought_signature starts a new
         parallel group. Scanning forward, subsequent unsigned tool call messages
         and their function response messages are merged into the group's single
-        model turn and single user turn respectively, and a fresh
-        thought_signature ends the group. Any other messages that happen to be
-        interleaved are collected and re-emitted after the group, so the
-        regrouping makes as few assumptions as possible about the surrounding
-        message structure.
+        model turn and single user turn respectively. A fresh thought_signature
+        ends the group, and so does any message that is neither a tool call nor
+        a tool response (text from either side, an async tool's developer
+        message included): a group never spans a conversation turn, so a call
+        made after the user's next turn is never moved ahead of it. The scan
+        then carries on from the message that ended the group.
 
         Args:
             thought_signature_dicts: A list of thought signature dicts, used
@@ -658,12 +659,11 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
             if is_tool_call_message(current) and message_has_thought_signature(current):
                 merged_parts = list(current.parts or [])
                 merged_response_parts = []
-                other_messages = []
                 j = i + 1
 
                 # Scan forward: merge unsigned tool calls and their responses
-                # into the group, collecting any other interleaved messages to
-                # re-emit afterward. A fresh thought signature ends the group.
+                # into the group. A fresh thought signature, or any message
+                # that is neither a tool call nor a tool response, ends it.
                 while j < len(messages):
                     next_msg = messages[j]
                     if is_tool_call_message(next_msg):
@@ -678,18 +678,15 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
                         merged_response_parts.extend(next_msg.parts or [])
                         j += 1
                     else:
-                        # Some other message is interleaved within the group;
-                        # collect it and keep scanning for this group's calls
-                        # and responses.
-                        other_messages.append(next_msg)
-                        j += 1
+                        # A conversation turn (text, or an async tool's
+                        # developer message) ends the group; a later call is
+                        # not pulled back across it.
+                        break
 
-                # Output the merged calls, then the merged responses, then any
-                # other messages that were interleaved within the group.
+                # Output the merged calls, then the merged responses.
                 merged_messages.append(Content(role="model", parts=merged_parts))
                 if merged_response_parts:
                     merged_messages.append(Content(role="user", parts=merged_response_parts))
-                merged_messages.extend(other_messages)
                 i = j
             else:
                 merged_messages.append(current)
