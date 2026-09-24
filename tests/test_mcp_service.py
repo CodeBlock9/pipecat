@@ -87,7 +87,8 @@ class _FakeSession:
         self._record["initializes"] = self._record.get("initializes", 0) + 1
 
     async def list_tools(self):
-        return SimpleNamespace(tools=self._tools)
+        # One page: no nextCursor, as a server answers when its catalog fits.
+        return SimpleNamespace(tools=self._tools, nextCursor=None)
 
     async def call_tool(self, name, arguments=None):
         self.calls.append((name, arguments))

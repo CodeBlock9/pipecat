@@ -30,6 +30,7 @@ try:
     from mcp.client.stdio import stdio_client
     from mcp.client.streamable_http import streamable_http_client
     from mcp.shared._httpx_utils import create_mcp_http_client
+    from mcp.types import PaginatedRequestParams
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error('In order to use an MCP client, you need to `uv add "pipecat-ai[mcp]"`.')
@@ -493,20 +494,76 @@ class MCPClient(BaseObject):
         return response
 
     async def _list_tools_helper(self, session, attach_handlers: bool = False):
-        available_tools = await session.list_tools()
+        """List the server's whole tool catalog and convert it to Pipecat schemas.
+
+        Reads every page of ``tools/list``: the first request carries no cursor,
+        and each later one passes the previous page's ``nextCursor``, until a
+        page comes back without one. A cursor the server has already returned
+        ends the listing, so a server that ignores the cursor cannot loop, and a
+        tool name listed twice keeps its first listing, so no name reaches the
+        LLM twice. A later page that fails ends the listing with a warning, and
+        the tools already listed are kept. The listing has no bound of its own:
+        a caller that needs one wraps the call in its own timeout. The tools
+        filter, the ``tools_arguments`` check and the conversion then run once
+        over the whole catalog.
+
+        Args:
+            session: The active MCP client session.
+            attach_handlers: Whether each schema carries the client's call
+                handler, for LLM auto-registration.
+
+        Returns:
+            A ToolsSchema with every listed tool the tools filter allows.
+        """
+        available_tools = []
+        listed_names = set()
+        repeated_names = []
+        seen_cursors = set()
+        page = await session.list_tools()
+        while True:
+            for tool in page.tools:
+                if tool.name in listed_names:
+                    repeated_names.append(tool.name)
+                    continue
+                listed_names.add(tool.name)
+                available_tools.append(tool)
+            cursor = page.nextCursor
+            if not cursor:
+                break
+            if cursor in seen_cursors:
+                logger.warning(
+                    f"{self} the MCP server returned the tools/list cursor {cursor!r} again; "
+                    "stopping the listing there"
+                )
+                break
+            seen_cursors.add(cursor)
+            try:
+                page = await session.list_tools(params=PaginatedRequestParams(cursor=cursor))
+            except Exception as e:
+                logger.warning(
+                    f"{self} the MCP server failed the tools/list page after cursor {cursor!r}: "
+                    f"{e}; keeping the {len(available_tools)} tool(s) listed before it"
+                )
+                break
+
+        if repeated_names:
+            logger.warning(
+                f"{self} the MCP server listed tool(s) more than once; keeping the first "
+                f"listing of each: {', '.join(repeated_names)}"
+            )
+
         tool_schemas: list[FunctionSchema] = []
 
-        logger.debug(f"Found {len(available_tools.tools)} available tools")
+        logger.debug(f"Found {len(available_tools)} available tools")
 
-        available_names = {tool.name for tool in available_tools.tools}
-        unknown = [name for name in self._tools_arguments if name not in available_names]
+        unknown = [name for name in self._tools_arguments if name not in listed_names]
         if unknown:
             logger.warning(
                 f"{self} tools_arguments configured for tool(s) the server does not "
                 f"advertise: {', '.join(unknown)}"
             )
 
-        for tool in available_tools.tools:
+        for tool in available_tools:
             tool_name = tool.name
 
             # Apply tools filter if configured
