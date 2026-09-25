@@ -817,10 +817,10 @@ class TestPipelineWorker(unittest.IsolatedAsyncioTestCase):
             nonlocal cancelled
             cancelled = isinstance(frame, CancelFrame)
 
-        try:
-            await worker.run(WorkerParams(task_manager=TaskManager()))
-        except asyncio.CancelledError:
-            assert cancelled
+        # run() returns normally after a cancel, so the assertion follows it.
+        await asyncio.wait_for(worker.run(WorkerParams(task_manager=TaskManager())), timeout=10.0)
+
+        assert cancelled
 
     async def test_task_cancel_before_start_reaches_sink(self):
         class StartBlocker(FrameProcessor):
@@ -1021,27 +1021,27 @@ class TestPipelineWorker(unittest.IsolatedAsyncioTestCase):
                 await super().process_frame(frame, direction)
 
                 if isinstance(frame, TextFrame):
-                    await self.push_error(ErrorFrame("Boo!"))
+                    await self.push_error("Boo!")
 
                 await self.push_frame(frame, direction)
 
-        error_received = False
+        errors: list[ErrorFrame] = []
 
         pipeline = Pipeline([ErrorProcessor()])
         worker = PipelineWorker(pipeline)
 
         @worker.event_handler("on_pipeline_error")
         async def on_pipeline_error(worker: PipelineWorker, frame: ErrorFrame):
-            nonlocal error_received
-            error_received = True
+            errors.append(frame)
             await worker.cancel()
 
         await worker.queue_frame(TextFrame(text="Hello from Pipecat!"))
 
-        try:
-            await worker.run(WorkerParams(task_manager=TaskManager()))
-        except asyncio.CancelledError:
-            assert error_received
+        await asyncio.wait_for(worker.run(WorkerParams(task_manager=TaskManager())), timeout=10.0)
+
+        # The text, not just an error: a processor that fails to build its
+        # error reports that failure as an ErrorFrame of its own.
+        assert [frame.error for frame in errors] == ["Boo!"]
 
     async def test_heartbeat_timeout_event_handler(self):
         """on_heartbeat_timeout fires when heartbeat frames cannot reach the sink."""
