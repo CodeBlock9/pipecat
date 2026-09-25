@@ -57,6 +57,36 @@ class TestRunnerCallerCancel(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(run_task.cancelled())
         self.assertTrue(worker._finished_event.is_set())
 
+    async def test_the_caller_still_counts_its_cancel_request(self):
+        """``run()`` re-raises without ``uncancel()``, so the caller's task still counts the request.
+
+        That count is what lets an enclosing ``asyncio.timeout`` or ``TaskGroup``
+        tell its own cancel from one aimed at it.
+        """
+        runner = WorkerRunner(handle_sigint=False)
+        await runner.add_workers(StubWorker("worker"))
+        ready = asyncio.Event()
+        seen = []
+
+        @runner.event_handler("on_ready")
+        async def on_ready(runner):
+            ready.set()
+
+        async def caller():
+            try:
+                await runner.run()
+            except asyncio.CancelledError:
+                seen.append(asyncio.current_task().cancelling())
+                raise
+
+        run_task = asyncio.create_task(caller())
+        await asyncio.wait_for(ready.wait(), timeout=5.0)
+        run_task.cancel()
+        await asyncio.wait({run_task}, timeout=5.0)
+
+        self.assertTrue(run_task.cancelled())
+        self.assertEqual(seen, [1])
+
     async def test_the_runners_own_stop_returns_normally(self):
         """``end()`` and ``cancel()`` stop the runner without raising in its caller."""
         for stop in ("end", "cancel"):
