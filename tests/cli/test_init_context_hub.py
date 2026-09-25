@@ -23,6 +23,10 @@ from pipecat.cli.main import app
 
 runner = CliRunner()
 
+# These test the hub setup itself, so they opt out of the stub the CLI
+# conftest gives every other test, and stub what lies beneath it instead.
+pytestmark = pytest.mark.real_context_hub
+
 
 def _no_hub_setup(monkeypatch) -> list[bool]:
     """Record whether the hub setup ran, without letting it touch anything real."""
