@@ -50,6 +50,8 @@ def _pydantic_model_type(annotation: Any) -> type[BaseModel] | None:
         if isinstance(candidate, type) and issubclass(candidate, BaseModel):
             return candidate
     return None
+
+
 class AIService(FrameProcessor):
     """Base class for all AI services.
 
