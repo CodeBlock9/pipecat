@@ -6,6 +6,7 @@
 
 """Plivo WebSocket frame serializer for audio streaming."""
 
+import asyncio
 import base64
 import json
 from typing import TYPE_CHECKING, cast
@@ -160,12 +161,17 @@ class PlivoFrameSerializer(FrameSerializer):
 
             if self._params.auto_hang_up and not self._hangup_attempted:
                 self._hangup_attempted = True
-                if self._hangup_strategy:
-                    success = await self._hangup_strategy.execute_hangup(context)
-                    if not success:
-                        logger.error(f"Hangup strategy failed for Plivo call {self._call_id}")
-                else:
-                    await self._hang_up_call()
+                try:
+                    if self._hangup_strategy:
+                        success = await self._hangup_strategy.execute_hangup(context)
+                        if not success:
+                            logger.error(f"Hangup strategy failed for Plivo call {self._call_id}")
+                    else:
+                        await self._hang_up_call()
+                except asyncio.CancelledError:
+                    # A cancel cut the request; let the CancelFrame that follows retry it.
+                    self._hangup_attempted = False
+                    raise
             return None
         elif isinstance(frame, InterruptionFrame):
             answer = {"event": "clearAudio", "streamId": self._stream_id}

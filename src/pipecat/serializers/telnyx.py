@@ -6,6 +6,7 @@
 
 """Telnyx WebSocket frame serializer for Pipecat."""
 
+import asyncio
 import base64
 import json
 from typing import TYPE_CHECKING
@@ -175,7 +176,12 @@ class TelnyxFrameSerializer(FrameSerializer):
                         "call_control_id": self._call_control_id,
                         "api_key": self._api_key,
                     }
-                    success = await self._hangup_strategy.execute_hangup(context)
+                    try:
+                        success = await self._hangup_strategy.execute_hangup(context)
+                    except asyncio.CancelledError:
+                        # A cancel cut the request; let the CancelFrame that follows retry it.
+                        self._hangup_attempted = False
+                        raise
                     if not success:
                         logger.error(f"Hangup strategy failed for call {self._call_control_id}")
                 else:

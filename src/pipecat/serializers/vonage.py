@@ -6,6 +6,7 @@
 
 """Vonage Audio Connector WebSocket serializer for Pipecat."""
 
+import asyncio
 import json
 
 from loguru import logger
@@ -112,7 +113,12 @@ class VonageFrameSerializer(FrameSerializer):
             and isinstance(frame, (EndFrame, CancelFrame))
         ):
             self._hangup_attempted = True
-            await self._hang_up_call()
+            try:
+                await self._hang_up_call()
+            except asyncio.CancelledError:
+                # A cancel cut the request; let the CancelFrame that follows retry it.
+                self._hangup_attempted = False
+                raise
             return None
         elif isinstance(frame, InterruptionFrame):
             # Clear the audio buffer to stop playback immediately

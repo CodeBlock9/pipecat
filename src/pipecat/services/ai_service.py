@@ -34,7 +34,7 @@ from pipecat.services.settings import ServiceSettings, is_given
 
 
 def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    result = copy.deepcopy(base)
+    result = dict(base)
     for key, value in override.items():
         existing = result.get(key)
         if isinstance(existing, dict) and isinstance(value, dict):
