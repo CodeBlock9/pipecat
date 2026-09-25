@@ -2231,10 +2231,15 @@ class TestVonageVideoConnectorTransport:
         self.mock_client_instance.add_video = MagicMock(return_value=True)
 
         transport._connected = True
-        result = await transport.write_video_frame(video_frame)
+        # No colorspace conversion turns RGB into the transport's YUV420, so a
+        # failed conversion would reject the frame too; the format check has to
+        # reject it before any conversion is attempted.
+        with patch("pipecat.transports.vonage.client.image_colorspace_conversion") as convert:
+            result = await transport.write_video_frame(video_frame)
 
         # Should return False for the wrong format, without sending the frame
         assert result is False
+        convert.assert_not_called()
         self.mock_client_instance.add_video.assert_not_called()
 
     @pytest.mark.asyncio
