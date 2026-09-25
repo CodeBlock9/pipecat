@@ -265,6 +265,12 @@ class WorkerRunner(BaseObject, BusSubscriber):
                 every root worker has finished. When ``False``, the
                 runner blocks until :meth:`end` or :meth:`cancel` is
                 called.
+
+        Raises:
+            asyncio.CancelledError: If the task awaiting ``run()`` is
+                cancelled, including by a ``wait_for`` or
+                ``asyncio.timeout`` deadline. The runner tears its workers
+                down first.
         """
         if worker is not None:
             warnings.warn(
@@ -289,10 +295,18 @@ class WorkerRunner(BaseObject, BusSubscriber):
 
         # Wait for shutdown. With ``auto_end=True``, ``_run_worker`` sets
         # ``_shutdown_event`` once the last root worker finishes.
+        #
+        # The runner's own stop (``end``, ``cancel``, a signal, the last root
+        # worker finishing) only sets the event, so a cancel landing here
+        # comes from whoever awaits ``run()``: a ``wait_for`` deadline, an
+        # ``asyncio.timeout`` scope or a cancelled parent task. Tear down
+        # first, then re-raise it, leaving ``cancelling()`` as it is, so the
+        # deadline surfaces as ``TimeoutError`` and the parent ends cancelled.
+        caller_cancel: asyncio.CancelledError | None = None
         try:
             await self._shutdown_event.wait()
-        except asyncio.CancelledError:
-            pass
+        except asyncio.CancelledError as cancel:
+            caller_cancel = cancel
 
         try:
             # Cancel any worker still going and wait for it to finish.
@@ -318,6 +332,9 @@ class WorkerRunner(BaseObject, BusSubscriber):
         self._print_dangling_tasks()
 
         logger.debug(f"WorkerRunner '{self}': finished running")
+
+        if caller_cancel is not None:
+            raise caller_cancel
 
     async def stop_when_done(self) -> None:
         """Schedule all root pipeline workers to stop when their current processing is complete."""
