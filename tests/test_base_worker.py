@@ -61,6 +61,15 @@ async def create_test_bus():
     return bus, tm
 
 
+async def _run(runner, *drivers, timeout=10.0):
+    """Run the runner beside the coroutines that drive it, with a bound.
+
+    A runner that never finishes (an end or cancel it ignores) then fails the
+    test with a ``TimeoutError`` instead of hanging the whole run.
+    """
+    return await asyncio.wait_for(asyncio.gather(runner.run(), *drivers), timeout)
+
+
 def create_test_registry():
     """Create a registry for testing worker lifecycle."""
     return WorkerRegistry(runner_name="test-runner")
@@ -161,7 +170,7 @@ class TestWorkerRunnerAccess(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
             await runner.end()
 
-        await asyncio.wait_for(asyncio.gather(runner.run(), end_after_start()), timeout=10.0)
+        await _run(runner, end_after_start())
 
         self.assertIs(probe.peer, helper)
 
@@ -325,7 +334,7 @@ class TestDrainBeforeTransition(unittest.IsolatedAsyncioTestCase):
             await action()
             await worker.queue_frame(EndFrame())
 
-        await asyncio.wait_for(asyncio.gather(runner.run(), drive()), timeout=10.0)
+        await _run(runner, drive())
 
     async def test_end_drains_a_running_pipeline(self):
         worker = make_stub_pipeline_task("draining")
@@ -416,7 +425,7 @@ class TestForeignFlushProbes(unittest.IsolatedAsyncioTestCase):
             for worker in workers:
                 await worker.queue_frame(EndFrame())
 
-        await asyncio.wait_for(asyncio.gather(runner.run(), drive()), timeout=10.0)
+        await _run(runner, drive())
 
         self.assertTrue(flushed)
         self.assertEqual(bystander_probes, {})
@@ -460,7 +469,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), handoff_after_start())
+        await _run(runner, handoff_after_start())
 
         self.assertTrue(worker.active)
         self.assertEqual(len(handoff_args_received), 1)
@@ -482,7 +491,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), wait_and_end())
+        await _run(runner, wait_and_end())
 
         self.assertTrue(worker.active)
         self.assertTrue(activated.is_set())
@@ -547,7 +556,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), drive())
+        await _run(runner, drive())
 
         self.assertTrue(observed_while_active["active"])
         self.assertEqual(observed_while_active["args"], args)
@@ -653,7 +662,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), wait_and_end())
+        await _run(runner, wait_and_end())
 
     async def test_on_pipeline_started_event(self):
         """on_pipeline_started fires after pipeline starts."""
@@ -671,7 +680,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), wait_and_end())
+        await _run(runner, wait_and_end())
 
         self.assertTrue(started.is_set())
 
@@ -691,7 +700,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), end_pipeline())
+        await _run(runner, end_pipeline())
 
         self.assertTrue(finished_fired.is_set())
 
@@ -726,7 +735,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), send_end_message())
+        await _run(runner, send_end_message())
 
         self.assertTrue(finished.is_set())
 
@@ -741,7 +750,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         try:
             await runner.add_workers(worker)
-            await asyncio.gather(runner.run(), send_cancel_message())
+            await _run(runner, send_cancel_message())
         except asyncio.CancelledError:
             pass
 
@@ -766,7 +775,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), push_frames())
+        await _run(runner, push_frames())
 
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0].text, "injected")
@@ -790,7 +799,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), push_frames())
+        await _run(runner, push_frames())
 
         self.assertEqual(len(received), 2)
         self.assertEqual(received[0].text, "a")
@@ -822,7 +831,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), send_speak())
+        await _run(runner, send_speak())
 
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0].text, "hello there")
@@ -849,7 +858,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), send_speak())
+        await _run(runner, send_speak())
 
         self.assertEqual(received, [])
 
@@ -873,7 +882,7 @@ class TestPipelineWorkerLifecycle(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), self_handoff())
+        await _run(runner, self_handoff())
 
         self.assertTrue(worker.active)
 
@@ -992,7 +1001,7 @@ class TestEdgeToBus(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), push_frames())
+        await _run(runner, push_frames())
 
         bus_frame_msgs = [m for m in sent if isinstance(m, BusFrameMessage)]
         text_msgs = [m for m in bus_frame_msgs if isinstance(m.frame, TextFrame)]
@@ -1021,7 +1030,7 @@ class TestEdgeToBus(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), inject_frame())
+        await _run(runner, inject_frame())
 
         # The frame passes through the identity pipeline and reaches
         # EdgeSink, which re-broadcasts with source="worker". That's
@@ -1053,7 +1062,7 @@ class TestEdgeToBus(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), push_frames())
+        await _run(runner, push_frames())
 
         bus_frame_msgs = [m for m in sent if isinstance(m, BusFrameMessage)]
         self.assertEqual(len(bus_frame_msgs), 0)
@@ -1083,7 +1092,7 @@ class TestEdgeToBus(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), inject_frame())
+        await _run(runner, inject_frame())
 
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0].text, "from_bus")
@@ -1102,7 +1111,7 @@ class TestEdgeToBus(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), push_frames())
+        await _run(runner, push_frames())
 
         bus_frame_msgs = [m for m in sent if isinstance(m, BusFrameMessage)]
         text_msgs = [m for m in bus_frame_msgs if isinstance(m.frame, TextFrame)]
@@ -1136,7 +1145,7 @@ class TestEdgeToBus(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), inject_frame())
+        await _run(runner, inject_frame())
 
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0].text, "voice_frame")
@@ -1167,7 +1176,7 @@ class TestEdgeToBus(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), inject_frame())
+        await _run(runner, inject_frame())
 
         self.assertEqual(len(received), 0)
 
@@ -1212,7 +1221,7 @@ class TestEdgeToBus(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), inject_frames())
+        await _run(runner, inject_frames())
 
         self.assertEqual(len(received), 3)
 
@@ -1258,7 +1267,7 @@ class TestEdgeToBus(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), inject_frames())
+        await _run(runner, inject_frames())
 
         texts = sorted([r.text for r in received])
         self.assertEqual(texts, ["video", "voice"])
@@ -1277,7 +1286,7 @@ class TestEdgeToBus(unittest.IsolatedAsyncioTestCase):
 
         runner = WorkerRunner(bus=self.bus, handle_sigint=False)
         await runner.add_workers(worker)
-        await asyncio.gather(runner.run(), push_frames())
+        await _run(runner, push_frames())
 
         bus_frame_msgs = [m for m in sent if isinstance(m, BusFrameMessage)]
         self.assertEqual(len(bus_frame_msgs), 0)

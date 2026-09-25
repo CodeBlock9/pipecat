@@ -76,16 +76,19 @@ def _make_frame(content: str, run_llm: bool = True) -> LLMMessagesAppendFrame:
 class TestToolCallTracking(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._workers = []
+        self._original_queue_frame = PipelineWorker.queue_frame
 
     def _track(self, worker):
         self._workers.append(worker)
         return worker
 
     def tearDown(self):
-        for worker in self._workers:
-            restore = getattr(worker, "_restore_pt_queue_frame", None)
-            if restore:
-                restore()
+        # Each worker saved whatever PipelineWorker.queue_frame was when it was
+        # created, the previous worker's replacement included, so the class is
+        # only clean again if the patches come off newest first.
+        for worker in reversed(self._workers):
+            worker._restore_pt_queue_frame()
+        self.assertIs(PipelineWorker.queue_frame, self._original_queue_frame)
 
     async def test_tool_call_active_initially_false(self):
         worker = self._track(_create_worker())

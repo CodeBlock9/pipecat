@@ -34,27 +34,9 @@ class _Resources:
     db: dict[str, Any] = field(default_factory=dict)
 
 
-def _complete_llm_settings() -> LLMSettings:
-    """Return an LLMSettings with every field set so test_service_init's
-    auto-discovered ``_MockLLMService`` doesn't fail its NOT_GIVEN check."""
-    return LLMSettings(
-        model=None,
-        system_instruction=None,
-        temperature=None,
-        max_tokens=None,
-        top_p=None,
-        top_k=None,
-        frequency_penalty=None,
-        presence_penalty=None,
-        seed=None,
-        filter_incomplete_user_turns=None,
-        user_turn_completion_config=None,
-    )
-
-
 class _MockLLMService(LLMService):
     def __init__(self, **kwargs):
-        super().__init__(settings=_complete_llm_settings(), **kwargs)
+        super().__init__(settings=LLMSettings(), **kwargs)
 
 
 class TestFunctionCallParamsAppResources(unittest.TestCase):

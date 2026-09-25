@@ -408,6 +408,8 @@ class _MockWordTimestampHttpTTSService(TTSService):
             push_stop_frames=True,
             push_text_frames=False,
             sample_rate=_SAMPLE_RATE,
+            # No assertion waits for the stop frame, so skip the 3 s default wait.
+            stop_frame_timeout_s=0.1,
             **kwargs,
         )
         self._includes_inter_frame_spaces = includes_inter_frame_spaces
@@ -908,6 +910,8 @@ class _MockPerCallWordTimestampHttpTTSService(TTSService):
             push_stop_frames=True,
             push_text_frames=False,
             sample_rate=_SAMPLE_RATE,
+            # No assertion waits for the stop frame, so skip the 3 s default wait.
+            stop_frame_timeout_s=0.1,
             **kwargs,
         )
         self._word_times_queue = list(word_times_per_call)

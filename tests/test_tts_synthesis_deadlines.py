@@ -63,10 +63,6 @@ class _StubTTS(TTSService):
     ):
         self.errors.append((error_msg, fatal or force_treat_as_permanent))
 
-    async def append_to_audio_context(self, context_id, frame):
-        if isinstance(frame, TTSAudioRawFrame):
-            await self._cancel_synthesis_watchdog(context_id)
-
     def create_task(self, coroutine, name=None):
         # The service is exercised outside a pipeline, so there is no task
         # manager to hand it to.
@@ -191,6 +187,7 @@ async def test_the_context_watchdog_bounds_a_websocket_shaped_service():
 @pytest.mark.asyncio
 async def test_the_first_audio_frame_disarms_the_context_watchdog():
     service = _StubTTS(chunks=[], synthesis_first_chunk_timeout_s=0.05)
+    await service.create_audio_context("ctx")
     await service._arm_synthesis_watchdog("ctx")
     await service.append_to_audio_context("ctx", _audio())
 
@@ -433,11 +430,8 @@ async def test_a_context_torn_down_by_the_handler_takes_its_watchdog_with_it():
 
     await service.create_audio_context("ctx")
     await service._arm_synthesis_watchdog("ctx")
-    # Mark it for deletion, then let the handler drain and tear it down. The
-    # sentinel goes into the queue directly: this stub overrides
-    # append_to_audio_context and would swallow it.
-    await service._audio_contexts["ctx"].put(None)
-    await service._serialization_queue.put("ctx")
+    # Mark it for deletion, then let the handler drain and tear it down.
+    await service.append_to_audio_context("ctx", None)
     handler = asyncio.create_task(service._audio_context_task_handler())
     await asyncio.sleep(0.1)
 

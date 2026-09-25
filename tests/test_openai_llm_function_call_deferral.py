@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from pipecat.frames.frames import BotStoppedSpeakingFrame
 from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import FunctionCallFromLLM
 from pipecat.services.openai.llm import OpenAILLMService
 
@@ -127,3 +129,33 @@ async def test_pending_node_transition_batch_runs_after_tts():
 
     service.run_function_calls.assert_awaited_once_with([function_call])
     assert service._pending_node_transition_function_calls == []
+
+
+@pytest.mark.asyncio
+async def test_bot_stopped_speaking_flushes_the_parked_transition():
+    """The deferral's only exit: the bot finishing the sentence it was saying."""
+    service = _make_service()
+    service.register_function(
+        "transition_to_next_node",
+        AsyncMock(),
+        is_node_transition=True,
+    )
+    service.run_function_calls = AsyncMock()
+    service.push_frame = AsyncMock()
+    function_call = _make_function_call(
+        "transition_to_next_node",
+        "call-transition",
+    )
+
+    await service._run_or_defer_function_calls(
+        [function_call],
+        text_generated=True,
+    )
+    service.run_function_calls.assert_not_awaited()
+
+    frame = BotStoppedSpeakingFrame()
+    await service.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+    service.run_function_calls.assert_awaited_once_with([function_call])
+    assert service._pending_node_transition_function_calls == []
+    service.push_frame.assert_awaited_once_with(frame, FrameDirection.DOWNSTREAM)

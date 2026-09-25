@@ -32,6 +32,33 @@ class StubTask(BaseWorker):
         self._finished_event.set()
 
 
+async def _run(runner, timeout=5.0):
+    """Run the runner with a bound that can fail.
+
+    ``WorkerRunner.run`` swallows a cancellation of its own task, so
+    ``wait_for(runner.run(), ...)`` cancels it at the deadline and then returns
+    normally. Awaiting it through ``gather`` keeps the expiry a ``TimeoutError``.
+    """
+    await asyncio.wait_for(asyncio.gather(runner.run()), timeout)
+
+
+def capture_sent(bus):
+    """Record every message sent on ``bus``, still delivering each one."""
+    sent = []
+    original_send = bus.send
+
+    async def capture_send(message):
+        sent.append(message)
+        await original_send(message)
+
+    bus.send = capture_send
+    return sent
+
+
+def sent_to(sent, message_class, target):
+    return [m for m in sent if isinstance(m, message_class) and m.target == target]
+
+
 class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
     async def test_pipeline_runner_alias_is_deprecated(self):
         """PipelineRunner still works but emits a DeprecationWarning."""
@@ -50,9 +77,11 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         task = StubTask("task_a")
 
         await runner.add_workers(task)
+        self.assertIs(runner.get_worker("task_a"), task)
 
         # Duplicate is silently skipped (logs error)
         await runner.add_workers(StubTask("task_a"))
+        self.assertIs(runner.get_worker("task_a"), task)
 
     async def test_run_starts_bus_and_tasks(self):
         """run() starts bus, starts all tasks, fires on_ready."""
@@ -68,7 +97,7 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
             # Immediately end to unblock run()
             await runner.end()
 
-        await asyncio.wait_for(runner.run(), timeout=5.0)
+        await _run(runner)
 
         self.assertTrue(runner_started.is_set())
 
@@ -77,30 +106,34 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         runner = WorkerRunner(handle_sigint=False)
         task = StubTask("task_a")
         await runner.add_workers(task)
+        sent = capture_sent(runner.bus)
 
         @runner.event_handler("on_ready")
         async def on_ready(runner):
             await runner.end(reason="first")
             await runner.end(reason="second")  # should be no-op
 
-        await asyncio.wait_for(runner.run(), timeout=5.0)
-        # If we got here without hanging, idempotency works
+        await _run(runner)
+
+        ends = sent_to(sent, BusEndWorkerMessage, "task_a")
+        self.assertEqual([m.reason for m in ends], ["first"])
 
     async def test_cancel_is_idempotent(self):
         """cancel() is idempotent — subsequent calls are no-ops."""
         runner = WorkerRunner(handle_sigint=False)
         task = StubTask("task_a")
         await runner.add_workers(task)
+        sent = capture_sent(runner.bus)
 
         @runner.event_handler("on_ready")
         async def on_ready(runner):
             await runner.cancel(reason="first")
             await runner.cancel(reason="second")  # should be no-op
 
-        try:
-            await asyncio.wait_for(runner.run(), timeout=5.0)
-        except asyncio.CancelledError:
-            pass
+        await _run(runner)
+
+        cancels = sent_to(sent, BusCancelWorkerMessage, "task_a")
+        self.assertEqual([m.reason for m in cancels], ["first"])
 
     async def test_end_sends_end_task_message_to_root_tasks_only(self):
         """end() sends BusEndWorkerMessage only to root tasks (no parent)."""
@@ -112,15 +145,7 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         await runner.add_workers(root)
         await runner.add_workers(child)
 
-        sent = []
-        bus = runner.bus
-        original_send = bus.send
-
-        async def capture_send(message):
-            sent.append(message)
-            await original_send(message)
-
-        bus.send = capture_send
+        sent = capture_sent(runner.bus)
 
         # Call end() directly — no need to run the full pipeline lifecycle
         await runner.end()
@@ -143,15 +168,7 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         await runner.add_workers(root)
         await runner.add_workers(child)
 
-        sent = []
-        bus = runner.bus
-        original_send = bus.send
-
-        async def capture_send(message):
-            sent.append(message)
-            await original_send(message)
-
-        bus.send = capture_send
+        sent = capture_sent(runner.bus)
 
         await runner.cancel("stop now")
         # What ``run()`` does once the shutdown signal reaches it.
@@ -170,14 +187,17 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         await runner.add_workers(task)
 
         bus = runner.bus
+        sent = capture_sent(bus)
 
         @runner.event_handler("on_ready")
         async def on_ready(runner):
             # Simulate a task sending BusEndMessage
-            await bus.send(BusEndMessage(source="task_a"))
+            await bus.send(BusEndMessage(source="task_a", reason="done"))
 
-        await asyncio.wait_for(runner.run(), timeout=5.0)
-        # If we got here, end was triggered by the bus message
+        await _run(runner)
+
+        ends = sent_to(sent, BusEndWorkerMessage, "task_a")
+        self.assertEqual([m.reason for m in ends], ["done"])
 
     async def test_bus_cancel_message_triggers_cancel(self):
         """BusCancelMessage on bus triggers runner.cancel()."""
@@ -186,15 +206,16 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         await runner.add_workers(task)
 
         bus = runner.bus
+        sent = capture_sent(bus)
 
         @runner.event_handler("on_ready")
         async def on_ready(runner):
-            await bus.send(BusCancelMessage(source="task_a"))
+            await bus.send(BusCancelMessage(source="task_a", reason="abort"))
 
-        try:
-            await asyncio.wait_for(runner.run(), timeout=5.0)
-        except asyncio.CancelledError:
-            pass
+        await _run(runner)
+
+        cancels = sent_to(sent, BusCancelWorkerMessage, "task_a")
+        self.assertEqual([m.reason for m in cancels], ["abort"])
 
     async def test_bus_add_task_message_triggers_add(self):
         """BusAddWorkerMessage on bus triggers add_workers()."""
@@ -207,14 +228,13 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
 
         @runner.event_handler("on_ready")
         async def on_ready(runner):
-            await bus.send(BusAddWorkerMessage(source="task_a", task=task_b))
+            await bus.send(BusAddWorkerMessage(source="task_a", worker=task_b))
             await asyncio.sleep(0.1)
             await runner.end()
 
-        await asyncio.wait_for(runner.run(), timeout=5.0)
+        await _run(runner)
 
-        # Verify task_b was added (duplicate is silently skipped)
-        await runner.add_workers(StubTask("task_b"))
+        self.assertIs(runner.get_worker("task_b"), task_b)
 
 
 if __name__ == "__main__":

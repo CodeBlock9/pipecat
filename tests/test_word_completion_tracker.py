@@ -364,6 +364,9 @@ class TestWordCompletionTrackerRealisticSentences(unittest.TestCase):
         """Tracker must not report complete before the final word is added."""
         tracker = WordCompletionTracker(self.SENTENCE)
         for word in self.TTS_WORDS[:-1]:
+            self.assertFalse(
+                tracker.add_word_and_check_complete(word), f"completed early on '{word}'"
+            )
             self.assertFalse(tracker.is_complete, f"should not be complete after '{word}'")
 
     def test_last_word_triggers_completion(self):
