@@ -207,7 +207,7 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
 
         @runner.event_handler("on_ready")
         async def on_ready(runner):
-            await bus.send(BusAddWorkerMessage(source="task_a", task=task_b))
+            await bus.send(BusAddWorkerMessage(source="task_a", worker=task_b))
             await asyncio.sleep(0.1)
             await runner.end()
 
