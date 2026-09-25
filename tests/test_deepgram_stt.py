@@ -16,6 +16,7 @@ from deepgram.core import ApiError
 from loguru import logger
 from websockets.exceptions import ConnectionClosedError
 
+import pipecat.services.deepgram.stt as deepgram_stt
 from pipecat.frames.frames import EndFrame
 from pipecat.services.deepgram.stt import DeepgramSTTService, _derive_deepgram_urls
 from pipecat.utils.asyncio.task_manager import TaskManager
@@ -282,7 +283,14 @@ async def test_connection_handler_backs_off_after_non_quick_failure(monkeypatch)
             # so the `while True` loop under test terminates.
             raise asyncio.CancelledError
 
-    monkeypatch.setattr("pipecat.services.deepgram.stt.asyncio.sleep", fake_sleep)
+    class _ModuleAsyncio:
+        # The module's own `asyncio` name, with sleep recorded and the rest real.
+        sleep = staticmethod(fake_sleep)
+
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+    monkeypatch.setattr(deepgram_stt, "asyncio", _ModuleAsyncio())
     service = _make_bare_service()
 
     fake_time = MagicMock()
@@ -305,6 +313,8 @@ async def test_connection_handler_backs_off_after_non_quick_failure(monkeypatch)
         await service._connection_handler()
 
     assert sleep_calls == [4, 4]  # exponential_backoff_time's min_wait, not skipped
+    # Only the module under test saw the fake; the stdlib's sleep is untouched.
+    assert asyncio.sleep is asyncio.tasks.sleep
 
 
 def _results_message(transcript: str, is_final: bool):

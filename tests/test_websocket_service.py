@@ -29,10 +29,6 @@ from pipecat.services.websocket_service import (
 # Magic value RFC 6455 requires when deriving the handshake accept header.
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-# The _no_sleep fixture below stubs out asyncio.sleep for the whole module, so
-# tests that need real elapsed time use this reference instead.
-_real_sleep = asyncio.sleep
-
 
 class ConcreteWebsocketService(WebsocketService):
     """Minimal concrete implementation for testing."""
@@ -63,10 +59,15 @@ def report_error():
 
 
 @pytest.fixture(autouse=True)
-def _no_sleep():
-    """Patch asyncio.sleep globally to avoid real backoff waits."""
-    with patch("pipecat.services.websocket_service.asyncio.sleep", new_callable=AsyncMock):
+def _no_backoff():
+    """Make every reconnection backoff zero, leaving asyncio.sleep alone."""
+    with patch("pipecat.services.websocket_service.exponential_backoff_time", return_value=0):
         yield
+
+
+def test_the_stdlib_sleep_is_untouched():
+    """The fixture above must not replace asyncio.sleep for the whole process."""
+    assert asyncio.sleep is asyncio.tasks.sleep
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +381,7 @@ async def test_bounded_close_logs_when_handshake_overruns(log_sink):
     conn.close_timeout = 0.05
 
     async def slow_close(self, code=1000, reason=""):
-        await _real_sleep(0.1)
+        await asyncio.sleep(0.1)
 
     with patch.object(ClientConnection, "close", slow_close):
         await conn.close()

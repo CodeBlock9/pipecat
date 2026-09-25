@@ -23,10 +23,25 @@ import pytest
 
 REPO_ROOT = Path(__file__).parent.parent
 SCRIPTS = REPO_ROOT / "scripts" / "provider-watch"
+
+# The scripts import each other as top-level modules, so they need their
+# directory on the path while they load. Take it back off afterwards, with the
+# entries probe.py and publish.py add for themselves: left in place, a script
+# would shadow any later import of the same name for the rest of the session.
+_SYS_PATH = list(sys.path)
 sys.path.insert(0, str(SCRIPTS))
 
 import digest  # noqa: E402
 import inventory  # noqa: E402
+import probe  # noqa: E402
+import publish  # noqa: E402
+
+sys.path[:] = _SYS_PATH
+
+
+def test_the_scripts_directory_is_not_left_on_sys_path():
+    assert str(SCRIPTS) not in sys.path
+    assert str(SCRIPTS.resolve()) not in sys.path
 
 
 @pytest.fixture(scope="module")
@@ -252,8 +267,6 @@ class TestProbe:
         assert result.returncode == 3
 
     def test_merge_probe_results_medians(self):
-        import probe
-
         def result(ok=True, ttfat=None, ttfb=None, error=None):
             return probe.ProbeResult(
                 service="AnthropicLLMService",
@@ -286,8 +299,6 @@ class TestProbe:
         assert partial.note.startswith("median of 1/2 runs")
 
     def test_setting_values_parse_json_and_scalars(self):
-        import probe
-
         assert probe._kv_pairs(['extra={"reasoning_effort": "low"}', "speed=1.5", "x=none"]) == {
             "extra": {"reasoning_effort": "low"},
             "speed": 1.5,
@@ -357,8 +368,6 @@ class TestPublish:
 
     @pytest.fixture
     def reports_dir(self, tmp_path):
-        import publish
-
         def write(unit, branch):
             path = tmp_path / "reports" / unit / "2026-08-20.md"
             path.parent.mkdir(parents=True)
@@ -417,8 +426,6 @@ class TestPublish:
         assert "reports/fireworks/llm/2026-08-20.md" in create[create.index("--body") + 1]
 
     def test_multi_commit_branch_stitches_pr(self, tmp_path):
-        import publish
-
         branch = "provider-watch/cartesia-tts-updates"
         path = tmp_path / "reports/cartesia/tts/2026-08-20.md"
         path.parent.mkdir(parents=True)
@@ -455,8 +462,6 @@ class TestPublish:
         assert body.index("sonic-4") < body.index("retired sonic-2")
 
     def test_renames_changelog_fragments_to_pr_number(self, tmp_path):
-        import publish
-
         branch = "provider-watch/cartesia-tts-updates"
         path = tmp_path / "reports/cartesia/tts/2026-08-20.md"
         path.parent.mkdir(parents=True)
@@ -552,13 +557,7 @@ class TestPublish:
 class TestSdkVersions:
     """probe.py sdk-versions: SDK derivation from pyproject, no network."""
 
-    @pytest.fixture
-    def probe(self):
-        import probe
-
-        return probe
-
-    def test_sdk_requirements_come_from_pyproject_extras(self, probe, units):
+    def test_sdk_requirements_come_from_pyproject_extras(self, units):
         deepgram = [u for u in units if u.provider == "deepgram"]
         reqs = probe.sdk_requirements("deepgram", deepgram)
         assert any(r.startswith("deepgram-sdk") for r in reqs)
@@ -571,7 +570,7 @@ class TestSdkVersions:
         }
         assert {"google-genai", "google-cloud-speech", "google-cloud-texttospeech"} <= names
 
-    def test_thin_wrappers_fall_back_to_openai(self, probe, units):
+    def test_thin_wrappers_fall_back_to_openai(self, units):
         groq = [u for u in units if u.provider == "groq"]
         reqs = probe.sdk_requirements("groq", groq)
         assert any(r.startswith("groq") for r in reqs)  # groq has its own extra
