@@ -32,16 +32,6 @@ class StubTask(BaseWorker):
         self._finished_event.set()
 
 
-async def _run(runner, timeout=5.0):
-    """Run the runner with a bound that can fail.
-
-    ``WorkerRunner.run`` swallows a cancellation of its own task, so
-    ``wait_for(runner.run(), ...)`` cancels it at the deadline and then returns
-    normally. Awaiting it through ``gather`` keeps the expiry a ``TimeoutError``.
-    """
-    await asyncio.wait_for(asyncio.gather(runner.run()), timeout)
-
-
 def capture_sent(bus):
     """Record every message sent on ``bus``, still delivering each one."""
     sent = []
@@ -97,7 +87,7 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
             # Immediately end to unblock run()
             await runner.end()
 
-        await _run(runner)
+        await asyncio.wait_for(runner.run(), timeout=5.0)
 
         self.assertTrue(runner_started.is_set())
 
@@ -113,7 +103,7 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
             await runner.end(reason="first")
             await runner.end(reason="second")  # should be no-op
 
-        await _run(runner)
+        await asyncio.wait_for(runner.run(), timeout=5.0)
 
         ends = sent_to(sent, BusEndWorkerMessage, "task_a")
         self.assertEqual([m.reason for m in ends], ["first"])
@@ -130,7 +120,7 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
             await runner.cancel(reason="first")
             await runner.cancel(reason="second")  # should be no-op
 
-        await _run(runner)
+        await asyncio.wait_for(runner.run(), timeout=5.0)
 
         cancels = sent_to(sent, BusCancelWorkerMessage, "task_a")
         self.assertEqual([m.reason for m in cancels], ["first"])
@@ -194,7 +184,7 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
             # Simulate a task sending BusEndMessage
             await bus.send(BusEndMessage(source="task_a", reason="done"))
 
-        await _run(runner)
+        await asyncio.wait_for(runner.run(), timeout=5.0)
 
         ends = sent_to(sent, BusEndWorkerMessage, "task_a")
         self.assertEqual([m.reason for m in ends], ["done"])
@@ -212,7 +202,7 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         async def on_ready(runner):
             await bus.send(BusCancelMessage(source="task_a", reason="abort"))
 
-        await _run(runner)
+        await asyncio.wait_for(runner.run(), timeout=5.0)
 
         cancels = sent_to(sent, BusCancelWorkerMessage, "task_a")
         self.assertEqual([m.reason for m in cancels], ["abort"])
@@ -232,7 +222,7 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.1)
             await runner.end()
 
-        await _run(runner)
+        await asyncio.wait_for(runner.run(), timeout=5.0)
 
         self.assertIs(runner.get_worker("task_b"), task_b)
 
