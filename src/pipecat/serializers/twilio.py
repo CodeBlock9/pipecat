@@ -6,6 +6,7 @@
 
 """Twilio Media Streams WebSocket protocol serializer for Pipecat."""
 
+import asyncio
 import base64
 import json
 from typing import TYPE_CHECKING, cast
@@ -209,20 +210,25 @@ class TwilioFrameSerializer(FrameSerializer):
                     logger.warning(f"No transfer strategy configured for call {self._call_sid}")
             elif self._params.auto_hang_up and not self._hangup_attempted:
                 self._hangup_attempted = True
-                if self._hangup_strategy:
-                    context = {
-                        "call_sid": self._call_sid,
-                        "account_sid": self._account_sid,
-                        "auth_token": self._auth_token,
-                        "region": self._region,
-                        "edge": self._edge,
-                        "base_url": self._base_url,
-                    }
-                    success = await self._hangup_strategy.execute_hangup(context)
-                    if not success:
-                        logger.error(f"Hangup strategy failed for call {self._call_sid}")
-                else:
-                    await self._hang_up_call()
+                try:
+                    if self._hangup_strategy:
+                        context = {
+                            "call_sid": self._call_sid,
+                            "account_sid": self._account_sid,
+                            "auth_token": self._auth_token,
+                            "region": self._region,
+                            "edge": self._edge,
+                            "base_url": self._base_url,
+                        }
+                        success = await self._hangup_strategy.execute_hangup(context)
+                        if not success:
+                            logger.error(f"Hangup strategy failed for call {self._call_sid}")
+                    else:
+                        await self._hang_up_call()
+                except asyncio.CancelledError:
+                    # A cancel cut the request; let the CancelFrame that follows retry it.
+                    self._hangup_attempted = False
+                    raise
                 return None
         elif isinstance(frame, InterruptionFrame):
             answer = {"event": "clear", "streamSid": self._stream_sid}

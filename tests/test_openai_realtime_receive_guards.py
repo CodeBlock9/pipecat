@@ -180,6 +180,58 @@ async def test_a_skipped_event_is_logged_by_type_and_first_line_only():
     assert "4111" not in warnings[0]
 
 
+def _completed_done(usage) -> str:
+    return json.dumps(
+        {
+            "event_id": "event_rec_6",
+            "type": "response.done",
+            "response": {
+                "id": "resp_rec_6",
+                "object": "realtime.response",
+                "status": "completed",
+                "status_details": None,
+                "output": [],
+                "usage": usage,
+            },
+        }
+    )
+
+
+# Usage the model cannot read: an empty object, and one without its detail objects.
+UNREADABLE_USAGE = {
+    "empty": {},
+    "no_details": {"total_tokens": 3, "input_tokens": 2, "output_tokens": 1},
+}
+
+
+@pytest.mark.parametrize("usage", UNREADABLE_USAGE.values(), ids=UNREADABLE_USAGE.keys())
+def test_unreadable_usage_is_dropped_and_the_response_done_parses(usage):
+    done = events.parse_server_event(_completed_done(usage))
+
+    assert isinstance(done, events.ResponseDone)
+    assert done.response.status == "completed"
+    assert done.response.usage is None
+
+
+@pytest.mark.parametrize("usage", UNREADABLE_USAGE.values(), ids=UNREADABLE_USAGE.keys())
+@pytest.mark.asyncio
+async def test_a_response_done_with_unreadable_usage_still_closes_the_turn(usage):
+    service = _service([_completed_done(usage), SPEECH_STARTED])
+
+    warnings = await _receive_with_warnings(service)
+
+    assert warnings[0].startswith("Realtime response.done usage unreadable, dropped: "), warnings
+    assert "validation error" in warnings[0]
+    assert not any("Failed to parse server event" in w for w in warnings)
+    service.start_llm_usage_metrics.assert_not_called()
+    service.stop_processing_metrics.assert_awaited_once()
+    assert [type(call.args[0]) for call in service.push_frame.await_args_list] == [
+        TTSStoppedFrame,
+        LLMFullResponseEndFrame,
+    ]
+    service._handle_evt_speech_started.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_control_a_fatal_error_event_still_ends_the_loop():
     service = _service([FATAL_ERROR, SPEECH_STARTED])

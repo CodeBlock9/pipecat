@@ -146,7 +146,6 @@ class IdleFrameObserver(BaseObserver):
         super().__init__()
         self._idle_event = idle_event
         self._idle_timeout_frames = idle_timeout_frames
-        self._processed_frames = set()
         self.observed_frame_types = (StartFrame, *idle_timeout_frames)
 
     async def on_push_frame(self, data: FramePushed):
@@ -155,12 +154,6 @@ class IdleFrameObserver(BaseObserver):
         Args:
             data: The frame push event data.
         """
-        # Skip already processed frames
-        if data.frame.id in self._processed_frames:
-            return
-
-        self._processed_frames.add(data.frame.id)
-
         if isinstance(data.frame, StartFrame) or isinstance(data.frame, self._idle_timeout_frames):
             self._idle_event.set()
 

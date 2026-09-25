@@ -10,7 +10,15 @@ import json
 import uuid
 from typing import Any, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from loguru import logger
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+)
 
 from pipecat.adapters.schemas.direct_function import DirectFunction
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -1107,6 +1115,19 @@ class Response(BaseModel):
     voice: str | None = None
     temperature: float | None = None
     output_audio_format: str | None = None
+
+    @field_validator("usage", mode="wrap")
+    @classmethod
+    def _drop_unreadable_usage(cls, value: Any, handler: ValidatorFunctionWrapHandler):
+        """Drop usage the model cannot read rather than the whole ``response.done``.
+
+        A skipped ``response.done`` leaves the turn open; the usage is only metrics.
+        """
+        try:
+            return handler(value)
+        except ValidationError as err:
+            logger.warning("Realtime response.done usage unreadable, dropped: {}", err)
+            return None
 
 
 _server_event_types = {
