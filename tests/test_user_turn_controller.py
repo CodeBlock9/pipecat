@@ -219,35 +219,49 @@ class TestUserTurnController(unittest.IsolatedAsyncioTestCase):
 
     async def test_deferred_wrapper_skips_stopped(self):
         """A deferred() wrapper drops the inner strategy's on_user_turn_stopped event."""
-        wrapped = deferred(
-            SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)
+        inner = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)
+        controller = UserTurnController(
+            user_turn_strategies=UserTurnStrategies(stop=[deferred(inner)]),
+            user_turn_stop_timeout=USER_TURN_STOP_TIMEOUT,
         )
-        controller = UserTurnController(user_turn_strategies=UserTurnStrategies(stop=[wrapped]))
 
         await controller.setup(frame_processor_setup(self.task_manager))
         await controller.start()
 
         events: list[str] = []
+        inference_strategies = []
+        stop_strategies = []
 
         @controller.event_handler("on_user_turn_inference_triggered")
         async def on_user_turn_inference_triggered(controller, strategy):
             events.append("inference_triggered")
+            inference_strategies.append(strategy)
+
+        @controller.event_handler("on_user_turn_stop_timeout")
+        async def on_user_turn_stop_timeout(controller):
+            events.append("stop_timeout")
 
         @controller.event_handler("on_user_turn_stopped")
         async def on_user_turn_stopped(controller, strategy, params):
             events.append("stopped")
+            stop_strategies.append(strategy)
 
         await controller.process_frame(VADUserStartedSpeakingFrame())
         await controller.process_frame(
             TranscriptionFrame(text="Hello!", user_id="", timestamp="now")
         )
         await controller.process_frame(VADUserStoppedSpeakingFrame())
-        await asyncio.sleep(TRANSCRIPTION_TIMEOUT + 0.1)
+        # Long enough for the inner strategy and then the watchdog to fire.
+        await asyncio.sleep(TRANSCRIPTION_TIMEOUT + USER_TURN_STOP_TIMEOUT + 0.3)
 
         # The inner strategy fires inference-triggered (forwarded by the
-        # wrapper). Finalization is suppressed, but the controller's
-        # stop watchdog eventually fires `stopped`.
-        self.assertEqual(events[0], "inference_triggered")
+        # wrapper). Its finalization is suppressed, so the only stop is the
+        # controller's watchdog, which carries no strategy.
+        self.assertEqual(events, ["inference_triggered", "stop_timeout", "stopped"])
+        self.assertEqual(inference_strategies, [inner])
+        self.assertEqual(stop_strategies, [None])
+
+        await controller.cleanup()
 
     async def test_force_user_turn_stop_stops_once(self):
         controller = UserTurnController(

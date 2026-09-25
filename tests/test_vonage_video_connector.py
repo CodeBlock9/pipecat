@@ -1145,11 +1145,6 @@ class TestVonageVideoConnectorTransport:
         assert frame.num_channels == 1
 
     @pytest.mark.asyncio
-    async def test_vonage_client_get_video(self) -> None:
-        """Test VonageClient get video."""
-        pass
-
-    @pytest.mark.asyncio
     async def test_vonage_client_write_audio(self) -> None:
         """Test VonageClient write_audio method."""
         params = self.VonageVideoConnectorTransportParams(
@@ -2225,19 +2220,22 @@ class TestVonageVideoConnectorTransport:
             )
         )
 
-        # Create a video frame with incorrect size
-        width, height = 320, 240  # Different from expected 640x480
+        # The expected 640x480, so the size check passes and only the format
+        # (RGB, where the transport sends YCbCr) can reject it.
+        width, height = 640, 480
         rgb_image = np.zeros((height, width, 3), dtype=np.uint8)
 
         video_frame = OutputImageRawFrame(
             image=rgb_image.tobytes(), size=(width, height), format="RGB"
         )
+        self.mock_client_instance.add_video = MagicMock(return_value=True)
 
         transport._connected = True
         result = await transport.write_video_frame(video_frame)
 
-        # Should return False for invalid size
+        # Should return False for the wrong format, without sending the frame
         assert result is False
+        self.mock_client_instance.add_video.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_vonage_output_transport_process_frame_with_interruption(self) -> None:
