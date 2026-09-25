@@ -6,7 +6,7 @@
 
 """Tests for realtime websocket send failures.
 
-A send-side failure retires the socket and reports the failure as fatal, so a
+A send-side failure retires the socket and reports the failure as permanent, so a
 session whose socket has gone reports once rather than once per frame the
 transport keeps feeding it. The retired socket is closed by ``_disconnect``.
 """
@@ -64,7 +64,7 @@ def _attach_recorder(service) -> _ErrorRecorder:
 
 
 @pytest.mark.asyncio
-async def test_send_failure_is_reported_once_as_fatal():
+async def test_send_failure_is_reported_once_as_permanent():
     service = _service()
     websocket = _FakeWebsocket(send_error=ConnectionError("keepalive ping timeout"))
     service._websocket = websocket
@@ -158,7 +158,7 @@ async def test_send_failure_while_disconnecting_reports_nothing():
 
 
 @pytest.mark.asyncio
-async def test_connect_failure_is_fatal():
+async def test_connect_failure_is_permanent():
     service = _service()
     errors = _attach_recorder(service)
 
@@ -180,7 +180,7 @@ async def test_connect_failure_is_fatal():
 
 
 @pytest.mark.asyncio
-async def test_azure_connect_failure_is_fatal():
+async def test_azure_connect_failure_is_permanent():
     """The Azure subclass connects with its own headers but the same verdict."""
     service = AzureRealtimeLLMService(
         api_key="test-key",
